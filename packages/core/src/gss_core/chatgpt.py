@@ -990,6 +990,7 @@ class ChatGPTClient:
         *,
         plan: str,
         country: str,
+        billing_country: str = "",
         promo: bool = False,
         promo_code: str = "",
         promo_campaign_id: str = "",
@@ -998,6 +999,7 @@ class ChatGPTClient:
         price_interval: str = "month",
     ) -> CheckoutSession:
         country = country.upper()
+        tax_country = (billing_country or country).upper()
         currency = currency_for(country)
         hosted = str(plan) == "team"
         campaign_id = str(promo_campaign_id or "").strip()[:120]
@@ -1087,7 +1089,8 @@ class ChatGPTClient:
             )
             if refreshed is not None:
                 amount, quote_currency = refreshed, refreshed_currency
-            billing = address_for(country)
+            billing = address_for(tax_country)
+            before_tax = amount
             taxed, taxed_currency = self._quote_from_taxes(
                 checkout_id=session_id,
                 page_url=page,
@@ -1097,6 +1100,17 @@ class ChatGPTClient:
             )
             if taxed is not None:
                 amount, quote_currency = taxed, taxed_currency
+                tax_delta = (before_tax - taxed) if before_tax is not None else None
+                logger.info(
+                    "checkout_tax_recalc exit_country=%s billing_country=%s "
+                    "before=%s after=%s currency=%s tax_delta=%s",
+                    country,
+                    tax_country,
+                    before_tax,
+                    taxed,
+                    quote_currency,
+                    tax_delta,
+                )
         customer_session = str(
             payload.get("customer_session_client_secret")
             or payload.get("customerSessionClientSecret")

@@ -29,9 +29,10 @@ _LAST = ("Miller", "Johnson", "Garcia", "Santos", "Kim", "Tanaka", "Silva", "Ngu
 
 _PLACES: Dict[str, List[_Place]] = {
     "US": [
-        {"city": "New York", "state": "NY", "postal_code": "10001", "streets": ["West 34th Street", "Broadway"]},
-        {"city": "Los Angeles", "state": "CA", "postal_code": "90012", "streets": ["South Spring Street", "West 5th Street"]},
-        {"city": "Chicago", "state": "IL", "postal_code": "60601", "streets": ["North Michigan Avenue", "East Wacker Drive"]},
+        # 免税州：Oregon / Delaware，避免美国本地销售税叠加。
+        {"city": "Portland", "state": "OR", "postal_code": "97201", "streets": ["SW Morrison Street", "NW Couch Street"]},
+        {"city": "Wilmington", "state": "DE", "postal_code": "19801", "streets": ["Market Street", "King Street"]},
+        {"city": "Salem", "state": "OR", "postal_code": "97301", "streets": ["Commercial Street SE", "State Street"]},
     ],
     "PH": [
         {"city": "Makati", "state": "NCR", "postal_code": "1226", "streets": ["Ayala Avenue", "Paseo de Roxas"]},

@@ -170,8 +170,10 @@ class StripeProtocol:
         timeout: float = 120.0,
         profile: dict | None = None,
         user_agent: str = "",
+        pin_proxy: bool = False,
     ) -> None:
         self.proxy = proxy or None
+        self.pin_proxy = pin_proxy
         self.locale = ""
         self.timezone = ""
         # 指纹必须与建单、求解器完全一致：优先使用 Session 的真实 UA。
@@ -911,6 +913,8 @@ class StripeProtocol:
                 last_exc = e
                 msg = str(e)
                 if "SSL" in msg or "ConnectError" in msg or "EOF" in msg:
+                    if self.pin_proxy:
+                        raise
                     self.rotate_proxy_sid()
                     self._client = None
                     time.sleep(2)

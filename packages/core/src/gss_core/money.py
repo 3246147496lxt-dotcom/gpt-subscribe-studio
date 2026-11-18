@@ -47,13 +47,25 @@ def quote_from_payload(payload: Any, default_currency: str = "") -> Tuple[Option
             parsed = _coerce(top, currency, minor=True)
             if parsed is not None:
                 return parsed, currency
-        state = payload.get("checkout_state")
-        if isinstance(state, dict):
+        for state in _checkout_states(payload):
             parsed = _checkout_state_amount(state, currency)
             if parsed is not None:
                 return parsed, currency
     amount = _amount_of(payload, currency)
     return amount, currency
+
+
+def _checkout_states(payload: dict) -> list[dict]:
+    states: list[dict] = []
+    state = payload.get("checkout_state")
+    if isinstance(state, dict):
+        states.append(state)
+    nested = payload.get("checkout_session")
+    if isinstance(nested, dict):
+        inner = nested.get("checkout_state")
+        if isinstance(inner, dict):
+            states.append(inner)
+    return states
 
 
 def _checkout_state_amount(state: dict, currency: str) -> Optional[Decimal]:
@@ -88,8 +100,7 @@ def _currency_of(payload: Any, default: str) -> str:
     candidates: list[Any] = []
     if isinstance(payload, dict):
         candidates.extend((payload.get("currency"), payload.get("currency_code")))
-        state = payload.get("checkout_state")
-        if isinstance(state, dict):
+        for state in _checkout_states(payload):
             candidates.append(state.get("currency"))
             total = state.get("total")
             if isinstance(total, dict):

@@ -84,7 +84,7 @@ Plus / Go / Pro 家族走的是 custom checkout，链路不同，见「支持的
 
 | 项目 | Plus 家族 | Team |
 |---|---|---|
-| 账单国家 | 由请求的 `billing_country` 决定；与 Session 签发地不一致时自动在目标国家重签发 session | 同左，目标国家需在支持列表内 |
+| 账单国家 | `billing_country` 决定地址/税务；`exit_country` 决定出口与建单定价（默认同 billing） | 同左 |
 | 席位数量 | 不涉及 | 2 席起，可配 |
 | 月付 / 年付 | 固定 | 可选 |
 | 工作空间名 | 不涉及 | 可填 |
@@ -250,11 +250,13 @@ API 层通过二选一的字段区分：
 
 ### 代理出口的两个坑
 
-- **地区必须显式对齐**：网关配置里的用户名是 `-region-JP-`。
-  订单的 `billing_country`、币种、默认账单地址和代理出口都以请求的目标国家为准。
-  如果 Session 的 `statsigContext.country` 与目标国家不一致，会丢弃旧 accessToken，
-  只保留 sessionToken，在目标国家出口上调用 `/api/auth/session` 重签发
-  （响应里 `session_reissued_for_country=true`），随后全链路复用同一出口和 UA。
+- **出口与账单可以分离**：`exit_country` 决定代理出口和建单定价（默认等于
+  `billing_country`）。例如 `exit_country=PH` + `billing_country=US`：
+  在 PH 住宅 IP 上重签发并锁定 PHP 定价，再用 US 免税州地址调用
+  `/backend-api/payments/checkout/taxes` 退掉 PH VAT（PHP 1100 → 982.14）。
+  如果 Session 的 `statsigContext.country` 与 `exit_country` 不一致，会丢弃旧
+  accessToken，只保留 sessionToken 重签发（响应里
+  `session_reissued_for_country=true`），随后全链路复用同一出口和 UA。
 - **SID 固定 = 坏出口会一直坏**：代理抽到坏 IP 时表现为
   `SSL: UNEXPECTED_EOF_WHILE_READING` 或 `TLS connect error`。
   `PlusProtocol.pay_from_url()` 遇到这类错误会轮换 SID 重试，最多 3 次。
@@ -380,7 +382,7 @@ pnpm --dir apps/web dev
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/orders` | 建单（plan / billing_country / session / 席位） |
+| `POST` | `/api/orders` | 建单（plan / billing_country / exit_country / session / 席位） |
 | `GET` | `/api/orders/{id}` | 查单，含 `session_email`、金额、结账会话 |
 | `POST` | `/api/orders/{id}/bind-and-pay-protocol` | **协议支付主路径**：卡内联 + 指纹 + 遥测 + intent confirm |
 | `GET` | `/api/orders/{id}/bind-and-pay-protocol` | 查询协议支付当前状态（不重复提交） |
@@ -605,7 +607,7 @@ confirm 请求里带一个 `rv_timestamp`：**212 字符**，字符集 43 个符
 
 **5. 免税州地址与非 US 出口的组合未验证**
 
-已知：账单地址由目标国家模板生成，出口与币种跟随订单的 `billing_country`，
+已知：账单地址由 `billing_country` 模板生成（US 默认 OR/DE 免税州），出口与币种跟随 `exit_country`，
 Session 没有 `statsigContext.country` 时才回退到账单国。
 缺：如果业务上需要跑其他国家（JP/GB 等），地址该用什么、税额如何稳定，
 没有实测数据。目前的做法是在界面上给出提示。

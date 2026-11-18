@@ -41,6 +41,8 @@ class CheckoutRequest:
     plan: Plan
     billing_country: str
     billing_mode: BillingMode
+    # 代理出口/建单定价国家；默认等于 billing_country。
+    exit_country: Optional[str] = None
     proxy: Optional[str] = None
     promo_code: str = ""
     promo_campaign_id: str = ""

@@ -33,6 +33,7 @@ from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.proxies import (
     align_proxy_region,
     configured_proxy,
+    proxy_exit_region,
     session_proxy,
 )
 
@@ -91,18 +92,22 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
         # forces an extra verification step.
         billing_country = str((req.billing or {}).get("country") or "").upper()
         target_country = billing_country if str(req.plan or "").lower() == "team" and billing_country else req.country
-        proxy = align_proxy_region(
-            req.checkout_proxy
-            or req.approve_proxy
-            or session_proxy("checkout", target_country)
-            or configured_proxy("checkout")
-            or configured_proxy("approve"),
-            target_country,
-        )
+        pinned_proxy = req.checkout_proxy or req.approve_proxy
+        if pinned_proxy:
+            # 已 pin 的出口（可能是 PH 出口 + US 账单）不能被 billing_country 改写。
+            proxy = pinned_proxy
+        else:
+            proxy = align_proxy_region(
+                session_proxy("checkout", target_country)
+                or configured_proxy("checkout")
+                or configured_proxy("approve"),
+                target_country,
+            )
         client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
         client.timeout = float(self.timeout)
-        client.language = locale_for(target_country)
-        client.timezone = timezone_for(target_country)
+        client_country = proxy_exit_region(proxy) or target_country
+        client.language = locale_for(client_country)
+        client.timezone = timezone_for(client_country)
         if str(req.plan or "").lower() == "team" and public_checkout_id(checkout_id).startswith("cs_"):
             try:
                 return await asyncio.to_thread(self._pay_team, client, req)

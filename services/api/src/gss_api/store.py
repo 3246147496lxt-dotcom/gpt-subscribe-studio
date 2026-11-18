@@ -32,6 +32,7 @@ class OrderView:
     confirm_return_url: Optional[str] = None
     protocol_saved_result: Optional[Dict[str, Any]] = None
     session_reissued_for_country: bool = False
+    exit_country: Optional[str] = None
 
 
 class InMemoryStore:

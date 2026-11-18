@@ -4,18 +4,18 @@
 （例如 PH 菲律宾）完成低价区充值；跨区时在目标国家出口重签发，并保证
 「重签发 → 建单 → Stripe 扣款」全链路同一 IP、同一 UA。
 
-## 1. 目标国家优先
+## 1. 出口国家与账单国家解耦
 
-- `Order.billing_country` 使用请求的 `billing_country`
-- 币种由 `currency_for(target_country)` 推导
-- 默认账单地址由 `address_for(target_country)` 生成，写入 `OrderSecrets.billing`
-- 代理出口按 `target_country` 生成一次并 pin 住
-- 响应字段：`session_reissued_for_country`（是否发生跨区重签发）
-- 目标国家不在支持列表时返回 400 `COMPLIANCE_BLOCKED`
+- `exit_country` 决定代理出口、Session 重签发地和建单定价（默认等于 `billing_country`）
+- `billing_country` 决定账单地址、税务国家和最终应付额
+- 币种由 `currency_for(exit_country)` 推导（PH 出口锁定 PHP）
+- 默认 US 地址使用 OR / DE 免税州（Portland 97201 / Wilmington 19801）
+- 响应字段：`exit_country`、`session_reissued_for_country`
+- 两个国家都必须在支持列表内
 
 ## 2. 跨区重签发（`ChatGPTClient.reauthorize_for_country`）
 
-仅当 `statsigContext.country` 存在且与目标国家不同时触发：
+仅当 `statsigContext.country` 存在且与 `exit_country` 不同时触发：
 
 1. 丢弃旧 `accessToken`
 2. 只保留 `__Secure-next-auth.session-token`
@@ -24,6 +24,8 @@
 5. 只接受新 `accessToken` / 新 Cookie，忽略响应里可能回带的旧 statsig 环境
 6. 后续 `prepare_risk`（Node 哨兵）、`create_checkout`、Stripe 支付复用
    同一个 client / proxy / UA
+7. 建单时用 `exit_country` 锁 PHP 定价，用 `billing_country` 调
+   `/backend-api/payments/checkout/taxes` 重算税费（PH VAT 退掉）
 
 跨区但缺少 sessionToken 时直接 401，提示重新导出完整 session。
 

@@ -257,7 +257,7 @@ def test_billing_address_matches_country() -> None:
         assert address["city"]
         assert address["postal_code"]
     us = address_for("US")
-    assert us["state"]
+    assert us["state"] in {"OR", "DE"}
     assert us["postal_code"].isdigit() and len(us["postal_code"]) == 5
 
 
@@ -1092,3 +1092,75 @@ def test_token_revoked_is_reported_as_actionable_session_error() -> None:
     assert exc.value.code is ErrorCode.INVALID_SESSION
     assert "token_revoked" in exc.value.message
     assert "重新登录" in exc.value.message
+
+
+def test_quote_parses_nested_checkout_session_tax_response() -> None:
+    payload = {
+        "using_automatic_tax": True,
+        "checkout_session": {
+            "checkout_state": {
+                "currency": "php",
+                "total": {"total": {"minorUnitsAmount": 98214, "amount": "₱982.14"}},
+            }
+        },
+    }
+    amount, currency = quote_from_payload(payload, "PHP")
+    assert currency == "PHP"
+    assert amount == Decimal("982.14")
+
+
+def test_create_checkout_recalculates_ph_price_with_us_billing(monkeypatch, caplog) -> None:
+    from types import SimpleNamespace
+
+    checkout_payload = {
+        "checkout_session_id": "oaics_fixture",
+        "url": "https://chatgpt.com/checkout/openai_llc/oaics_fixture",
+        "publishable_key": "pk_test_fixture",
+        "currency": "php",
+        "checkout_state": {
+            "currency": "php",
+            "total": {"total": {"minorUnitsAmount": 110000}},
+        },
+    }
+    tax_payload = {
+        "using_automatic_tax": True,
+        "checkout_session": {
+            "checkout_state": {
+                "currency": "php",
+                "total": {"total": {"minorUnitsAmount": 98214}},
+            }
+        },
+    }
+
+    def response(status, payload):
+        return SimpleNamespace(
+            status_code=status,
+            text=json.dumps(payload),
+            url="https://chatgpt.com/fixture",
+            json=lambda: payload,
+        )
+
+    class FakeHttp:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, **kwargs):
+            return response(404, {})
+
+        def post(self, url, **kwargs):
+            if url.endswith("/backend-api/payments/checkout"):
+                return response(200, checkout_payload)
+            if url.endswith("/backend-api/payments/checkout/taxes"):
+                return response(200, tax_payload)
+            return response(404, {})
+
+    client = ChatGPTClient("tok", account_id="acct", _http=FakeHttp())
+    monkeypatch.setattr(client, "prepare_risk", lambda **kwargs: None)
+    with caplog.at_level("INFO"):
+        checkout = client.create_checkout(
+            plan="plus", country="PH", billing_country="US"
+        )
+    assert checkout.currency == "PHP"
+    assert checkout.amount == Decimal("982.14")
+    assert "checkout_tax_recalc exit_country=PH billing_country=US" in caplog.text
+    assert "before=1100.00 after=982.14" in caplog.text

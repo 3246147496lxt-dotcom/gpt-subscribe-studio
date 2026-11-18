@@ -136,6 +136,8 @@ class PlusHarProtocol:
         read_only: bool = False,
         user_agent: str = "",
         device_id: str = "",
+        exit_country: str = "",
+        pin_proxy: bool = False,
     ) -> None:
         self.session = session or ""
         self.checkout_url = checkout_url or ""
@@ -146,9 +148,10 @@ class PlusHarProtocol:
         self.currency = (currency or "USD").upper()
         self.timeout = float(timeout or 120.0)
         self.plan = plan or "plus"
-        # The card's billing country drives tax and AVS; the order country is
-        # only a fallback (the capture taxed a JP checkout with a US address).
+        # billing country drives tax/AVS; exit country drives device timezone/IP.
         self.country = (self.billing.get("country") or country or "US").upper()
+        self.exit_country = (exit_country or country or self.country).upper()
+        self.pin_proxy = pin_proxy
         self.email = (email or self.billing.get("email") or "").strip()
         self.expected_account = account_id or ""
         self.cuss_secret = customer_session_client_secret or ""
@@ -162,9 +165,9 @@ class PlusHarProtocol:
         self.is_stripe_custom = self.checkout_id.startswith("cs_")
 
         if device is None and account_id:
-            device = device_for_account(account_id, self.country)
+            device = device_for_account(account_id, self.exit_country)
         self.device = device or DeviceProfile.random(
-            country=self.country, seed=device_id or None
+            country=self.exit_country, seed=device_id or None
         )
         if isinstance(profile, dict) and profile.get("os_key"):
             # Only a full har_device dict restores an identity; the legacy
@@ -581,9 +584,20 @@ class PlusHarProtocol:
         session = payload.get("checkout_session") if isinstance(payload.get("checkout_session"), dict) else {}
         if session.get("publishable_key"):
             self.publishable_key = str(session["publishable_key"])
+        before = self.amount_minor
         self.amount_minor = self._total_minor(session or payload)
+        tax_delta = (before - self.amount_minor) if before else None
         self.raw["taxes"] = payload
-        logger.info("plus_har_taxes total=%s %s", self.amount_minor, self.currency)
+        logger.info(
+            "plus_har_tax_recalc exit_country=%s billing_country=%s "
+            "before=%s after=%s currency=%s tax_delta=%s",
+            self.exit_country,
+            self.country,
+            before,
+            self.amount_minor,
+            self.currency,
+            tax_delta,
+        )
 
     def _update_tax_id(self) -> None:
         body = {"checkout_session_id": self.checkout_id, "tax_id_info": None}
@@ -1066,7 +1080,7 @@ class PlusHarProtocol:
                 message = str(exc)
                 if not any(key in message for key in ("SSL", "EOF", "ConnectError", "TLS")):
                     raise
-                if attempt == retries - 1:
+                if attempt == retries - 1 or self.pin_proxy:
                     raise
                 logger.warning("plus_har_proxy_retry attempt=%s err=%s", attempt + 1, message[:120])
                 self.rotate_proxy_sid()

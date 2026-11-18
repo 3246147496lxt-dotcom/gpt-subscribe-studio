@@ -17,6 +17,8 @@ class ModeIn(BaseModel):
 class OrderCreateRequest(BaseModel):
     plan: str
     billing_country: str
+    # 代理出口 / Session 重签发国家；默认等于 billing_country。
+    exit_country: Optional[str] = None
     mode: ModeIn = Field(default_factory=ModeIn)
     session: Optional[str] = None
     payment_method_token: Optional[str] = None
@@ -99,6 +101,7 @@ class OrderOut(BaseModel):
     session_email: Optional[str] = None
     # 跨区充值：已丢弃旧 accessToken，在目标国家出口重签发 session
     session_reissued_for_country: bool = False
+    exit_country: Optional[str] = None
 
 
 class ErrorOut(BaseModel):

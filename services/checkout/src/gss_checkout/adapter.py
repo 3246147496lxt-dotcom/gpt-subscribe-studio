@@ -101,12 +101,12 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
     async def create_checkout(self, req: CheckoutRequest) -> CheckoutResult:
         if not req.session:
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法创建结账")
-        # 目标充值国家由订单的 billing_country 决定；跨区场景会先在目标国家
-        # 重签发 session，再带着同一个 pin 出口进入这里。
-        proxy = align_proxy_region(
-            req.proxy or session_proxy("checkout", req.billing_country) or configured_proxy("checkout"),
-            req.billing_country,
-        )
+        # exit_country 决定代理出口与建单定价；billing_country 只决定地址/税额。
+        # 已 pin 的 req.proxy 必须原样保留，不能再按 billing_country 改写。
+        exit_country = req.exit_country or req.billing_country
+        proxy = req.proxy or session_proxy("checkout", exit_country) or configured_proxy("checkout")
+        if not req.proxy:
+            proxy = align_proxy_region(proxy, exit_country)
         used_proxy = proxy
         created = None
         if req.plan is Plan.TEAM:
@@ -178,7 +178,8 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         try:
             return client.create_checkout(
                 plan=str(req.plan),
-                country=req.billing_country,
+                country=req.exit_country or req.billing_country,
+                billing_country=req.billing_country,
                 promo=req.billing_mode is BillingMode.PROMO,
                 promo_code=req.promo_code,
                 promo_campaign_id=req.promo_campaign_id,
@@ -196,7 +197,7 @@ class FakeCheckoutAdapter(CheckoutAdapterBase):
 
     async def create_checkout(self, req: CheckoutRequest) -> CheckoutResult:
         self.calls.append(req)
-        currency = currency_for(req.billing_country)
+        currency = currency_for(req.exit_country or req.billing_country)
         amount = Decimal("0.00") if req.billing_mode is BillingMode.PROMO else _list_price(req)
         hosted = req.plan is Plan.TEAM
         return CheckoutResult(

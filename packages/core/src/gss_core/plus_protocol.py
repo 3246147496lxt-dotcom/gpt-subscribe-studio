@@ -77,6 +77,7 @@ class PlusProtocol:
         timeout: float = 120.0,
         profile: Optional[Dict[str, Any]] = None,
         user_agent: str = "",
+        pin_proxy: bool = False,
         customer_session_client_secret: str = "",
     ) -> None:
         self.session = session or ""
@@ -85,6 +86,7 @@ class PlusProtocol:
         self.card = card or {}
         self.billing = billing or {}
         self.proxy = proxy or None
+        self.pin_proxy = pin_proxy
         # 指纹必须与建单、求解器完全一致
         self.profile = dict(profile or {})
         derived = profile_from_session_ua(user_agent) if user_agent else None
@@ -704,7 +706,7 @@ class PlusProtocol:
                 msg = str(exc)
                 if not any(k in msg for k in ("SSL", "EOF", "ConnectError", "TLS")):
                     raise
-                if attempt == retries - 1:
+                if attempt == retries - 1 or self.pin_proxy:
                     raise
                 log(f"   代理故障（第 {attempt + 1}/{retries} 次），轮换重试")
                 self.rotate_proxy_sid()

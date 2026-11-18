@@ -192,6 +192,7 @@ def _to_out(order: Order) -> OrderOut:
         confirm_return_url=view.confirm_return_url,
         session_email=session_email or None,
         session_reissued_for_country=bool(getattr(view, "session_reissued_for_country", False)),
+        exit_country=getattr(view, "exit_country", None),
     )
 
 
@@ -297,29 +298,37 @@ async def create_order(
     except ValueError as exc:
         raise _error(status.HTTP_401_UNAUTHORIZED, ErrorCode.INVALID_SESSION, str(exc))
     
-    target_country = normalize_country(payload.billing_country)
-    if not is_supported(target_country):
+    billing_country = normalize_country(payload.billing_country)
+    if not is_supported(billing_country):
         raise _error(
             status.HTTP_400_BAD_REQUEST,
             ErrorCode.COMPLIANCE_BLOCKED,
             f"不支持的地区: {payload.billing_country}",
         )
-    country = target_country
+    country = billing_country
+    requested_exit = normalize_country(payload.exit_country or billing_country)
+    if not is_supported(requested_exit):
+        raise _error(
+            status.HTTP_400_BAD_REQUEST,
+            ErrorCode.COMPLIANCE_BLOCKED,
+            f"不支持的出口地区: {requested_exit}",
+        )
+    exit_country = requested_exit
     original_country = normalize_country(bundle.country)
     session_reissued = False
 
-    # 目标充值国家由订单决定；跨区时只保留 sessionToken，在目标国家出口上重签发。
-    # 从重签发到支付完成必须复用同一个 pin 出口，禁止后续再换 SID。
-    exit_country = target_country
+    # exit_country 决定代理出口与重签发地；billing_country 决定币种/地址/税务。
+    # 两者允许不同，例如 PH 出口 + US 免税州账单。
     logger.info(
-        "checkout_exit_country session_country=%s target_country=%s",
+        "checkout_country exit_country=%s billing_country=%s session_country=%s",
+        exit_country,
+        billing_country,
         original_country or "-",
-        target_country,
     )
     exit_proxy = checkout_proxy_for(
         "checkout",
-        session_country=target_country,
-        billing_country=target_country,
+        session_country=exit_country,
+        billing_country=exit_country,
     )
 
     def _session_json(client: ChatGPTClient, country: str) -> str:
@@ -337,17 +346,18 @@ async def create_order(
             },
         })
 
-    if original_country and original_country != target_country and not bundle.session_token:
+    if original_country and original_country != exit_country and not bundle.session_token:
         raise _error(
             status.HTTP_401_UNAUTHORIZED,
             ErrorCode.INVALID_SESSION,
             "跨区充值需要完整 Session（缺少 sessionToken），请重新导出整段 session JSON",
         )
 
-    if bundle.session_token and original_country and original_country != target_country:
+    if bundle.session_token and original_country and original_country != exit_country:
         logger.info(
-            "session_reissue_start target_country=%s original_country=%s",
-            target_country,
+            "session_reissue_start exit_country=%s billing_country=%s original_country=%s",
+            exit_country,
+            billing_country,
             original_country or "-",
         )
         try:
@@ -355,20 +365,20 @@ async def create_order(
                 ChatGPTClient.reauthorize_for_country,
                 raw_session,
                 proxy=exit_proxy,
-                country=target_country,
+                country=exit_country,
             )
         except DomainError as exc:
             raise _from_domain(exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "session_reissue_failed target_country=%s error=%s",
-                target_country,
+                "session_reissue_failed exit_country=%s error=%s",
+                exit_country,
                 redact_sensitive(str(exc))[:200],
             )
             raise _error(
                 status.HTTP_401_UNAUTHORIZED,
                 ErrorCode.INVALID_SESSION,
-                f"无法在目标国家 {target_country} 重签发 Session，请检查出口代理后重试",
+                f"无法在出口国家 {exit_country} 重签发 Session，请检查出口代理后重试",
             )
         try:
             bundle.access_token = client.access_token
@@ -376,13 +386,14 @@ async def create_order(
             bundle.device_id = client.device_id
             bundle.user_agent = client.user_agent
             bundle.oai_session_id = client.oai_session_id
-            bundle.country = target_country
+            bundle.country = exit_country
             bundle.cookies = dict(client.extra_cookies)
-            raw_session = _session_json(client, target_country)
+            raw_session = _session_json(client, exit_country)
             session_reissued = True
             logger.info(
-                "session_reissued_for_country target_country=%s original_country=%s",
-                target_country,
+                "session_reissued_for_country exit_country=%s billing_country=%s original_country=%s",
+                exit_country,
+                billing_country,
                 original_country or "-",
             )
         finally:
@@ -407,9 +418,9 @@ async def create_order(
             bundle.device_id = client.device_id or bundle.device_id
             bundle.user_agent = client.user_agent or bundle.user_agent
             bundle.oai_session_id = client.oai_session_id or bundle.oai_session_id
-            bundle.country = target_country
+            bundle.country = exit_country
             bundle.cookies = dict(client.extra_cookies)
-            raw_session = _session_json(client, target_country)
+            raw_session = _session_json(client, exit_country)
             logger.info("已从 session token 换取 accessToken")
         finally:
             client.close()
@@ -443,6 +454,7 @@ async def create_order(
     store.add_job(Job(order_id=order.id, stage="checkout"))
     view = store.view(order.id)
     view.session_reissued_for_country = session_reissued
+    view.exit_country = exit_country
     # 指纹 profile：Session 真实 UA 优先；只有完全缺失时才按 device_id 派生。
     _profile = profile_from_session_ua(bundle.user_agent) or _pick_profile(bundle.device_id)
     _billing = address_for(country)
@@ -470,6 +482,7 @@ async def create_order(
             session=raw_session,
             plan=plan,
             billing_country=country,
+            exit_country=exit_country,
             mode=mode,
             promo_code=promo_code,
             promo_campaign_id=promo_campaign_id,
@@ -1119,18 +1132,21 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         raise _error(401, ErrorCode.SESSION_EXPIRED, "订单凭证已过期，请重新创建结账")
     _assert_saved_card_resolved(secrets)
     session_raw = secrets.session or ""
-    target_country = normalize_country(order.billing_country)
+    billing_country = normalize_country(order.billing_country)
+    exit_country = normalize_country(
+        getattr(secrets, "exit_country", "") or billing_country
+    )
     # 全链路粘性：优先复用建单时 pin 的出口，禁止每次支付换 SID。
-    # 只有老订单没有 proxy 时才按目标国家新建一次。
+    # 只有老订单没有 proxy 时才按 exit_country 新建一次。
     proxy = secrets.proxy or payload.proxy or checkout_proxy_for(
         "checkout",
-        session_country=target_country,
-        billing_country=target_country,
+        session_country=exit_country,
+        billing_country=exit_country,
     )
     logger.info(
-        "protocol_pay_exit_country target_country=%s billing_country=%s pinned=%s",
-        target_country or "-",
-        payload.billing.country or "-",
+        "protocol_pay_country exit_country=%s billing_country=%s pinned=%s",
+        exit_country or "-",
+        billing_country or "-",
         bool(secrets.proxy),
     )
     publishable_key = (
@@ -1171,6 +1187,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 confirm_return_url=getattr(view, "confirm_return_url", "") or "",
                 user_agent=getattr(secrets, "user_agent", "") or "",
                 device_id=getattr(secrets, "device_id", "") or "",
+                exit_country=getattr(secrets, "exit_country", "") or "",
+                pin_proxy=True,
             )
             try:
                 return hp.pay_from_url()
@@ -1184,6 +1202,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 proxy=proxy, currency=currency,
                 profile=getattr(secrets, "profile", None),
                 user_agent=getattr(secrets, "user_agent", "") or "",
+                pin_proxy=True,
             )
             pp.external_pm = pm_id
             try:
@@ -1195,6 +1214,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
             card=card, billing=billing,
             profile=getattr(secrets, "profile", None),
             user_agent=getattr(secrets, "user_agent", "") or "",
+            pin_proxy=True,
             publishable_key=publishable_key,
         )
         # 默认全关（批量模式）；网页上勾选后逐项打开
