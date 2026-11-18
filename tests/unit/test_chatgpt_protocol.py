@@ -283,9 +283,11 @@ def test_header_value_strips_private_keys() -> None:
     assert "_so" not in value
 
 
-def test_mint_without_node_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mint_without_node_reports_reason(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SENTINEL_NODE", "/nonexistent-gss-node")
-    assert mint(flow="chatgpt_checkout", device_id="did", user_agent="ua") == {}
+    token = mint(flow="chatgpt_checkout", device_id="did", user_agent="ua")
+    assert token.get("_error")
+    assert "node executable not found" in token["_error"]
 
 
 class _FakeResponse:

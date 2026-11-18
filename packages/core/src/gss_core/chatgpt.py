@@ -826,9 +826,11 @@ class ChatGPTClient:
         )
         value = header_value(token)
         if not value:
+            reason = token.get("_error") if isinstance(token, dict) else ""
+            detail = f"：{redact_sensitive(str(reason))[:200]}" if reason else ""
             raise DomainError(
                 ErrorCode.CHECKOUT_UPSTREAM_ERROR,
-                "无法签发 ChatGPT 风控令牌（Sentinel）。请确认容器里有 Node，且出口代理可用。",
+                f"无法签发 ChatGPT 风控令牌（Sentinel）{detail}。请确认 Node 可用、出口代理稳定。",
             )
         self.sentinel_token = value
         self.sentinel_so = so_header_value(token)

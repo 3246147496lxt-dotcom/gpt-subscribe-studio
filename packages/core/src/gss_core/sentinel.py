@@ -89,7 +89,7 @@ def mint(
     """返回哨兵 JSON；失败返回空 dict，由调用方决定是否中止。"""
 
     if not _BRIDGE.is_file():
-        return {}
+        return {"_error": f"sentinel bridge missing: {_BRIDGE}"}
     payload = json.dumps(
         {
             "ua": user_agent,
@@ -125,23 +125,30 @@ def mint(
             env=env,
             check=False,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return {}
+    except FileNotFoundError:
+        return {"_error": "node executable not found"}
+    except subprocess.TimeoutExpired:
+        return {"_error": "sentinel bridge timed out"}
     output = (process.stdout or b"").decode("utf-8", "replace").strip()
+    stderr = (process.stderr or b"").decode("utf-8", "replace").strip()
+    if process.returncode != 0:
+        return {"_error": f"node exit {process.returncode}: {stderr[:240]}"}
     if not output:
-        return {}
+        return {"_error": f"empty node output: {stderr[:240]}"}
     try:
         result = json.loads(output)
     except json.JSONDecodeError:
-        return {}
-    if result.get("error") or not result.get("main"):
-        return {}
+        return {"_error": f"bad node json: {output[:120]}"}
+    if result.get("error"):
+        return {"_error": str(result.get("error"))[:240]}
+    if not result.get("main"):
+        return {"_error": "node returned no main token"}
     try:
         token = json.loads(str(result.get("main") or ""))
     except json.JSONDecodeError:
-        return {}
+        return {"_error": "bad main token json"}
     if not isinstance(token, dict):
-        return {}
+        return {"_error": "main token is not an object"}
     so_raw = str(result.get("so") or "")
     if so_raw:
         try:
