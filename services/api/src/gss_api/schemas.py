@@ -102,6 +102,15 @@ class OrderOut(BaseModel):
     # 跨区充值：已丢弃旧 accessToken，在目标国家出口重签发 session
     session_reissued_for_country: bool = False
     exit_country: Optional[str] = None
+    payment_status: str = "unpaid"
+    delivery_status: str = "pending"
+    payment_intent_id: Optional[str] = None
+    paid_amount: Optional[str] = None
+    paid_currency: Optional[str] = None
+    tax_delta: Optional[str] = None
+    plan_type: Optional[str] = None
+    status_summary: Optional[str] = None
+    receipt: Optional[Dict[str, Any]] = None
 
 
 class ErrorOut(BaseModel):

@@ -863,6 +863,7 @@ class PlusHarProtocol:
         out.payment_method_id = str(self.raw.get("payment_method_id") or "")
         intent_payload = self.raw.get("intent") if isinstance(self.raw.get("intent"), dict) else {}
         intent_status = str(intent_payload.get("status") or "")
+        out.intent_id = str(intent_payload.get("id") or self.intent_id or "")
         error = intent_payload.get("last_payment_error") if isinstance(intent_payload.get("last_payment_error"), dict) else {}
         if not error and isinstance(intent_payload.get("error"), dict):
             error = intent_payload["error"]
@@ -1103,6 +1104,8 @@ def outcome_from_payment(result: PaymentOutcome, *, stage: str = "payment") -> D
         payload["charge_id"] = result.charge_id
     if result.payment_method_id:
         payload["payment_method_id"] = result.payment_method_id
+    if result.intent_id:
+        payload["payment_intent_id"] = result.intent_id
     return payload
 
 

@@ -213,6 +213,9 @@ def test_direct_checkout_uses_one_token_and_original_context_then_delivers(flow)
     assert result["order"]["billing_country"] == "JP"
     assert result["order"]["currency"] == "JPY"
     assert result["order"]["amount"] == "1363"
+    assert result["order"]["payment_status"] == "succeeded"
+    assert result["order"]["delivery_status"] == "delivered"
+    assert result["order"]["receipt"]["payment_status"] == "succeeded"
     assert names(flow) == ["context_get", "taxes", "update_tax_id", "elements_get", "token_create", "app_confirm", "context_get", "pi_get", "pi_confirm", "context_get", "ack", "subscription_get"]
     before = list(flow.state["calls"])
     assert get(flow) == post(flow) == result
@@ -305,9 +308,14 @@ def test_paid_context_without_active_subscription_stays_pending(flow):
     result = post(flow)
     assert (result["state"], result["stage"]) == ("pending", "payment")
     assert result["order"]["status"] != "delivered"
+    assert result["order"]["payment_status"] == "succeeded"
+    assert result["order"]["delivery_status"] == "verify_delayed"
+    assert result["order"]["receipt"]["amount"] == "1363"
     assert vault.get(flow.oid) is not None
     flow.state["active"] = True
-    assert get(flow)["state"] == "paid"
+    recovered = get(flow)
+    assert recovered["state"] == "paid"
+    assert recovered["order"]["delivery_status"] == "delivered"
     assert names(flow).count("ack") == names(flow).count("pi_confirm") == 1
 
 
@@ -318,13 +326,22 @@ def test_get_does_not_acknowledge_delayed_paid_context(flow):
     result = get(flow)
     assert (result["state"], result["stage"]) == ("pending", "checkout")
     assert "ack" not in names(flow)
-    assert post(flow)["state"] == "paid"
-    assert names(flow).count("pi_confirm") == names(flow).count("app_confirm") == names(flow).count("ack") == 1
+    second = post(flow)
+    # 已扣款后再次提交只做只读核验，不会二次扣款或重新 ack。
+    assert second["state"] == "pending"
+    assert second["payment_status"] == "succeeded"
+    assert second["delivery_status"] == "verify_delayed"
+    assert names(flow).count("pi_confirm") == names(flow).count("app_confirm") == 1
+    assert "ack" not in names(flow)
 
 
 def test_lost_ack_is_reconciled_without_duplicate_ack(flow):
     flow.state.update(ack_lost=True, active=False)
-    assert post(flow)["state"] == "unknown"
+    result = post(flow)
+    # Intent 已 succeeded：支付结果必须锁定为成功，ack 丢失只影响交付核验。
+    assert result["state"] == "pending"
+    assert result["payment_status"] == "succeeded"
+    assert result["delivery_status"] == "verify_delayed"
     flow.state["active"] = True
     assert get(flow)["state"] == "paid"
     assert names(flow).count("ack") == 1

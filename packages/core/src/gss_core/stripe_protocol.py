@@ -144,6 +144,7 @@ class PaymentOutcome:
     decline_code: str | None = None
     message: str | None = None
     intent_status: str | None = None
+    intent_id: str | None = None
     charge_id: str | None = None
     payment_method_id: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)

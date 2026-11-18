@@ -68,6 +68,7 @@ class CheckoutResult:
     publishable_key: Optional[str] = None
     customer_session_client_secret: Optional[str] = None
     billing: Optional[Dict[str, str]] = None
+    tax_delta: Optional[Decimal] = None
     checkout_kind: str = "custom"
     confirm_return_url: str = ""
     effective_proxy: Optional[str] = field(default=None, repr=False)

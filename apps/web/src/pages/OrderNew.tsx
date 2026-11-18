@@ -78,6 +78,21 @@ export function OrderNew({ onRecord }: Props) {
     onRecord(next);
   }
 
+  async function recheckDelivery() {
+    if (!result || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await verifyOrder(result.id, true);
+      setResult(next);
+      onRecord(next);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "核验失败，请稍后重试");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function reset() {
     if (busy || protocolBusy) return;
     setOrder(null);
@@ -516,7 +531,15 @@ export function OrderNew({ onRecord }: Props) {
 
 
 
-          {step === 2 && result && <ResultPanel order={result} protocolOnly={result.plan === "plus" && pmMode === "server"} onReset={reset} />}
+          {step === 2 && result && (
+            <ResultPanel
+              order={result}
+              protocolOnly={result.plan === "plus" && pmMode === "server"}
+              onReset={reset}
+              onVerify={recheckDelivery}
+              verifying={busy}
+            />
+          )}
 
           {errorAlert}
           {primaryAction}

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import hmac
 import json
 from decimal import Decimal, InvalidOperation
@@ -23,8 +24,12 @@ from gss_core.vault import vault
 from ..schemas import BillingIn, CardIn
 from ..store import store
 from .events import notify_order_update
-from .orders import _error, _mark_delivered, _team_locks, _to_out
+from .orders import (
+    _error, _mark_delivered, _receipt_for, _set_delivery_status,
+    _set_payment_status, _team_locks, _to_out,
+)
 
+logger = logging.getLogger("gss.protocol_cards")
 router = APIRouter(prefix="/api/orders", tags=["card-protocol"])
 
 
@@ -109,24 +114,80 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
         secrets.account_id = context["account_id"]
     result = dict(result)
     result["payment_method_id"] = context.get("payment_method_id")
-    view.protocol_saved_result = result
+    payment_succeeded = (
+        result["stage"] == "payment"
+        and (result["state"] == "paid" or result.get("intent_status") == "succeeded")
+    )
+    if view.payment_status == "succeeded" and not payment_succeeded:
+        # 已完成扣款后，只读核验返回的 unknown/pending 不能把支付状态降级。
+        result.update({
+            "state": "pending",
+            "message": view.status_summary,
+            "payment_status": "succeeded",
+            "delivery_status": view.delivery_status,
+            "payment_intent_id": view.payment_intent_id,
+            "tax_delta": view.tax_delta,
+            "plan_type": view.plan_type or str(order.plan),
+            "status_summary": view.status_summary,
+            "receipt": _receipt_for(order, view),
+        })
+        view.protocol_saved_result = result
+        return {**result, "order": _to_out(order)}
     if result["stage"] == "checkout" and result["state"] == "pending":
         store.update_status(order.id, OrderStatus.AWAITING_PAYMENT)
-    if result["stage"] == "payment":
-        state = result["state"]
-        if state == "paid":
-            store.update_status(order.id, OrderStatus.PAYING)
-            store.update_status(order.id, OrderStatus.VERIFYING)
+    if payment_succeeded:
+        _set_payment_status(
+            order.id,
+            "succeeded",
+            intent_id=result.get("payment_intent_id") or result.get("charge_id"),
+            amount=view.amount,
+            currency=view.currency,
+            tax_delta=view.tax_delta,
+            plan_type=str(order.plan),
+            summary="扣款成功，正在核验订阅",
+        )
+        if result["state"] == "paid":
+            # HAR 自身已确认订阅生效，直接交付；不再重复查订阅。
+            if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION, OrderStatus.UNKNOWN}:
+                store.update_status(order.id, OrderStatus.PAYING)
+            if order.status is OrderStatus.PAYING:
+                store.update_status(order.id, OrderStatus.VERIFYING)
+            store.update_status(order.id, OrderStatus.ACTIVE)
             await _mark_delivered(order.id)
-        elif state == "card_declined":
+        else:
+            # 扣款已成功但 HAR 尚未看到订阅生效：只标记核验延迟，
+            # 由 /verify 或下一次只读查询推进交付。
+            if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION, OrderStatus.UNKNOWN}:
+                store.update_status(order.id, OrderStatus.PAYING)
+            store.update_status(order.id, OrderStatus.VERIFYING)
+            _set_delivery_status(order.id, "verify_delayed", "扣款成功，订阅核验延迟，可点击重新核验")
+            result["state"] = "pending"
+            result["message"] = view.status_summary
+    elif result["stage"] == "payment":
+        state = result["state"]
+        if state == "card_declined":
+            _set_payment_status(order.id, "failed", summary=result.get("message") or "支付失败")
             store.update_status(order.id, OrderStatus.FAILED)
         elif state == "challenge_required":
+            _set_payment_status(order.id, "processing", summary=result.get("message") or "支付需要继续验证")
             store.update_status(order.id, OrderStatus.REQUIRES_ACTION)
         elif state == "unknown":
+            _set_payment_status(order.id, "processing", summary="支付结果待核实，可点击重新核验")
             store.update_status(order.id, OrderStatus.UNKNOWN)
         elif context.get("app_confirmation_started"):
+            _set_payment_status(order.id, "processing")
             store.update_status(order.id, OrderStatus.PAYING)
-    if result["state"] != "paid":
+    result.update({
+        "payment_status": view.payment_status,
+        "delivery_status": view.delivery_status,
+        "payment_intent_id": view.payment_intent_id,
+        "tax_delta": view.tax_delta,
+        "plan_type": view.plan_type or str(order.plan),
+        "status_summary": view.status_summary,
+        "receipt": _receipt_for(order, view),
+    })
+    view.protocol_saved_result = result
+    if not payment_succeeded and result["state"] != "paid":
         view.last_error = result.get("message")
         view.next_action = result.get("next_action")
         await notify_order_update(order.id, order.status, {"protocol_stage": result["stage"], "protocol_state": result["state"]})
@@ -144,6 +205,33 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
         # Validate the quote before creating or mutating a binding context.
         order = store.get_order(order_id)
         view = store.view(order_id)
+        if view.payment_status == "succeeded":
+            # 已扣款：禁止二次提交卡；只允许只读重读结账/订阅并返回回执。
+            secrets = vault.get(order_id)
+            context = secrets.saved_card_context if secrets is not None else None
+            if secrets is not None and context:
+                try:
+                    result = await asyncio.to_thread(
+                        _run, secrets, context, _spec(order, view, secrets), read_only=True
+                    )
+                    return await _apply(order, secrets, view, context, result)
+                except HTTPException:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("bind_recheck_failed id=%s error=%s", order_id, str(exc)[:160])
+            return {
+                "state": "paid" if view.delivery_status == "delivered" else "pending",
+                "stage": "payment",
+                "message": view.status_summary,
+                "payment_status": view.payment_status,
+                "delivery_status": view.delivery_status,
+                "payment_intent_id": view.payment_intent_id,
+                "tax_delta": view.tax_delta,
+                "plan_type": view.plan_type or str(order.plan),
+                "status_summary": view.status_summary,
+                "receipt": _receipt_for(order, view),
+                "order": _to_out(order),
+            }
         try:
             amount = Decimal(payload.expected_amount)
             current_amount = Decimal(str(view.amount))

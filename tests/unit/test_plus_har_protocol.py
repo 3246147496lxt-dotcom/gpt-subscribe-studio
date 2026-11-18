@@ -455,3 +455,13 @@ def test_quote_guard_skipped_without_expected():
     h.expected_amount_minor = 0
     h.amount_minor = 9999
     assert h._quote_guard() is None
+
+
+def test_outcome_from_payment_carries_intent_id():
+    from gss_core.plus_har_protocol import outcome_from_payment
+
+    payload = outcome_from_payment(
+        PaymentOutcome(state="paid", intent_status="succeeded", intent_id="pi_test_123")
+    )
+    assert payload["payment_intent_id"] == "pi_test_123"
+    assert payload["intent_status"] == "succeeded"

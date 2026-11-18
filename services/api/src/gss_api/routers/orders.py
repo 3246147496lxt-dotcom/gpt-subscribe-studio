@@ -19,6 +19,7 @@ from gss_contracts import (
     BillingMode,
     CardSource,
     Job,
+    PaymentStatus,
     Mode,
     ModeValidationError,
     Order,
@@ -144,6 +145,104 @@ def _to_mode(mode_in: ModeIn) -> Mode:
     )
 
 
+def _default_status_summary(payment_status: str, delivery_status: str) -> str:
+    if payment_status == "succeeded":
+        if delivery_status == "delivered":
+            return "扣款成功，订阅已生效"
+        if delivery_status == "verify_delayed":
+            return "扣款成功，订阅核验延迟，可点击重新核验"
+        return "扣款成功，正在核验订阅"
+    if payment_status == "processing":
+        return "支付处理中，请勿重复提交"
+    if payment_status == "failed":
+        return "支付失败，未完成扣款"
+    return "待支付"
+
+
+def _receipt_for(order: Order, view) -> dict:
+    amount = view.paid_amount if view.paid_amount is not None else view.amount
+    currency = view.paid_currency if view.paid_currency is not None else view.currency
+    summary = view.status_summary or _default_status_summary(view.payment_status, view.delivery_status)
+    return {
+        "payment_intent_id": view.payment_intent_id,
+        "amount": str(amount) if amount is not None else None,
+        "currency": currency,
+        "tax_delta": view.tax_delta,
+        "plan_type": view.plan_type or str(order.plan),
+        "payment_status": view.payment_status,
+        "delivery_status": view.delivery_status,
+        "summary": summary,
+    }
+
+
+def _set_payment_status(
+    order_id: str,
+    status: str,
+    *,
+    intent_id: Optional[str] = None,
+    amount: Optional[str] = None,
+    currency: Optional[str] = None,
+    tax_delta: Optional[str] = None,
+    plan_type: Optional[str] = None,
+    summary: Optional[str] = None,
+) -> None:
+    view = store.view(order_id)
+    view.payment_status = status
+    if intent_id:
+        view.payment_intent_id = intent_id
+    if amount is not None:
+        view.paid_amount = str(amount)
+    if currency:
+        view.paid_currency = currency
+    if tax_delta is not None:
+        view.tax_delta = str(tax_delta)
+    if plan_type:
+        view.plan_type = plan_type
+    view.status_summary = summary or _default_status_summary(status, view.delivery_status)
+    order = store.get_order(order_id)
+    if order is not None:
+        view.receipt = _receipt_for(order, view)
+
+
+def _set_delivery_status(order_id: str, status: str, summary: Optional[str] = None) -> None:
+    view = store.view(order_id)
+    view.delivery_status = status
+    view.status_summary = summary or _default_status_summary(view.payment_status, status)
+    order = store.get_order(order_id)
+    if order is not None:
+        view.receipt = _receipt_for(order, view)
+
+
+async def _verify_after_payment(order: Order, secrets: OrderSecrets, view) -> bool:
+    """核验订阅；失败只推进 delivery_status，绝不回退 payment_status。"""
+    pipeline = build_pipeline()
+    try:
+        info = await pipeline.verify(session=secrets.session)
+    except DomainError as exc:
+        _set_delivery_status(
+            order.id,
+            "verify_delayed",
+            f"扣款成功，订阅核验延迟：{redact_sensitive(exc.message)[:120]}",
+        )
+        view.last_error = None
+        view.next_action = None
+        logger.warning("verify_after_pay_delayed id=%s error=%s", order.id, redact_sensitive(exc.message)[:160])
+        await notify_order_update(order.id, order.status, {"delivery_status": "verify_delayed"})
+        return False
+    view.subscription = info
+    view.plan_type = info.raw_kind or view.plan_type
+    if info.active:
+        store.update_status(order.id, OrderStatus.ACTIVE)
+        assert_deliverable(OrderStatus.ACTIVE, info)
+        await _mark_delivered(order.id)
+        return True
+    _set_delivery_status(order.id, "verify_delayed", "扣款成功，订阅尚未生效，可点击重新核验")
+    view.last_error = None
+    view.next_action = None
+    await notify_order_update(order.id, order.status, {"delivery_status": "verify_delayed"})
+    return False
+
+
 def _to_out(order: Order) -> OrderOut:
     view = store.view(order.id)
     subscription = None
@@ -193,6 +292,16 @@ def _to_out(order: Order) -> OrderOut:
         session_email=session_email or None,
         session_reissued_for_country=bool(getattr(view, "session_reissued_for_country", False)),
         exit_country=getattr(view, "exit_country", None),
+        payment_status=view.payment_status,
+        delivery_status=view.delivery_status,
+        payment_intent_id=view.payment_intent_id,
+        paid_amount=view.paid_amount,
+        paid_currency=view.paid_currency,
+        tax_delta=view.tax_delta,
+        plan_type=view.plan_type or str(order.plan),
+        status_summary=view.status_summary
+        or _default_status_summary(view.payment_status, view.delivery_status),
+        receipt=view.receipt or None,
     )
 
 
@@ -516,6 +625,11 @@ async def create_order(
     view.billing = dict(checkout.billing or {})
     view.amount = str(checkout.amount) if checkout.amount is not None else None
     view.currency = checkout.currency
+    view.payment_status = "unpaid"
+    view.delivery_status = "pending"
+    view.tax_delta = str(checkout.tax_delta) if getattr(checkout, "tax_delta", None) is not None else None
+    view.status_summary = _default_status_summary("unpaid", "pending")
+    view.receipt = _receipt_for(order, view)
     view.checkout_kind = checkout.checkout_kind or ("hosted" if plan is Plan.TEAM else "custom")
     view.confirm_return_url = checkout.confirm_return_url or None
     view.promo_code = promo_code or None
@@ -560,8 +674,14 @@ async def _mark_delivered(order_id: str) -> None:
     current = store.get_order(order_id)
     if current is not None and current.status is OrderStatus.ACTIVE:
         store.update_status(order_id, OrderStatus.DELIVERED)
-    store.view(order_id).last_error = None
-    store.view(order_id).next_action = None
+    view = store.view(order_id)
+    view.last_error = None
+    view.next_action = None
+    view.delivery_status = "delivered"
+    view.status_summary = "扣款成功，订阅已生效"
+    current = store.get_order(order_id)
+    if current is not None:
+        view.receipt = _receipt_for(current, view)
     vault.drop(order_id)
     await notify_order_update(order_id, OrderStatus.DELIVERED, {"payment_confirmed": True})
 
@@ -807,6 +927,10 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         raise _error(status.HTTP_404_NOT_FOUND, ErrorCode.COMPLIANCE_BLOCKED, "订单不存在")
     if order.status in {OrderStatus.DELIVERED, OrderStatus.ACTIVE}:
         return _to_out(order)
+    early_view = store.view(order_id)
+    if early_view.payment_status == "succeeded":
+        # 已扣款成功：无论交付是否完成，都不允许再次提交支付。
+        return _to_out(order)
     if order.status is not OrderStatus.AWAITING_PAYMENT:
         raise HTTPException(409, "支付已提交，请查询状态，不要重复确认")
     secrets = vault.get(order_id)
@@ -876,6 +1000,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         view.billing = dict(secrets.billing)
     pipeline = build_pipeline()
     store.update_status(order_id, OrderStatus.PAYING)
+    _set_payment_status(order_id, "processing")
     try:
         payment = await pipeline.pay(
             checkout_url=view.checkout_url or "",
@@ -897,6 +1022,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         uncertain = order.plan is Plan.TEAM and exc.code is ErrorCode.PAYMENT_UNKNOWN_STATE
         failed_status = OrderStatus.UNKNOWN if uncertain else OrderStatus.FAILED
         store.update_status(order_id, failed_status)
+        _set_payment_status(order_id, "failed", summary=f"支付失败：{redact_sensitive(exc.message)[:120]}")
         view.last_error = exc.message
         logger.info(
             "pay_failed id=%s country=%s error=%s",
@@ -912,6 +1038,21 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     store.update_status(order_id, new_status)
     view.next_action = payment.next_action
     view.last_error = None if payment.status.value == "succeeded" else payment.message
+    if payment.status is PaymentStatus.SUCCEEDED:
+        _set_payment_status(
+            order_id,
+            "succeeded",
+            intent_id=payment.provider_ref,
+            amount=view.amount,
+            currency=view.currency,
+            tax_delta=view.tax_delta,
+            plan_type=str(order.plan),
+            summary="扣款成功，正在核验订阅",
+        )
+    elif payment.status in {PaymentStatus.PROCESSING, PaymentStatus.REQUIRES_ACTION}:
+        _set_payment_status(order_id, "processing", summary="支付处理中，请勿重复提交")
+    elif payment.status in {PaymentStatus.DECLINED, PaymentStatus.ERROR}:
+        _set_payment_status(order_id, "failed", summary=payment.message or "支付失败")
     logger.info(
         "pay_finished id=%s country=%s payment=%s order=%s error=%s",
         order_id,
@@ -927,13 +1068,8 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     if new_status is OrderStatus.VERIFYING and order.plan is Plan.TEAM:
         await _mark_delivered(order_id)
     elif new_status is OrderStatus.VERIFYING:
-        # 业务规则：扣款成功即视为开通成功。订阅查询只作为附带信息，失败或尚未生效都不影响结果。
-        try:
-            info = await pipeline.verify(session=secrets.session)
-            view.subscription = info
-        except DomainError as exc:
-            logger.warning("verify_after_pay_failed id=%s error=%s", order_id, redact_sensitive(exc.message)[:200])
-        await _mark_delivered(order_id)
+        # 支付已成功：订阅查询失败只标记 verify_delayed，不回退 payment_status。
+        await _verify_after_payment(order, secrets, view)
     return _to_out(store.get_order(order_id))  # type: ignore[arg-type]
 
 
@@ -967,33 +1103,34 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
     pipeline = build_pipeline()
     if secrets.saved_card_context:
         if secrets.saved_card_context.get("protocol_flow"):
-            raise HTTPException(409, "本订单已进入协议绑卡支付，请使用协议状态查询")
-        if secrets.saved_card_context.get("state") != "checkout_ready":
-            raise HTTPException(409, "请先完成保存卡片并刷新结账链接，再查询订阅")
-        # A status query before payment must leave this checkout available.
-        try:
-            refreshed_session, info = await asyncio.to_thread(_verify_saved_checkout, pipeline, secrets)
-            secrets.session = refreshed_session
-        except DomainError as exc:
-            if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED, ErrorCode.CHECKOUT_UPSTREAM_ERROR}:
-                raise _from_domain(exc)
-            view.last_error = "订阅状态暂未读到，请稍后重新查询"
-            return _to_out(order)
-        view.subscription = info
-        if info.active:
-            if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION, OrderStatus.UNKNOWN}:
-                store.update_status(order_id, OrderStatus.PAYING)
-            if order.status is OrderStatus.PAYING:
-                store.update_status(order_id, OrderStatus.VERIFYING)
-            store.update_status(order_id, OrderStatus.ACTIVE)
-            assert_deliverable(OrderStatus.ACTIVE, info)
-            store.update_status(order_id, OrderStatus.DELIVERED)
-            view.last_error = None
-            vault.drop(order_id)
-            await notify_order_update(order_id, OrderStatus.DELIVERED, {"subscription_active": True})
+            # 协议支付已成功时，/verify 就是前端的一键“重新核验订阅”入口；
+            # 未扣款前仍然拒绝，避免把建单查询混进支付流程。
+            if view.payment_status != "succeeded":
+                raise HTTPException(409, "本订单已进入协议绑卡支付，请使用协议状态查询")
         else:
-            view.last_error = "订阅尚未生效，请在新结账页面完成付款后重新查询"
-        return _to_out(order)
+            if secrets.saved_card_context.get("state") != "checkout_ready":
+                raise HTTPException(409, "请先完成保存卡片并刷新结账链接，再查询订阅")
+            # A status query before payment must leave this checkout available.
+            try:
+                refreshed_session, info = await asyncio.to_thread(_verify_saved_checkout, pipeline, secrets)
+                secrets.session = refreshed_session
+            except DomainError as exc:
+                if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED, ErrorCode.CHECKOUT_UPSTREAM_ERROR}:
+                    raise _from_domain(exc)
+                view.last_error = "订阅状态暂未读到，请稍后重新查询"
+                return _to_out(order)
+            view.subscription = info
+            if info.active:
+                if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION, OrderStatus.UNKNOWN}:
+                    store.update_status(order_id, OrderStatus.PAYING)
+                if order.status is OrderStatus.PAYING:
+                    store.update_status(order_id, OrderStatus.VERIFYING)
+                store.update_status(order_id, OrderStatus.ACTIVE)
+                assert_deliverable(OrderStatus.ACTIVE, info)
+                await _mark_delivered(order_id)
+            else:
+                view.last_error = "订阅尚未生效，请在新结账页面完成付款后重新查询"
+            return _to_out(order)
     current = store.get_order(order_id)
     if current is not None and current.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION, OrderStatus.UNKNOWN}:
         # 3DS 验证完成（或不确定态复查）后从这里继续往 verifying 推进。
@@ -1004,29 +1141,37 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
     try:
         info = await pipeline.verify(session=secrets.session)
     except DomainError as exc:
+        # 扣款已成功的订单：订阅查询任何失败都只能标记 verify_delayed，
+        # 不能返回 401，也不能覆盖 payment_status=succeeded。
+        if view.payment_status == "succeeded":
+            _set_delivery_status(
+                order_id,
+                "verify_delayed",
+                f"扣款成功，订阅核验延迟：{redact_sensitive(exc.message)[:120]}",
+            )
+            view.last_error = None
+            view.next_action = None
+            await notify_order_update(order_id, order.status, {"delivery_status": "verify_delayed"})
+            return _to_out(store.get_order(order_id))  # type: ignore[arg-type]
         if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED}:
             raise _from_domain(exc)
-        # 上游查询暂时出错：保持当前状态返回，由前端稍后重查，不把已支付订单打成失败。
+        # 未扣款订单：保持当前状态返回，由前端稍后重查。
         logger.warning("verify_failed id=%s error=%s", order_id, redact_sensitive(exc.message)[:200])
-        if paid:
-            await _mark_delivered(order_id)
-            return _to_out(store.get_order(order_id))  # type: ignore[arg-type]
         view.last_error = f"订阅状态查询失败，稍后会自动重试：{exc.message[:120]}"
         return _to_out(store.get_order(order_id))  # type: ignore[arg-type]
     view.subscription = info
+    view.plan_type = info.raw_kind or view.plan_type
     if info.active:
         store.update_status(order_id, OrderStatus.ACTIVE)
         assert_deliverable(OrderStatus.ACTIVE, info)
-        store.update_status(order_id, OrderStatus.DELIVERED)
-        view.last_error = None
-        vault.drop(order_id)
-        # SSE 通知：订阅激活并交付
-        await notify_order_update(order_id, OrderStatus.DELIVERED, {"subscription_active": True})
-    elif paid:
         await _mark_delivered(order_id)
+    elif view.payment_status == "succeeded":
+        _set_delivery_status(order_id, "verify_delayed", "扣款成功，订阅尚未生效，可点击重新核验")
+        view.last_error = None
+        view.next_action = None
+        await notify_order_update(order_id, order.status, {"delivery_status": "verify_delayed"})
     else:
         view.last_error = "订阅尚未生效。若是 Team 长链,请先打开链接完成支付再查询。"
-        # SSE 通知：验证失败
         current_status = store.get_order(order_id)
         if current_status:
             await notify_order_update(order_id, current_status.status, {"subscription_active": False})
@@ -1094,6 +1239,35 @@ class ProtocolPayOut(BaseModel):
     intent_status: Optional[str] = None
     charge_id: Optional[str] = None
     payment_method_id: Optional[str] = None
+    payment_status: str = "unpaid"
+    delivery_status: str = "pending"
+    payment_intent_id: Optional[str] = None
+    amount: Optional[str] = None
+    currency: Optional[str] = None
+    tax_delta: Optional[str] = None
+    plan_type: Optional[str] = None
+    status_summary: Optional[str] = None
+    receipt: Optional[Dict[str, Any]] = None
+
+
+def _protocol_out(order_id: str, *, state: str, message: Optional[str] = None, **extra: Any) -> ProtocolPayOut:
+    order = store.get_order(order_id)
+    view = store.view(order_id)
+    summary = view.status_summary or _default_status_summary(view.payment_status, view.delivery_status)
+    return ProtocolPayOut(
+        state=state,
+        message=message if message is not None else summary,
+        payment_status=view.payment_status,
+        delivery_status=view.delivery_status,
+        payment_intent_id=view.payment_intent_id,
+        amount=view.paid_amount or view.amount,
+        currency=view.paid_currency or view.currency,
+        tax_delta=view.tax_delta,
+        plan_type=view.plan_type or (str(order.plan) if order else None),
+        status_summary=summary,
+        receipt=_receipt_for(order, view) if order else None,
+        **extra,
+    )
 
 
 @router.post(
@@ -1120,6 +1294,9 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         raise HTTPException(409, "支付已提交，请查询订单状态，不要重复确认")
 
     view = store.view(order_id)
+    if view.payment_status == "succeeded":
+        state = "paid" if view.delivery_status == "delivered" else "pending"
+        return _protocol_out(order_id, state=state, message=view.status_summary)
     checkout_url = (getattr(view, "checkout_url", "") or "") if view else ""
     if not checkout_url:
         raise HTTPException(409, "订单缺少 checkout_url，请先创建结账")
@@ -1230,6 +1407,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         finally:
             sp.close()
 
+    _set_payment_status(order_id, "processing", summary="支付处理中，请勿重复提交")
     try:
         outcome = await asyncio.to_thread(_run)
     except DomainError as exc:
@@ -1239,13 +1417,50 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         raise _error(status.HTTP_502_BAD_GATEWAY, ErrorCode.CHECKOUT_UPSTREAM_ERROR, str(exc)[:200])
 
     logger.info(
-        "protocol_pay id=%s state=%s decline=%s code=%s",
-        order_id, outcome.state, outcome.decline_code, outcome.code,
+        "protocol_pay id=%s state=%s decline=%s code=%s intent=%s",
+        order_id, outcome.state, outcome.decline_code, outcome.code, outcome.intent_id,
     )
-    return ProtocolPayOut(
-        state=outcome.state, code=outcome.code,
-        decline_code=outcome.decline_code, message=outcome.message,
-        intent_status=outcome.intent_status, charge_id=outcome.charge_id,
+    payment_succeeded = outcome.state == "paid" or outcome.intent_status == "succeeded"
+    if payment_succeeded:
+        _set_payment_status(
+            order_id,
+            "succeeded",
+            intent_id=outcome.intent_id or outcome.charge_id,
+            amount=view.amount,
+            currency=view.currency,
+            tax_delta=view.tax_delta,
+            plan_type=str(order.plan),
+            summary="扣款成功，正在核验订阅",
+        )
+        store.update_status(order_id, OrderStatus.VERIFYING)
+        delivered = await _verify_after_payment(order, secrets, view)
+        response_state = "paid" if delivered else "pending"
+        message = view.status_summary
+    elif outcome.state == "card_declined":
+        _set_payment_status(order_id, "failed", summary=outcome.message or "支付失败")
+        store.update_status(order_id, OrderStatus.FAILED)
+        response_state, message = "card_declined", outcome.message
+    elif outcome.state == "challenge_required":
+        _set_payment_status(order_id, "processing", summary="支付需要继续验证")
+        store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
+        response_state, message = "challenge_required", outcome.message
+    elif outcome.state == "pending":
+        _set_payment_status(order_id, "processing", summary=outcome.message or "支付处理中")
+        store.update_status(order_id, OrderStatus.PAYING)
+        response_state, message = "pending", outcome.message
+    else:
+        # 未确认扣款：保持 processing，不把未知结果误报成失败。
+        _set_payment_status(order_id, "processing", summary="支付结果待核实，可点击重新核验")
+        store.update_status(order_id, OrderStatus.UNKNOWN)
+        response_state, message = "unknown", outcome.message
+    return _protocol_out(
+        order_id,
+        state=response_state,
+        message=message,
+        code=outcome.code,
+        decline_code=outcome.decline_code,
+        intent_status=outcome.intent_status,
+        charge_id=outcome.charge_id,
         payment_method_id=outcome.payment_method_id,
     )
 

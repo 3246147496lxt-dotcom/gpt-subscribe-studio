@@ -32,6 +32,24 @@ export interface Order {
   confirm_return_url?: string | null;
   /** 从 accessToken 解析出的账户邮箱 */
   session_email?: string | null;
+  payment_status?: "unpaid" | "processing" | "succeeded" | "failed";
+  delivery_status?: "pending" | "delivered" | "verify_delayed";
+  payment_intent_id?: string | null;
+  paid_amount?: string | null;
+  paid_currency?: string | null;
+  tax_delta?: string | null;
+  plan_type?: string | null;
+  status_summary?: string | null;
+  receipt?: {
+    payment_intent_id?: string | null;
+    amount?: string | null;
+    currency?: string | null;
+    tax_delta?: string | null;
+    plan_type?: string | null;
+    payment_status?: string | null;
+    delivery_status?: string | null;
+    summary?: string | null;
+  } | null;
 }
 
 export type SavedCardState =
@@ -259,6 +277,22 @@ export interface ProtocolPayResult {
   intent_status?: string | null;
   charge_id?: string | null;
   payment_method_id?: string | null;
+  payment_status?: string | null;
+  delivery_status?: string | null;
+  payment_intent_id?: string | null;
+  tax_delta?: string | null;
+  plan_type?: string | null;
+  status_summary?: string | null;
+  receipt?: {
+    payment_intent_id?: string | null;
+    amount?: string | null;
+    currency?: string | null;
+    tax_delta?: string | null;
+    plan_type?: string | null;
+    payment_status?: string | null;
+    delivery_status?: string | null;
+    summary?: string | null;
+  } | null;
   stage?: "setup" | "sync" | "checkout" | "payment";
   order?: Order;
   next_action?: { type?: string } | null;

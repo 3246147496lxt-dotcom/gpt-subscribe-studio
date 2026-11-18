@@ -33,6 +33,16 @@ class OrderView:
     protocol_saved_result: Optional[Dict[str, Any]] = None
     session_reissued_for_country: bool = False
     exit_country: Optional[str] = None
+    # 支付状态与交付状态独立：支付成功后任何订阅查询失败都不能回退支付结果。
+    payment_status: str = "unpaid"        # unpaid | processing | succeeded | failed
+    delivery_status: str = "pending"     # pending | delivered | verify_delayed
+    payment_intent_id: Optional[str] = None
+    paid_amount: Optional[str] = None
+    paid_currency: Optional[str] = None
+    tax_delta: Optional[str] = None
+    plan_type: Optional[str] = None
+    status_summary: Optional[str] = None
+    receipt: Optional[Dict[str, Any]] = None
 
 
 class InMemoryStore:

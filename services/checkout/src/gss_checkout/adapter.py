@@ -163,6 +163,7 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
             publishable_key=created.publishable_key or None,
             customer_session_client_secret=created.customer_session_client_secret or None,
             billing=dict(address_for(req.billing_country)),
+            tax_delta=getattr(created, "tax_delta", None),
             checkout_kind=created.checkout_kind or ("hosted" if req.plan is Plan.TEAM else "custom"),
             confirm_return_url=created.confirm_return_url or "",
             effective_proxy=used_proxy,

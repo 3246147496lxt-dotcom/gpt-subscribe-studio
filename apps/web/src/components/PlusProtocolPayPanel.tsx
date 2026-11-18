@@ -217,6 +217,18 @@ export function PlusProtocolPayPanel({
             {result.code && <Text size="sm">code：{result.code}</Text>}
             {result.decline_code && <Text size="sm">decline_code：{result.decline_code}</Text>}
             {result.state === "challenge_required" && <Text size="sm">当前结果需要上游验证。查询协议状态可读取后续进展。</Text>}
+            {(result.payment_status === "succeeded" || result.intent_status === "succeeded" || result.receipt?.payment_status === "succeeded") && (
+              <Paper withBorder p="sm" radius="sm">
+                <Stack gap={4}>
+                  <Text fw={600}>扣款回执</Text>
+                  <Text size="sm">实际扣款：{formatAmount(result.receipt?.amount ?? undefined, result.receipt?.currency ?? undefined) || price || "—"}</Text>
+                  {(result.receipt?.tax_delta || result.tax_delta) && <Text size="sm">减免税额：{result.receipt?.tax_delta || result.tax_delta}</Text>}
+                  {(result.receipt?.plan_type || result.plan_type) && <Text size="sm">账号套餐：{result.receipt?.plan_type || result.plan_type}</Text>}
+                  {(result.receipt?.payment_intent_id || result.payment_intent_id) && <Text size="xs" c="dimmed">PaymentIntent：{result.receipt?.payment_intent_id || result.payment_intent_id}</Text>}
+                  <Text size="xs" c="dimmed">{result.receipt?.summary || result.status_summary || result.message}</Text>
+                </Stack>
+              </Paper>
+            )}
           </Stack>
         </Alert>
       )}

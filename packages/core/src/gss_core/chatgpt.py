@@ -465,6 +465,7 @@ class CheckoutSession:
     customer_session_client_secret: str = ""
     checkout_kind: str = "custom"
     confirm_return_url: str = ""
+    tax_delta: Optional[Decimal] = None
 
 
 def jwt_account_id(access_token: str) -> str:
@@ -1083,6 +1084,7 @@ class ChatGPTClient:
                 pk = ""
         page = url if str(url).startswith("http") else page_url
         amount, quote_currency = quote_from_payload(payload, currency)
+        tax_delta: Optional[Decimal] = None
         if not hosted:
             refreshed, refreshed_currency = self._quote_from_context(
                 processor=processor, checkout_id=session_id, page_url=page, currency=quote_currency or currency
@@ -1131,6 +1133,7 @@ class ChatGPTClient:
             customer_session_client_secret=customer_session,
             checkout_kind="hosted" if hosted else "custom",
             confirm_return_url="" if hosted else confirm_return,
+            tax_delta=tax_delta,
         )
 
     def _publishable_key(self) -> str:
