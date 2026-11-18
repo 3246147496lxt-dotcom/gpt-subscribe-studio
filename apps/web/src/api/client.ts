@@ -5,6 +5,7 @@ export interface Order {
   status: string;
   plan: string;
   billing_country: string;
+  exit_country?: string | null;
   checkout_url?: string | null;
   publishable_key?: string | null;
   customer_session_client_secret?: string | null;
@@ -81,6 +82,7 @@ async function readError(res: Response): Promise<string> {
 export async function createOrder(input: {
   plan: Plan;
   billing_country: string;
+  exit_country?: string;
   session: string;
   promo_code?: string;
   promo_campaign_id?: string;
@@ -94,6 +96,7 @@ export async function createOrder(input: {
     body: JSON.stringify({
       plan: input.plan,
       billing_country: input.billing_country,
+      exit_country: input.exit_country || undefined,
       session: input.session,
       promo_code: input.promo_code || "",
       promo_campaign_id: input.promo_campaign_id || "",

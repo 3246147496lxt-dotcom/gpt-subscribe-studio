@@ -22,6 +22,7 @@ import { subscribeOrderUpdates, type OrderUpdateEvent } from "../api/events";
 import { loadStripe, type StripeCardHandle } from "../card-payment/CardFields";
 import { OrderSummary } from "../components/OrderSummary";
 import { PlanPicker, type TeamValues } from "../components/PlanPicker";
+import { REGIONS } from "../plans";
 import { ResultPanel } from "../components/ResultPanel";
 import { SessionField } from "../components/SessionField";
 import { ProtocolPayPanel } from "../components/ProtocolPayPanel";
@@ -35,6 +36,7 @@ interface Props {
 export function OrderNew({ onRecord }: Props) {
   const [plan, setPlan] = useState<Plan>("plus");
   const [country, setCountry] = useState("");
+  const [exitCountry, setExitCountry] = useState("");
   const [session, setSession] = useState("");
   const [team, setTeam] = useState<TeamValues>({
     seats: 5,
@@ -85,6 +87,7 @@ export function OrderNew({ onRecord }: Props) {
     setTeamBilling({ name: "", line1: "", city: "", state: "", postal_code: "", country: "US" });
     setAddr(null);
     setSession("");
+    setExitCountry("");
     setError(null);
     setPromo(null);
     setPromoCampaignId("");
@@ -230,6 +233,7 @@ export function OrderNew({ onRecord }: Props) {
         const created = await createOrder({
           plan,
           billing_country: country,
+          exit_country: exitCountry || country,
           session,
           promo_code: plan === "team" ? team.promoCode.trim() : "",
           promo_campaign_id: plan === "plus" ? promoCampaignId : "",
@@ -341,8 +345,8 @@ export function OrderNew({ onRecord }: Props) {
       {error}
     </Alert>
   ) : null;
-  // 全协议模式的出口：账单国决定，后端会自动把网关地区换成该国家
-  const protocolExit = (order?.billing?.country || order?.billing_country || country || "").toUpperCase() || undefined;
+  // 全协议模式的出口：优先订单 exit_country，其次账单国
+  const protocolExit = (order?.exit_country || order?.billing?.country || order?.billing_country || country || "").toUpperCase() || undefined;
   // 全协议模式在 step 1 由 ProtocolPayPanel 自带按钮，底部不再重复一个「确认支付」
   // 只有「协议模式 + 已建单」才由面板自带按钮；未建单时仍需要底部「生成结账」按钮
   const protocolStep = payMode === "protocol" && step === 1 && Boolean(order);
@@ -391,6 +395,16 @@ export function OrderNew({ onRecord }: Props) {
                 team={team}
                 onTeam={setTeam}
                 disabled={busy}
+              />
+              <Select
+                label="出口国家（代理 / Session 重签发）"
+                description="默认跟随上面的地区。低价区示例：地区 US、出口 PH，代理与重签发走 PH，账单/税务走 US。"
+                placeholder="默认跟随地区"
+                searchable
+                data={REGIONS.map((item) => ({ value: item.code, label: `${item.label} (${item.code})` }))}
+                value={exitCountry || null}
+                onChange={(value) => setExitCountry(value ?? "")}
+                disabled={busy || Boolean(order)}
               />
               <div>
                 <Text size="sm" fw={600} mb={6}>支付方式</Text>
