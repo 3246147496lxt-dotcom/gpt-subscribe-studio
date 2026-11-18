@@ -12,12 +12,13 @@ import {
   type TeamCardPayload,
 } from "../api/client";
 import { PROTOCOL_STAGE_LABELS, protocolBillingError, protocolCardError, protocolIsPaid, protocolPostReady, protocolStateLabel } from "../card-payment/protocolBind";
-import { randomBillingExample } from "../card-payment/billingExamples";
+import { FIXED_TAX_FREE_BILLING, randomBillingExample } from "../card-payment/billingExamples";
 
 interface Props {
   orderId: string;
   country: string;
   sessionEmail?: string | null;
+  billing?: BillingInput | null;
   amount?: string | null;
   currency?: string | null;
   quotationError?: string | null;
@@ -28,12 +29,21 @@ interface Props {
 }
 
 export function PlusProtocolPayPanel({
-  orderId, country, sessionEmail, amount, currency, quotationError, disabled = false,
+  orderId, country, sessionEmail, billing: billingDefaults, amount, currency, quotationError, disabled = false,
   submissionDisabled = false, onBusyChange, onDone,
 }: Props) {
   const [card, setCard] = useState<TeamCardPayload>({ number: "", cvc: "", exp_month: "", exp_year: "" });
-  const [billing, setBilling] = useState<BillingInput>({
-    name: "", email: sessionEmail || "", line1: "", city: "", state: "", postal_code: "", country: country || "US",
+  const [billing, setBilling] = useState<BillingInput>(() => {
+    const source = billingDefaults ?? FIXED_TAX_FREE_BILLING;
+    return {
+      name: source.name ?? "Card Holder",
+      email: sessionEmail || "",
+      line1: source.line1 ?? "",
+      city: source.city ?? "",
+      state: source.state ?? "",
+      postal_code: source.postal_code ?? "",
+      country: source.country ?? (country || "US"),
+    };
   });
   const [result, setResult] = useState<BindAndPayProtocolResult | null>(null);
   const [work, setWork] = useState<"submit" | "query" | null>(null);

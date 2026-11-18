@@ -131,6 +131,8 @@ export function billingExampleError(): string | null {
  * 钉死在免税州可以让总额恒定，也让同一张卡的重复测试可比。
  */
 export const FIXED_TAX_FREE_BILLING = {
+  name: "Card Holder",
+  email: "",
   country: "US",
   state: "OR",
   city: "Portland",

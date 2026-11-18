@@ -23,7 +23,7 @@ import { PlusProtocolPayPanel } from "./PlusProtocolPayPanel";
 import { StripeCardFields, type StripeCardHandle } from "../card-payment/CardFields";
 
 import { formatAmount, payProtocol, payOrder, getOrder, verifyOrder, type BillingInput, type ProtocolPayResult, type Order } from "../api/client";
-import { randomBillingExample } from "../card-payment/billingExamples";
+import { FIXED_TAX_FREE_BILLING, randomBillingExample } from "../card-payment/billingExamples";
 
 interface Props {
   orderId: string;
@@ -43,6 +43,8 @@ interface Props {
   checkoutUrl?: string | null;
   /** 从 accessToken 解析出的账户邮箱，用于预填账单邮箱 */
   sessionEmail?: string | null;
+  /** 建单时后端生成的免税州账单地址；有它就不再要求用户手填 */
+  billing?: BillingInput | null;
   /** 订单是否带优惠活动：带的话浏览器 pm_ 要声明 allow_redisplay */
   requireSaveChoice?: boolean;
   /** 取 pm_ 的方式；由上层持有，提链前就能选 */
@@ -128,7 +130,7 @@ const STEPS = [
 ];
 
 function LegacyProtocolPayPanel({
-  orderId, country, amount, currency, quotationError, exitLabel, sessionEmail,
+  orderId, country, amount, currency, quotationError, exitLabel, sessionEmail, billing: billingDefaults,
   publishableKey, pmMode, onPmMode, requireSaveChoice = false,
   checkoutUrl, disabled, submissionDisabled, browserPayment = false, onBusyChange, onDone, onRefreshQuote,
 }: Props) {
@@ -136,13 +138,17 @@ function LegacyProtocolPayPanel({
   // 账单地址在五个免税州里随机生成（避免每次同一地址）；
   // 邮箱优先用 accessToken 里解析出的账户邮箱。
   const [billing, setBilling] = useState<BillingInput>(() => {
+    const source = billingDefaults ?? FIXED_TAX_FREE_BILLING;
     const base: BillingInput = {
       email: (sessionEmail ?? "").trim(),
-      name: "",
-      line1: "", city: "", state: "", postal_code: "",
-      country: country || "US",
+      name: source.name ?? "",
+      line1: source.line1 ?? "",
+      city: source.city ?? "",
+      state: source.state ?? "",
+      postal_code: source.postal_code ?? "",
+      country: source.country ?? (country || "US"),
     };
-    return browserPayment ? base : randomBillingExample(base);
+    return base;
   });
   // 取 pm_ 的方式由上层持有（提链前就能选），这里只保留输入框句柄
   const [stripeCard, setStripeCard] = useState<StripeCardHandle | null>(null);

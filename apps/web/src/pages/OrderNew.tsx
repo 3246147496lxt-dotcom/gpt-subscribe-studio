@@ -532,6 +532,15 @@ export function OrderNew({ onRecord }: Props) {
                 browserPayment={order.plan === "plus" && pmMode === "stripe"}
                 submissionDisabled={order.status !== "awaiting_payment"}
                 sessionEmail={order.session_email}
+                billing={order.billing ? {
+                  name: order.billing.name ?? "",
+                  email: order.session_email ?? "",
+                  line1: order.billing.line1 ?? "",
+                  city: order.billing.city ?? "",
+                  state: order.billing.state ?? "",
+                  postal_code: order.billing.postal_code ?? "",
+                  country: order.billing.country ?? order.billing_country,
+                } : null}
                 pmMode={pmMode}
                 onPmMode={setPmMode}
                 requireSaveChoice={Boolean(order.promo_campaign_id)}
