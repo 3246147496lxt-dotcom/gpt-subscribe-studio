@@ -469,21 +469,45 @@ async def create_order(
             billing_country,
             original_country or "-",
         )
-        try:
-            client = await asyncio.to_thread(
-                ChatGPTClient.reauthorize_for_country,
-                raw_session,
-                proxy=exit_proxy,
-                country=exit_country,
-            )
-        except DomainError as exc:
-            raise _from_domain(exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "session_reissue_failed exit_country=%s error=%s",
-                exit_country,
-                redact_sensitive(str(exc))[:200],
-            )
+        # PH 住宅节点会偶发 TLS reset / CONNECT 404；换 SID 重试，
+        # 避免一次代理抖动就把可用的 sessionToken 判死。
+        from gss_core.proxies import rotate_proxy_sid
+
+        last_exc: Exception | None = None
+        client = None
+        for attempt in range(3):
+            try:
+                client = await asyncio.to_thread(
+                    ChatGPTClient.reauthorize_for_country,
+                    raw_session,
+                    proxy=exit_proxy,
+                    country=exit_country,
+                )
+                break
+            except DomainError as exc:
+                last_exc = exc
+                retryable = "无法在目标国家" in exc.message
+                if not retryable or attempt == 2:
+                    raise _from_domain(exc)
+                logger.warning(
+                    "session_reissue_retry exit_country=%s attempt=%s error=%s",
+                    exit_country, attempt + 1, redact_sensitive(exc.message)[:160],
+                )
+                if exit_proxy:
+                    exit_proxy = rotate_proxy_sid(exit_proxy)
+                await asyncio.sleep(1)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning(
+                    "session_reissue_failed exit_country=%s attempt=%s error=%s",
+                    exit_country, attempt + 1, redact_sensitive(str(exc))[:200],
+                )
+                if attempt == 2:
+                    break
+                if exit_proxy:
+                    exit_proxy = rotate_proxy_sid(exit_proxy)
+                await asyncio.sleep(1)
+        if client is None:
             raise _error(
                 status.HTTP_401_UNAUTHORIZED,
                 ErrorCode.INVALID_SESSION,
