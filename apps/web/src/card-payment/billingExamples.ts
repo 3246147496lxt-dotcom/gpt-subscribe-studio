@@ -87,10 +87,12 @@ const PLACES: Record<string, readonly Place[]> = {
   ],
 };
 
-export const TAX_FREE_STATES = Object.keys(PLACES) as readonly string[];
+// 只随机 OR / DE：这两州州级与地方都没有销售税。
+// AK 虽然没有州销售税，但部分市镇（如 Juneau）有地方税，不能保证 0 税。
+export const TAX_FREE_STATES = ["OR", "DE"] as const;
 
-/** Human-readable label for the five statewide no-sales-tax states. */
-export const TAX_FREE_STATE_LABEL = "AK / DE / MT / NH / OR";
+/** Human-readable label for the strictly zero-sales-tax states. */
+export const TAX_FREE_STATE_LABEL = "OR / DE";
 
 function random(): number {
   return crypto.getRandomValues(new Uint32Array(1))[0] / 0x100000000;
