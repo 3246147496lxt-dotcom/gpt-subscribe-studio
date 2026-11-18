@@ -1062,3 +1062,19 @@ def test_exit_country_prefers_target_country() -> None:
     # 非法目标国家码才回退到 Session 签发地。
     assert exit_country_for("PH", "USA") == "PH"
     assert exit_country_for("PH", "japan") == "PH"
+
+
+def test_quote_currency_prefers_checkout_state_over_unrelated_nested_currency() -> None:
+    payload = {
+        "marketing": {"currency": "usd"},
+        "checkout_state": {
+            "currency": "php",
+            "total": {
+                "total": {"minorUnitsAmount": 110000, "amount": "₱1,100.00"},
+                "subtotal": {"minorUnitsAmount": 98214, "amount": "₱982.14"},
+            },
+        },
+    }
+    amount, currency = quote_from_payload(payload, "PHP")
+    assert currency == "PHP"
+    assert amount == Decimal("1100.00")

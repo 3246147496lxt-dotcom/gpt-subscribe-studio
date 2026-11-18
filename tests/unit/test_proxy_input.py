@@ -46,3 +46,11 @@ def test_parse_without_tokens_is_flagged() -> None:
 def test_parse_rejects_garbage(raw: str) -> None:
     with pytest.raises(ValueError):
         parse_proxy_input(raw)
+
+
+def test_parse_provider_geo_style_region() -> None:
+    raw = ("http://1p7m3lhraxmiyaip_g-PH_f-1001_sid-556948_l-15:"
+           "secret@global.miyaip.online:1111")
+    gw = gateway_from_input(raw)
+    assert (gw.region, gw.sid) == ("PH", "556948")
+    assert "g-PH" in gw.proxy_url()

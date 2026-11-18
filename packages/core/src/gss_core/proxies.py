@@ -16,7 +16,9 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 ROLES = ("checkout", "approve")
 # 供应商写法不一：-region-US / _country_us、-sid-abc / -session-abc。替换时保留原来的键名与大小写。
-_REGION = re.compile(r"([-_](?:region|country|area|cc)[-_])([A-Za-z]{2})(?=[-_]|$)", re.I)
+_REGION = re.compile(
+    r"([-_](?:region|country|area|cc|geo|g)[-_])([A-Za-z]{2})(?=[-_]|$)", re.I
+)
 _SID = re.compile(r"([-_](?:sid|session|sessid|sessionid)[-_])([A-Za-z0-9]+)(?=[-_]|$)", re.I)
 _COUNTRY_CODE = re.compile(r"^[A-Z]{2}$")
 

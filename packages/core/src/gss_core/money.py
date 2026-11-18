@@ -84,6 +84,22 @@ def _minor_bucket(bucket: Any, currency: str) -> Optional[Decimal]:
 
 
 def _currency_of(payload: Any, default: str) -> str:
+    """按 checkout 的权威位置取币种，避免递归命中无关的 "usd" 字段。"""
+    candidates: list[Any] = []
+    if isinstance(payload, dict):
+        candidates.extend((payload.get("currency"), payload.get("currency_code")))
+        state = payload.get("checkout_state")
+        if isinstance(state, dict):
+            candidates.append(state.get("currency"))
+            total = state.get("total")
+            if isinstance(total, dict):
+                for key in ("total", "subtotal"):
+                    bucket = total.get(key)
+                    if isinstance(bucket, dict):
+                        candidates.append(bucket.get("currency"))
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
     found = _find_string(payload, ("currency", "currency_code"), depth=0)
     return (found or default or "").strip().upper()
 
