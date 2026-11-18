@@ -891,6 +891,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
             plan=str(order.plan), team_context=secrets.team_context,
             passive_captcha_token=payload.passive_captcha_token, rv_timestamp=payload.rv_timestamp,
             session_reissued=getattr(secrets, "session_reissued", False),
+            exit_country=getattr(secrets, "exit_country", "") or None,
         )
     except DomainError as exc:
         uncertain = order.plan is Plan.TEAM and exc.code is ErrorCode.PAYMENT_UNKNOWN_STATE

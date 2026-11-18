@@ -105,7 +105,7 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
             )
         client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
         client.timeout = float(self.timeout)
-        client_country = proxy_exit_region(proxy) or target_country
+        client_country = req.exit_country or proxy_exit_region(proxy) or target_country
         client.language = locale_for(client_country)
         client.timezone = timezone_for(client_country)
         if str(req.plan or "").lower() == "team" and public_checkout_id(checkout_id).startswith("cs_"):

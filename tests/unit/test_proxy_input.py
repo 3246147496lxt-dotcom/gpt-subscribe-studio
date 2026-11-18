@@ -54,3 +54,13 @@ def test_parse_provider_geo_style_region() -> None:
     gw = gateway_from_input(raw)
     assert (gw.region, gw.sid) == ("PH", "556948")
     assert "g-PH" in gw.proxy_url()
+
+
+def test_rewrite_does_not_append_params_for_fixed_username_proxy() -> None:
+    raw = "http://1p7m3lhraxmiyaip:secret@global.miyaip.online:1111"
+    gw = gateway_from_input(raw)
+    out = gw.proxy_url()
+    rewritten = rewrite_proxy_exit(out, region="PH", sid="ABCD1234")
+    assert rewritten == out
+    assert "-region-PH" not in rewritten
+    assert "-sid-" not in rewritten

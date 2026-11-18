@@ -216,15 +216,16 @@ def rewrite_proxy_exit(proxy: str, *, region: str = "", sid: str = "") -> str:
         return proxy
     region = str(region or "").strip().upper()
     sid = str(sid or "").strip()
+    append_params = os.environ.get("GSS_PROXY_APPEND_PARAMS", "").lower() in {"1", "true", "yes"}
     if region:
         if _REGION.search(username):
             username = _REGION.sub(lambda match: match[1] + _like(match[2], region), username)
-        else:
+        elif append_params:
             username = f"{username}-region-{region}"
     if sid:
         if _SID.search(username):
             username = _SID.sub(lambda match: match[1] + sid, username)
-        else:
+        elif append_params:
             username = f"{username}-sid-{sid}"
     host = hostname
     if ":" in hostname and not hostname.startswith("["):

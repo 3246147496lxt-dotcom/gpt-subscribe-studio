@@ -115,6 +115,7 @@ class OrderPipeline:
         passive_captcha_token: Optional[str] = None,
         rv_timestamp: Optional[str] = None,
         session_reissued: bool = False,
+        exit_country: Optional[str] = None,
     ) -> PaymentResult:
         """阶段二：卡支付。按 ``card_source`` 校验必备入参（凭证只在此处入参传递）。"""
 
@@ -140,6 +141,7 @@ class OrderPipeline:
             billing=billing, plan=plan, team_context=team_context,
             passive_captcha_token=passive_captcha_token, rv_timestamp=rv_timestamp,
             session_reissued=session_reissued,
+            exit_country=exit_country,
         )
         return await self.deps.payment.pay(req)
 

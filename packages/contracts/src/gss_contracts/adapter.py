@@ -111,6 +111,7 @@ class PaymentRequest:
     passive_captcha_token: Optional[str] = None
     rv_timestamp: Optional[str] = None
     session_reissued: bool = False
+    exit_country: Optional[str] = None
 
 
 @dataclass(frozen=True)

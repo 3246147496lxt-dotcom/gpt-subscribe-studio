@@ -784,6 +784,11 @@ class PlusHarProtocol:
             message = redact_sensitive(str(payload.get("message") or f"confirm HTTP {status}"))[:200]
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, message)
         self.confirmed = payload
+        if str(payload.get("status") or "") == "subscription_limit":
+            raise DomainError(
+                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                "该账号已达到订阅数量上限（subscription_limit），本次未扣款",
+            )
         intent_id, secret, return_url = payment_intent_from_confirm(payload)
         if return_url:
             self.confirm_return_url = return_url
