@@ -55,3 +55,21 @@ def test_redact_mapping_nested() -> None:
 def test_non_sensitive_text_unchanged() -> None:
     text = "订单已创建，状态 created，账单国家 US"
     assert redact(text) == text
+
+
+def test_stripe_client_secret_and_pi_secret_redacted() -> None:
+    out = redact(
+        '{"client_secret":"pi_3AbcDef_secret_9Zyx",'
+        '"payment_intent":"pi_3AbcDef_secret_9Zyx"}'
+    )
+    assert "pi_3AbcDef_secret_9Zyx" not in out
+    assert MASK in out
+
+
+def test_pii_email_and_address_redacted() -> None:
+    out = redact(
+        '{"email":"buyer@example.test","line1":"98 EDSA","postal_code":"1100"}'
+    )
+    assert "buyer@example.test" not in out
+    assert "98 EDSA" not in out
+    assert "1100" not in out

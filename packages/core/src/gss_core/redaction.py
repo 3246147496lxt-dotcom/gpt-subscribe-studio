@@ -38,7 +38,23 @@ _KEYED_RULES: List[Tuple[Pattern[str], str]] = [
         r"\1\2" + MASK,
     ),
     (
+        re.compile(r"(?i)\b(client[_-]?secret)\b(\"?\s*[:=]\s*\"?)([^\s,;&\"']{6,})"),
+        r"\1\2" + MASK,
+    ),
+    (
+        re.compile(r"\b(pi_[A-Za-z0-9]+)_secret_[A-Za-z0-9]+"),
+        r"\1_secret_" + MASK,
+    ),
+    (
         re.compile(r"(?i)\b(api[_-]?key|service[_-]?token|secret)\b(\"?\s*[:=]\s*\"?)([A-Za-z0-9._\-]{6,})"),
+        r"\1\2" + MASK,
+    ),
+    (
+        re.compile(r"(?i)\b(email)\b(\"?\s*[:=]\s*\"?)([^\s,;&\"']{3,})"),
+        r"\1\2" + MASK,
+    ),
+    (
+        re.compile(r"(?i)\b(line1|line2|postal_code|address_line1)\b(\"?\s*[:=]\s*\"?)([^\s,;&\"']{2,})"),
         r"\1\2" + MASK,
     ),
     (
