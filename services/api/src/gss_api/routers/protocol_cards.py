@@ -85,6 +85,7 @@ def _context(order_id: str, *, start: bool):
 def _spec(order, view, secrets, payload=None):
     return {
         "account_id": secrets.account_id, "country": order.billing_country,
+        "exit_country": getattr(secrets, "exit_country", "") or "",
         "promo": order.mode.billing_mode is BillingMode.PROMO,
         "promo_code": view.promo_code or "", "promo_campaign_id": view.promo_campaign_id or "",
         "expected_amount": payload.expected_amount if payload else view.amount,

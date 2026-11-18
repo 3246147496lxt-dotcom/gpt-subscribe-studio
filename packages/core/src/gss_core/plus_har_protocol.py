@@ -1117,6 +1117,7 @@ def run_har_context(
     card: Optional[Dict[str, str]] = None,
     billing: Optional[Dict[str, str]] = None,
     read_only: bool = False,
+    exit_country: str = "",
 ) -> Dict[str, Any]:
     """Drive one HAR-faithful attempt on an existing checkout context.
 
@@ -1156,6 +1157,7 @@ def run_har_context(
         customer_session_client_secret=str(spec.get("customer_session_client_secret") or ""),
         email=str((billing or {}).get("email") or ""),
         country=country,
+        exit_country=exit_country,
         account_id=str(client.account_id or spec.get("account_id") or ""),
         processor=str(spec.get("processor") or ""),
         confirm_return_url=str(spec.get("confirm_return_url") or ""),

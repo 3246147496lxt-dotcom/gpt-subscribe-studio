@@ -297,7 +297,10 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
     if har_engine_enabled() and not checkout_id.startswith("cs_"):
         # 2026-10-29 HAR 逐请求复刻（含指纹与遥测）；GSS_PLUS_ENGINE=legacy 回退旧链路。
         # cs_ 形态的 custom checkout 需要先 finalize，仍走旧链路。
-        return run_har_context(client, context, spec, card=card, billing=billing, read_only=read_only)
+        return run_har_context(
+            client, context, spec, card=card, billing=billing, read_only=read_only,
+            exit_country=str(spec.get("exit_country") or ""),
+        )
     stage = "checkout"
     terminal = context.get("terminal_result")
     if terminal:

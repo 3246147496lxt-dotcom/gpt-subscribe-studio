@@ -62,7 +62,12 @@ class UpstreamAccountAdapter(AccountAdapterBase):
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法查询订阅")
         client = ChatGPTClient.from_raw_session(session, proxy=configured_proxy("checkout"))
         client.timeout = float(self.timeout)
-        payload = client.subscription_payload()
+        try:
+            # 付款后 accessToken 经常在订阅查询前过期；先刷新一次再读。
+            client.refresh_session()
+            payload = client.subscription_payload()
+        finally:
+            client.close()
         plan_type = str(
             payload.get("plan_type")
             or (payload.get("subscription") or {}).get("plan")
