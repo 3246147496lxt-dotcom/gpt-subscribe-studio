@@ -81,3 +81,66 @@ def test_session_token_with_prefix() -> None:
     assert bundle.access_token == ""
     assert bundle.session_token == jwe_token
 
+
+
+SESSION_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/141.0.7390.55 Safari/537.36"
+)
+
+
+def test_statsig_identity_wins_over_stale_cookie_and_top_level_fields() -> None:
+    raw = json.dumps(
+        {
+            "accessToken": "tok_json",
+            "deviceId": "did-top-level",
+            "cookies": {"oai-did": "did-stale-cookie"},
+            "statsigContext": {
+                "deviceId": "did-from-statsig",
+                "userAgent": SESSION_UA,
+                "country": "jp",
+            },
+        }
+    )
+    bundle = parse_session_bundle(raw)
+    assert bundle.device_id == "did-from-statsig"
+    # Cookie oai-did 必须被强制同步，不能保留旧导出里的值。
+    assert bundle.cookies["oai-did"] == "did-from-statsig"
+    assert bundle.user_agent == SESSION_UA
+    assert bundle.country == "JP"
+
+
+def test_statsig_context_accepts_json_string() -> None:
+    raw = json.dumps(
+        {
+            "accessToken": "tok_json",
+            "statsigContext": json.dumps(
+                {"deviceId": "did-string", "userAgent": SESSION_UA, "country": "PH"}
+            ),
+        }
+    )
+    bundle = parse_session_bundle(raw)
+    assert bundle.device_id == "did-string"
+    assert bundle.user_agent == SESSION_UA
+    assert bundle.country == "PH"
+
+
+def test_invalid_statsig_user_agent_is_ignored() -> None:
+    raw = json.dumps(
+        {
+            "accessToken": "tok_json",
+            "statsigContext": {"deviceId": "did-1", "userAgent": "not a browser", "country": "USA"},
+        }
+    )
+    bundle = parse_session_bundle(raw)
+    assert bundle.user_agent == ""
+    assert bundle.country == ""
+
+
+def test_missing_statsig_still_uses_cookie_device() -> None:
+    raw = json.dumps({"accessToken": "tok_json", "cookies": {"oai-did": "did-cookie"}})
+    bundle = parse_session_bundle(raw)
+    assert bundle.device_id == "did-cookie"
+    assert bundle.user_agent == ""
+    assert bundle.country == ""

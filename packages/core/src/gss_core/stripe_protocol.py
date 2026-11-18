@@ -28,6 +28,9 @@ from urllib.parse import urlencode
 
 import httpx
 
+from gss_core.chatgpt import profile_from_session_ua
+from gss_core.redaction import redact_sensitive
+
 try:
     from curl_cffi import requests as curl_requests
     _HAS_CURL_CFFI = True
@@ -83,6 +86,15 @@ _PLUGINS = (
 
 def log(msg: str) -> None:
     print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def _log_http_failure(where: str, response: Any, *, limit: int = 4000) -> None:
+    """上游 >=400 时输出原始状态码 + 脱敏响应体。"""
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status < 400 or "r.stripe.com" in where:
+        return
+    body = redact_sensitive(str(getattr(response, "text", "") or "")[:limit])
+    log(f"   upstream_error where={where} status={status} body={body}")
 
 
 def _b64url(n: int = 32) -> str:
@@ -157,15 +169,23 @@ class StripeProtocol:
         billing: dict[str, str] | None = None,
         timeout: float = 120.0,
         profile: dict | None = None,
+        user_agent: str = "",
     ) -> None:
         self.proxy = proxy or None
         self.locale = ""
         self.timezone = ""
-        # 指纹必须与建单、求解器完全一致：由调用方传入同一份 profile
+        # 指纹必须与建单、求解器完全一致：优先使用 Session 的真实 UA。
         self.profile = dict(profile or _DEFAULT_PROFILE)
-        self.ua = self.profile["ua"].format(build=self.profile["build"])
-        self.platform = self.profile["platform"]
-        self.screen = tuple(self.profile["screen"])
+        derived = profile_from_session_ua(user_agent) if user_agent else None
+        if user_agent:
+            self.ua = user_agent
+            self.platform = (derived or self.profile)["platform"]
+            self.screen = tuple((derived or self.profile)["screen"])
+        else:
+            self.ua = self.profile["ua"].format(build=self.profile["build"])
+            self.platform = self.profile["platform"]
+            self.screen = tuple(self.profile["screen"])
+        self.headers = {**STRIPE_HEADERS, "User-Agent": self.ua}
         self.captcha_key = captcha_key
         self.captcha_url = captcha_url.rstrip("/")
         self.card = card or {}
@@ -220,7 +240,7 @@ class StripeProtocol:
                     impersonate="chrome150",
                     proxies=proxies,
                     timeout=self.timeout,
-                    headers={"Accept": "application/json"},
+                    headers={"User-Agent": self.ua, "Accept": "application/json"},
                 )
                 log("   使用 curl_cffi（Chrome TLS 指纹）")
             else:
@@ -250,12 +270,17 @@ class StripeProtocol:
     def _post(self, url: str, data: str, headers: dict[str, str]):
         c = self._http()
         if _HAS_CURL_CFFI and curl_requests is not None and hasattr(c, "post"):
-            return c.post(url, data=data, headers=headers)
-        return c.post(url, content=data, headers=headers)
+            response = c.post(url, data=data, headers=headers)
+        else:
+            response = c.post(url, content=data, headers=headers)
+        _log_http_failure(url, response)
+        return response
 
     def _get(self, url: str, params: dict[str, Any], headers: dict[str, str]):
         c = self._http()
-        return c.get(url, params=params, headers=headers)
+        response = c.get(url, params=params, headers=headers)
+        _log_http_failure(url, response)
+        return response
 
 
     # ── 遥测上报（模拟 stripe.js 的 r.stripe.com/b）─────────
@@ -510,7 +535,7 @@ class StripeProtocol:
         }
         r = self._post(
             f"{STRIPE_API}/v1/payment_pages/{cs_id}/init",
-            _form(data), STRIPE_HEADERS,
+            _form(data), self.headers,
         )
         if r.status_code != 200:
             raise RuntimeError(f"init {r.status_code}: {r.text[:200]}")
@@ -555,7 +580,7 @@ class StripeProtocol:
             "stripe_js_id": ctx.stripe_js_id,
             "type": "deferred_intent",
         }
-        r = self._get(f"{STRIPE_API}/v1/elements/sessions", params, STRIPE_HEADERS)
+        r = self._get(f"{STRIPE_API}/v1/elements/sessions", params, self.headers)
         if r.status_code == 200:
             j = r.json()
             sid = j.get("session_id") or j.get("id")
@@ -578,7 +603,7 @@ class StripeProtocol:
             "tax_region[country]": self.billing.get("country", "US"),
         }
         r = self._post(f"{STRIPE_API}/v1/payment_pages/{cs_id}",
-                       _form(data), STRIPE_HEADERS)
+                       _form(data), self.headers)
         log(f"   → {r.status_code}")
         if r.status_code == 200:
             try:
@@ -642,7 +667,7 @@ class StripeProtocol:
         }
         r = self._post(
             f"{STRIPE_API}/v1/payment_methods", _form(data),
-            {**STRIPE_HEADERS, "Origin": "https://pay.openai.com",
+            {**self.headers, "Origin": "https://pay.openai.com",
              "Referer": "https://pay.openai.com/"})
         if r.status_code != 200:
             raise RuntimeError(f"payment_methods {r.status_code}: {r.text[:300]}")
@@ -682,7 +707,7 @@ class StripeProtocol:
             data["passive_captcha_ekey"] = captcha.get("ekey", "")
         r = self._post(
             f"{STRIPE_API}/v1/payment_pages/{cs_id}/confirm", _form(data),
-            {**STRIPE_HEADERS, "Origin": "https://pay.openai.com",
+            {**self.headers, "Origin": "https://pay.openai.com",
              "Referer": "https://pay.openai.com/"},
         )
         log(f"   → {r.status_code} ({len(r.text)} chars)")
@@ -754,7 +779,7 @@ class StripeProtocol:
         if ekey:
             data["captcha_response_key"] = ekey
         path = path if path.startswith("/") else "/" + path
-        r = self._post(f"{STRIPE_API}{path}", _form(data), STRIPE_HEADERS)
+        r = self._post(f"{STRIPE_API}{path}", _form(data), self.headers)
         log(f"   → {r.status_code} ({len(r.text)} chars)")
         try:
             return {"status": r.status_code, "body": r.json()}
@@ -770,7 +795,7 @@ class StripeProtocol:
             r = self._get(
                 f"{STRIPE_API}/v1/payment_pages/{cs_id}/poll",
                 {"key": PUBLISHABLE_KEY, "_stripe_version": V_BASE},
-                STRIPE_HEADERS,
+                self.headers,
             )
             try:
                 last = r.json()

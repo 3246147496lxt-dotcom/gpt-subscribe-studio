@@ -1,6 +1,6 @@
-"""session 刷新对齐：用账单国出口请求 /api/auth/session，换取与本次 IP 同批次的凭证。
+"""session 刷新对齐：用 Session 签发地出口请求 /api/auth/session，换取与本次 IP 同批次的凭证。
 
-结账地区由出口代理决定，session 本身不绑定国家；刷新是风控缓解措施，
+结账地区由 statsigContext.country 决定，session 本身不绑定国家；刷新是风控缓解措施，
 必须软失败（不阻断结账/支付）。
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from curl_cffi.requests import Cookies
 
 from gss_checkout import UpstreamCheckoutAdapter
 from gss_contracts import BillingMode, CheckoutRequest, PaymentRequest, Plan
@@ -66,6 +67,35 @@ def test_refresh_session_updates_token_and_cookies() -> None:
     assert client.access_token == _jwt("acct-refreshed")
     assert client.extra_cookies["oai-sc"] == "sc-from-refresh"
     assert any("/api/auth/session" in url for url in client._http.gets)
+
+
+def test_refresh_session_drops_expired_copies_without_restoring_them() -> None:
+    session_cookie = "__Secure-next-auth.session-token"
+    jar = Cookies()
+    jar.set(session_cookie, "sess-token", domain="chatgpt.com", secure=True)
+    jar.set("old-cookie", "old-value", domain="chatgpt.com")
+    jar.set("old-cookie", "different-path", domain="chatgpt.com", path="/unrelated")
+    jar.set("keep-cookie", "keep-value", domain="chatgpt.com")
+    for cookie in jar.jar:
+        if cookie.path == "/" and cookie.name in {session_cookie, "old-cookie"}:
+            cookie.expires = 1
+
+    class RefreshHttp(_SessionHttp):
+        def get(self, url, **kwargs):
+            jar.jar.clear_expired_cookies()
+            return super().get(url, **kwargs)
+
+    client = _client_with_session_token()
+    client.extra_cookies = {session_cookie: "sess-token", "old-cookie": "old-value"}
+    client._http = RefreshHttp(payload={"accessToken": _jwt("acct-refreshed")})
+    client._http.cookies = jar
+
+    assert client.refresh_session() is True
+    assert client.session_token == ""
+    assert client.extra_cookies == {"keep-cookie": "keep-value"}
+    header = client._http.headers["Cookie"]
+    assert session_cookie not in header
+    assert "old-cookie" not in header
 
 
 def test_refresh_session_soft_fails_on_network_error() -> None:
@@ -198,3 +228,28 @@ def test_payment_adapter_refreshes_session_before_warmup(monkeypatch: pytest.Mon
         )
 
     assert stub.calls.index("refresh") < stub.calls.index("warmup") < stub.calls.index("confirm")
+
+
+def test_refresh_session_logs_upstream_status_and_body(caplog) -> None:
+    class ErrorResponse:
+        status_code = 503
+        text = '{"error":"upstream-body-marker"}'
+        url = "https://chatgpt.com/api/auth/session?secret=should-not-leak"
+
+        def json(self):
+            return {}
+
+    class ErrorHttp:
+        headers: dict = {}
+        cookies = None
+
+        def get(self, url, **kwargs):
+            return ErrorResponse()
+
+    client = _client_with_session_token()
+    client._http = ErrorHttp()
+    with caplog.at_level("WARNING"):
+        assert client.refresh_session() is False
+    assert "upstream_error where=/api/auth/session status=503" in caplog.text
+    assert "body={\"error\":\"upstream-body-marker\"}" in caplog.text
+    assert "secret=should-not-leak" not in caplog.text

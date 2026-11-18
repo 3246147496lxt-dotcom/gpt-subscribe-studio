@@ -30,7 +30,13 @@ from gss_core.chatgpt import (
 )
 from gss_core.config import load_settings
 from gss_core.countries import currency_for, locale_for, timezone_for
-from gss_core.proxies import align_proxy_region, configured_proxy, session_proxy
+from gss_core.proxies import (
+    align_proxy_region,
+    configured_proxy,
+    exit_country_for,
+    session_proxy,
+)
+from gss_core.session_token import parse_session_bundle
 
 
 class PaymentAdapterBase:
@@ -82,11 +88,17 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
         if not checkout_id:
             raise DomainError(ErrorCode.PAYMENT_DECLINED, "缺少 checkout_session_id")
 
-        # The exit must match the billing country of the payment method. A checkout
-        # created for one region but billed to another otherwise looks inconsistent to
-        # Stripe and forces an extra verification step.
+        # The exit follows the session issuer (statsigContext.country); billing country
+        # is only a fallback. A cross-border exit looks inconsistent to Stripe and
+        # forces an extra verification step.
         billing_country = str((req.billing or {}).get("country") or "").upper()
         target_country = billing_country if str(req.plan or "").lower() == "team" and billing_country else req.country
+        # Session 签发地优先于账单国；否则已 pin 的出口会被账单国改回去。
+        try:
+            session_country = parse_session_bundle(req.session).country
+        except ValueError:
+            session_country = ""
+        target_country = exit_country_for(session_country, target_country)
         proxy = align_proxy_region(
             req.checkout_proxy
             or req.approve_proxy
@@ -105,7 +117,7 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
             finally:
                 client.close()
         page_url = req.checkout_url if str(req.checkout_url or "").startswith(APP_BASE) else f"{APP_BASE}/"
-        # 支付阶段出口同样已对齐账单国：先刷新 session 再 warmup，
+        # 支付阶段出口同样已对齐 Session 签发地：先刷新 session 再 warmup，
         # 让确认请求的 cookie/凭证与本批次出口同批次。软失败不阻断。
         client.refresh_session()
         client.warmup(page_url=page_url)
@@ -271,10 +283,12 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                     bool(challenge.get("site_key")), bool(challenge.get("rqdata")))
         try:
             token = solve_hcaptcha(client.stripe_http, challenge, api_key=settings.captcha_api_key,
-                                   api_url=settings.captcha_api_url)
+                                   api_url=settings.captcha_api_url, proxy=client.proxy or "",
+                                   user_agent=client.ua)
             verified = verify_challenge(client.stripe_http, intent_id=intent_id, client_secret=client_secret,
                                         token=token, publishable_key=req.publishable_key or "",
-                                        api_version="2026-03-25.dahlia")
+                                        api_version="2026-03-25.dahlia",
+                                        user_agent=client.ua)
         except DomainError as exc:
             logger.warning("challenge_failed code=%s error=%s", exc.code.value,
                            redact_sensitive(exc.message)[:200])

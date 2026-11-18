@@ -85,10 +85,11 @@ class TeamHostedClient:
 
     @staticmethod
     def response(response) -> dict:
-        from .chatgpt import _json, _raise_stripe
+        from .chatgpt import _json, _log_upstream_failure, _raise_stripe
         payload = _json(response)
         status = int(getattr(response, "status_code", 0) or 0)
         if status >= 400:
+            _log_upstream_failure("hosted", response)
             error = payload.get("error") if isinstance(payload, dict) else None
             error = error if isinstance(error, dict) else {}
             # Stripe 把真正的失败原因放在 extra_fields.confirm_error_reason，

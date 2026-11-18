@@ -19,7 +19,14 @@ from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
 from gss_core.chatgpt import ChatGPTClient, clamp_team_seats
 from gss_core.countries import country_codes, currency_for
-from gss_core.proxies import align_proxy_region, configured_proxy, rotate_proxy_sid, session_proxy
+from gss_core.proxies import (
+    align_proxy_region,
+    configured_proxy,
+    exit_country_for,
+    rotate_proxy_sid,
+    session_proxy,
+)
+from gss_core.session_token import parse_session_bundle
 
 logger = logging.getLogger("gss.checkout")
 _STRIPE_PROXY_CHECK_URL = "https://api.stripe.com/v1/payment_methods"
@@ -96,9 +103,16 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
     async def create_checkout(self, req: CheckoutRequest) -> CheckoutResult:
         if not req.session:
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法创建结账")
+        # 出口国家以 Session 签发地为准，账单国只兜底。调用方传入的 req.proxy
+        # （建单时已 pin 的出口）也要按签发地复核，不能被账单国改回去。
+        try:
+            session_country = parse_session_bundle(req.session).country
+        except ValueError:
+            session_country = ""
+        exit_country = exit_country_for(session_country, req.billing_country)
         proxy = align_proxy_region(
-            req.proxy or session_proxy("checkout", req.billing_country) or configured_proxy("checkout"),
-            req.billing_country,
+            req.proxy or session_proxy("checkout", exit_country) or configured_proxy("checkout"),
+            exit_country,
         )
         used_proxy = proxy
         created = None
@@ -161,8 +175,8 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
     def _create(self, req: CheckoutRequest, proxy: Optional[str]):
         client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
         client.timeout = float(self.timeout)
-        # 出口已对齐账单国：先用同一出口刷新 session，让 accessToken/cookie 与
-        # 本次 IP 同批次，降低 403 与 unusual activity 概率。软失败不阻断。
+        # 出口已对齐 Session 签发地：先用同一出口刷新 session，让 accessToken/cookie
+        # 与本次 IP 同批次，降低 403 与 unusual activity 概率。软失败不阻断。
         client.refresh_session()
         try:
             return client.create_checkout(

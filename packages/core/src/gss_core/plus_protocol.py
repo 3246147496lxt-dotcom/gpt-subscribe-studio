@@ -45,6 +45,7 @@ from gss_core.chatgpt import (
     stripe_verify_url,
     _processor_from_checkout_url,
     submission_state,
+    profile_from_session_ua,
 )
 from gss_core.stripe_protocol import (
     RUNTIME_HASH,
@@ -53,6 +54,7 @@ from gss_core.stripe_protocol import (
     V_HOSTED,
     PaymentOutcome,
     StripeProtocol,
+    _log_http_failure,
     log,
 )
 
@@ -74,6 +76,7 @@ class PlusProtocol:
         currency: str = "USD",
         timeout: float = 120.0,
         profile: Optional[Dict[str, Any]] = None,
+        user_agent: str = "",
         customer_session_client_secret: str = "",
     ) -> None:
         self.session = session or ""
@@ -84,7 +87,12 @@ class PlusProtocol:
         self.proxy = proxy or None
         # 指纹必须与建单、求解器完全一致
         self.profile = dict(profile or {})
-        if self.profile:
+        derived = profile_from_session_ua(user_agent) if user_agent else None
+        if user_agent:
+            self.ua = user_agent
+            self.platform = (derived or self.profile).get("platform", "Linux x86_64")
+            self.screen = tuple((derived or self.profile).get("screen", (1920, 1080, 1053)))
+        elif self.profile:
             self.ua = self.profile["ua"].format(build=self.profile["build"])
             self.platform = self.profile.get("platform", "Linux x86_64")
             self.screen = tuple(self.profile.get("screen", (1920, 1080, 1053)))
@@ -203,6 +211,7 @@ class PlusProtocol:
             "_stripe_version": V_HOSTED,
         }
         r = self._stripe().post(f"{STRIPE_API}/v1/payment_methods", content=urlencode(body))
+        _log_http_failure(f"{STRIPE_API}/v1/payment_methods", r)
         payload: Dict[str, Any] = {}
         try:
             payload = r.json() or {}
@@ -242,6 +251,7 @@ class PlusProtocol:
         r = self._stripe().post(
             f"{STRIPE_BASE}/v1/{kind}/{intent_id}/confirm", content=urlencode(body)
         )
+        _log_http_failure(f"{STRIPE_BASE}/v1/{kind}/{intent_id}/confirm", r)
         try:
             payload: Dict[str, Any] = r.json() or {}
         except Exception:

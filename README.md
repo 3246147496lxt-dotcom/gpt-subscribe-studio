@@ -84,7 +84,7 @@ Plus / Go / Pro 家族走的是 custom checkout，链路不同，见「支持的
 
 | 项目 | Plus 家族 | Team |
 |---|---|---|
-| 账单国家 | 必须与建单地区一致，不一致直接报 `billing_country_mismatch` | 可独立选择，仅需在支持列表内 |
+| 账单国家 | 有 `statsigContext.country` 时自动跟随 Session 签发地；缺失时才用请求值且必须与建单地区一致 | 有签发地时自动跟随；缺失时可独立选择（需在支持列表内） |
 | 席位数量 | 不涉及 | 2 席起，可配 |
 | 月付 / 年付 | 固定 | 可选 |
 | 工作空间名 | 不涉及 | 可填 |
@@ -250,9 +250,11 @@ API 层通过二选一的字段区分：
 
 ### 代理出口的两个坑
 
-- **地区必须显式对齐**：网关配置里的用户名是 `-region-JP-`，
-  不调 `align_proxy_region(..., "US")` 会抽到日本出口，
-  Stripe 直接回 `billing country must match`。
+- **地区必须显式对齐**：网关配置里的用户名是 `-region-JP-`。
+  有 `statsigContext.country` 时，订单的 `billing_country`、币种、默认账单地址
+  和代理出口会一起跟随 Session 签发地（响应里 `country_aligned_to_session=true`）；
+  只有缺失该字段时才回退到请求的账单国。否则会抽到跨国 IP，
+  Cloudflare 判异常、Stripe 直接回 `billing country must match`。
 - **SID 固定 = 坏出口会一直坏**：代理抽到坏 IP 时表现为
   `SSL: UNEXPECTED_EOF_WHILE_READING` 或 `TLS connect error`。
   `PlusProtocol.pay_from_url()` 遇到这类错误会轮换 SID 重试，最多 3 次。
@@ -603,7 +605,8 @@ confirm 请求里带一个 `rv_timestamp`：**212 字符**，字符集 43 个符
 
 **5. 免税州地址与非 US 出口的组合未验证**
 
-已知：账单地址默认从美国五个免税州里随机生成，出口按账单国家对齐。
+已知：账单地址默认从美国五个免税州里随机生成，出口优先跟随 Session 签发地，
+Session 没有 `statsigContext.country` 时才回退到账单国。
 缺：如果业务上需要跑其他国家（JP/GB 等），地址该用什么、税额如何稳定，
 没有实测数据。目前的做法是在界面上给出提示。
 

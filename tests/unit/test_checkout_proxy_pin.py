@@ -84,3 +84,46 @@ def test_preflight_uses_proxy_and_accepts_unauthenticated_stripe_response(monkey
     monkeypatch.setattr("gss_core.chatgpt._new_session",session)
     assert _probe_stripe_proxy("http://fixture.invalid:3010") is expected
     assert calls[-1] == "closed"
+
+
+def test_checkout_proxy_follows_session_country_not_billing(tmp_path, monkeypatch):
+    """建单链路不能把已 pin 的 Session 出口按账单国改回去。"""
+    import json
+
+    from gss_core.proxies import proxy_exit_region
+
+    config = tmp_path / "proxy-gateways.json"
+    gateway = {
+        "host": "gw.example.com",
+        "port": 3010,
+        "scheme": "http",
+        "username": "u-region-US-sid-BASE",
+        "password": "pw",
+        "region": "US",
+        "sid": "BASE",
+        "enabled": True,
+    }
+    config.write_text(json.dumps({"version": 1, "checkout": gateway, "approve": gateway}))
+    monkeypatch.setenv("GSS_PROXY_CONFIG", str(config))
+    monkeypatch.setenv("GSS_PROXY_SID", "PINNED01")
+
+    session = json.dumps(
+        {
+            "accessToken": "tok_fixture",
+            "statsigContext": {"deviceId": "did_fixture", "country": "JP"},
+        }
+    )
+    req = CheckoutRequest(
+        session=session,
+        plan=Plan.PLUS,
+        billing_country="US",
+        billing_mode=BillingMode.STANDARD,
+        proxy=None,
+    )
+    adapter = UpstreamCheckoutAdapter()
+    seen = []
+    monkeypatch.setattr(
+        adapter, "_create", lambda request, proxy: seen.append(proxy) or created()
+    )
+    asyncio.run(adapter.create_checkout(req))
+    assert seen and proxy_exit_region(seen[0]) == "JP"

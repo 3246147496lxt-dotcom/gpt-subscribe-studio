@@ -18,6 +18,7 @@ ROLES = ("checkout", "approve")
 # 供应商写法不一：-region-US / _country_us、-sid-abc / -session-abc。替换时保留原来的键名与大小写。
 _REGION = re.compile(r"([-_](?:region|country|area|cc)[-_])([A-Za-z]{2})(?=[-_]|$)", re.I)
 _SID = re.compile(r"([-_](?:sid|session|sessid|sessionid)[-_])([A-Za-z0-9]+)(?=[-_]|$)", re.I)
+_COUNTRY_CODE = re.compile(r"^[A-Z]{2}$")
 
 
 def _like(old: str, new: str) -> str:
@@ -238,12 +239,43 @@ def rotate_proxy_sid(proxy: str) -> str:
     return rewrite_proxy_exit(proxy, sid=new_proxy_sid())
 
 
+def exit_country_for(session_country: str = "", billing_country: str = "") -> str:
+    """选择代理出口国家：Session 签发地（statsigContext.country）优先，账单国兜底。
+
+    出口 IP 必须与 Session 签发地一致，否则 Cloudflare / Stripe 会把同一次
+    结账判成跨国异常；账单国只在 Session 没带国家时兜底。
+    """
+    for candidate in (session_country, billing_country):
+        code = normalize_region(candidate)
+        if _COUNTRY_CODE.match(code):
+            return code
+    return ""
+
+
 def session_proxy(role: str, region: str) -> str | None:
     """本次开通专用出口：选定地区 + 随机 SID。"""
     base = configured_proxy(role)
     if not base:
         return None
     return rewrite_proxy_exit(base, region=normalize_region(region), sid=new_proxy_sid())
+
+
+def session_proxy_for(
+    role: str, *, session_country: str = "", billing_country: str = ""
+) -> str | None:
+    """按 Session 签发地生成出口；缺失时才回退到账单国。"""
+    return session_proxy(role, exit_country_for(session_country, billing_country))
+
+
+def checkout_proxy_for(
+    role: str, *, session_country: str = "", billing_country: str = ""
+) -> str | None:
+    """建单/支付统一入口：Session 签发地优先生成出口，并强制对齐地区。"""
+    country = exit_country_for(session_country, billing_country)
+    return align_proxy_region(
+        session_proxy(role, country) or configured_proxy(role),
+        country,
+    )
 
 
 def proxy_exit_region(proxy: str) -> str:
@@ -254,7 +286,11 @@ def proxy_exit_region(proxy: str) -> str:
 
 
 def align_proxy_region(proxy: str | None, country: str) -> str | None:
-    """账单国必须等于出口国，否则 Stripe 会拒：Billing country must match request country。"""
+    """代理出口国必须等于传入的国家码。
+
+    调用方应传入 Session 签发地（statsigContext.country），缺失时才用账单国；
+    否则 Stripe 会拒：Billing country must match request country。
+    """
     proxy = str(proxy or "").strip()
     country = normalize_region(country)
     if not proxy:
@@ -278,6 +314,9 @@ __all__ = [
     "rewrite_proxy_exit",
     "rotate_proxy_sid",
     "session_proxy",
+    "session_proxy_for",
+    "checkout_proxy_for",
+    "exit_country_for",
     "proxy_exit_region",
     "align_proxy_region",
 ]

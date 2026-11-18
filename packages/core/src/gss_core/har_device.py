@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 import random
 import secrets
@@ -469,6 +470,57 @@ def _write_store(path: "pathlib.Path", data: Dict[str, Any]) -> None:
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+def _nearest_impersonate(major: str) -> str:
+    """把 Session UA 的 Chrome 大版本映射到 curl_cffi 现有 impersonate。"""
+    try:
+        target = int(str(major).split(".", 1)[0])
+    except (TypeError, ValueError):
+        return _CHROME_BUILDS[0][1]
+    best = min(
+        _CHROME_BUILDS,
+        key=lambda row: abs(int(row[0].split(".", 1)[0]) - target),
+    )
+    return best[1]
+
+
+def apply_user_agent(device: "DeviceProfile", user_agent: str) -> "DeviceProfile":
+    """用 Session 签发时的真实 UA 覆盖设备档案，保证 HTTP 头与指纹同源。"""
+    text = str(user_agent or "").strip()
+    if not text:
+        return device
+    low = text.lower()
+    if "windows" in low:
+        key = "windows"
+    elif "macintosh" in low or "mac os x" in low:
+        key = "macos"
+    elif "android" in low:
+        key = "linux"
+    elif "cros" in low:
+        key = "linux"
+    else:
+        key = "linux" if ("linux" in low or "x11" in low) else device.os_key
+    prof = _OS_PROFILES.get(key)
+    if prof is not None:
+        device.os_key = key
+        device.platform = prof["platform"]
+        device.os_label = prof["os_label"]
+        device.ch_platform = prof["ch_platform"]
+        device.ch_arch = prof["arch"]
+        device.ch_bitness = prof["bitness"]
+        device.ch_platform_version = prof["platform_versions"][0]
+        device.screen_w, device.screen_h, chrome_px, device.dpr = prof["screens"][0]
+        device.avail_h = device.screen_h - chrome_px
+        device.cores = prof["cores"][0]
+        device.memory = prof["memory"][0]
+    match = re.search(r"(?:Chrome|CriOS)/([0-9][0-9.]*)", text)
+    if match:
+        device.chrome_build = match.group(1)
+        device.chrome_major = device.chrome_build.split(".", 1)[0]
+        device.impersonate = _nearest_impersonate(device.chrome_major)
+    device.ua = text
+    return device
 
 
 def device_for_account(account_id: str, country: str = "US") -> "DeviceProfile":

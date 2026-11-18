@@ -31,6 +31,7 @@ from gss_core.chatgpt import (
 from gss_core.countries import country_codes, currency_for, is_supported
 from gss_core.proxies import (
     align_proxy_region,
+    exit_country_for,
     new_proxy_sid,
     proxy_exit_region,
     rewrite_proxy_exit,
@@ -331,6 +332,39 @@ class _PromoHttp(_FakeHttp):
         if ACCOUNTS_CHECK_PATH in url:
             return _FakeResponse(payload=self.promo_payload)
         return super().get(url, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("content_type", "payload", "expected_kind", "expected_code"),
+    [
+        ("application/json; charset=utf-8", {"error": {"code": "invalid_token"}}, "json", "invalid_token"),
+        ("application/json", {"detail": {"code": "private-diagnostic-marker"}}, "json", "unknown"),
+        ("text/html", {}, "html", "unknown"),
+    ],
+)
+def test_checkout_401_records_safe_diagnostics(monkeypatch, caplog, content_type, payload, expected_kind, expected_code):
+    http = _FakeHttp("")
+    response = _FakeResponse(status_code=401, text="private-diagnostic-marker", payload=payload)
+    response.headers = {"Content-Type": content_type}
+    response.content = response.text.encode()
+    response.url = "https://chatgpt.com/checkout/private-diagnostic-marker?secret=private-diagnostic-marker"
+    response.request = SimpleNamespace(headers={"Oai-Device-Id": "private-diagnostic-marker"})
+    monkeypatch.setattr(http, "post", lambda *args, **kwargs: response)
+    client = ChatGPTClient("offline-token", account_id="offline-account", _http=http)
+    monkeypatch.setattr(client, "prepare_risk", lambda **kwargs: None)
+
+    with pytest.raises(DomainError) as exc:
+        client.create_checkout(plan="plus", country="PH")
+
+    assert exc.value.code is ErrorCode.INVALID_SESSION
+    assert "checkout_unauthorized status_code=401 url=https://chatgpt.com/" in caplog.text
+    assert "header_source=request has_oai_device_id=True has_user_agent=False" in caplog.text
+    assert f"body_kind={expected_kind} body_bytes={len(response.content)}" in caplog.text
+    assert f"upstream_error_code={expected_code}" in caplog.text
+    # 新策略：>=400 必须落原始响应体（脱敏后），URL 里的 secret 仍要打码。
+    assert "upstream_error where=/backend-api/payments/checkout status=401" in caplog.text
+    assert "body=private-diagnostic-marker" in caplog.text
+    assert "secret=private-diagnostic-marker" not in caplog.text
 
 
 def test_parse_account_check_preserves_50_percent_campaign() -> None:
@@ -960,3 +994,71 @@ def test_decline_message_keeps_code_and_adds_advice() -> None:
 
 
 # Team Hosted currency/address regressions live in test_hosted_protocol.py.
+
+
+SESSION_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/141.0.7390.55 Safari/537.36"
+)
+
+
+def test_client_uses_statsig_user_agent_for_http_and_sentinel(monkeypatch) -> None:
+    raw = json.dumps(
+        {
+            "accessToken": "tok_ua",
+            "statsigContext": {
+                "deviceId": "did-ua",
+                "userAgent": SESSION_UA,
+                "country": "JP",
+            },
+        }
+    )
+    client = ChatGPTClient.from_raw_session(raw)
+    try:
+        assert client.ua == SESSION_UA
+        assert client.device_id == "did-ua"
+        assert client.session_country == "JP"
+        headers = client._identity_headers()
+        assert headers["User-Agent"] == SESSION_UA
+        assert headers["oai-device-id"] == "did-ua"
+        assert headers["oai-did"] == "did-ua"
+        assert "oai-did=did-ua" in headers["Cookie"]
+        assert 'v="141"' in headers["sec-ch-ua"]
+        assert headers["sec-ch-ua-platform"] == '"macOS"'
+        # curl_cffi 的 Stripe 会话也必须使用同一个 UA。
+        assert client.stripe_http.headers["User-Agent"] == SESSION_UA
+    finally:
+        client.close()
+
+    captured = {}
+
+    def fake_mint(**kwargs):
+        captured.update(kwargs)
+        return {"p": "proof", "c": "challenge"}
+
+    monkeypatch.setattr("gss_core.chatgpt.mint", fake_mint)
+    client.mint_sentinel(flow="chatgpt_checkout")
+    assert captured["user_agent"] == SESSION_UA
+    assert captured["device_id"] == "did-ua"
+    assert captured["platform"] == "MacIntel"
+    assert captured["platform_label"] == "macOS"
+
+
+def test_prepare_risk_uses_session_country_over_billing(monkeypatch) -> None:
+    from gss_core.countries import timezone_for
+
+    client = ChatGPTClient(access_token="tok", session_country="JP")
+    monkeypatch.setattr(client, "warmup", lambda **kwargs: None)
+    monkeypatch.setattr(client, "mint_sentinel", lambda **kwargs: None)
+    client.prepare_risk(flow="chatgpt_checkout", country="US")
+    assert client.timezone == timezone_for("JP")
+
+
+def test_exit_country_prefers_session_issuer() -> None:
+    assert exit_country_for("JP", "US") == "JP"
+    assert exit_country_for("", "us") == "US"
+    assert exit_country_for("", "") == ""
+    # 非法国家码不能覆盖后面的有效值。
+    assert exit_country_for("USA", "PH") == "PH"
+    assert exit_country_for("japan", "") == ""

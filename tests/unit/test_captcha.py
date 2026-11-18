@@ -120,7 +120,10 @@ def test_verify_posts_token_with_client_secret():
     assert "_stripe_version=2026-03-25.dahlia" in body
 
 
-def test_verify_includes_ekey_when_present():
+def test_verify_includes_ekey_when_present(monkeypatch):
+    # 线上探测发现 Stripe 会以 parameter_unknown 拒绝 captcha_response_key，
+    # 所以代码用 GSS_SEND_CAPTCHA_KEY 显式开启；测试验证开关打开后的行为。
+    monkeypatch.setenv("GSS_SEND_CAPTCHA_KEY", "1")
     http = HTTP([{"status": "succeeded"}])
     verify_challenge(http, intent_id="pi_fixture", client_secret="pi_fixture_secret_x",
                      token="P1_token", publishable_key="pk_live_x",

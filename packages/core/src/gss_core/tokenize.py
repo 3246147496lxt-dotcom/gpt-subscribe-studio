@@ -161,6 +161,12 @@ def tokenize_card(
     message = _scrub(str(error.get("message") or f"Stripe 支付方式创建失败（{status}）"), safe)
     code = str(error.get("code") or "")
     decline = str(error.get("decline_code") or "")
+    if status >= 400:
+        logger.warning(
+            "upstream_error where=tokenize_payment_methods status=%s body=%s",
+            status,
+            redact_sensitive(str(getattr(response, "text", "") or "")[:4000]),
+        )
     logger.warning("tokenize_failed http=%s type=%s code=%s decline=%s", status,
                    error.get("type"), code, decline)
     detail = " ".join(part for part in (code, decline) if part)

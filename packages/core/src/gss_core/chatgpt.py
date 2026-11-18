@@ -10,8 +10,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
+from http.cookiejar import CookieJar
 from typing import Any, Dict, Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
@@ -19,7 +20,7 @@ from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.money import quote_from_payload
 from gss_core.redaction import redact_sensitive
 from gss_core.sentinel import extract_attestation, extract_build, header_value, mint, so_header_value
-from gss_core.session_token import SessionBundle, parse_session_bundle
+from gss_core.session_token import SessionBundle, parse_session_bundle, parse_statsig_context
 
 APP_BASE = "https://chatgpt.com"
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
@@ -97,6 +98,52 @@ def _pick_profile(device_id: str) -> dict:
     prof["key"] = key
     prof["build"] = prof["builds"][_hash8(seed, "b") % len(prof["builds"])]
     return prof
+
+
+_UA_CHROME_VERSION = re.compile(r"(?:Chrome|CriOS)/([0-9][0-9.]*)")
+
+
+def _profile_from_session_ua(ua: str) -> Optional[dict]:
+    """从 Session 的真实 UA 推导平台/版本，保证请求头与哨兵子进程同源。
+
+    返回 None 表示 UA 不可识别，调用方回退到 deviceId 推导的伪造档案。
+    """
+    text = str(ua or "").strip()
+    if not text:
+        return None
+    low = text.lower()
+    if "windows" in low:
+        key = "windows"
+    elif "macintosh" in low or "mac os x" in low:
+        key = "macos"
+    elif "android" in low:
+        key = "android"
+    elif "cros" in low:
+        key = "cros"
+    elif "linux" in low or "x11" in low:
+        key = "linux"
+    else:
+        return None
+    prof = dict(_PROFILES.get(key, _PROFILES["linux"]))
+    if key == "android":
+        prof.update({"platform": "Linux armv8l", "label": "Android"})
+        prof["hints"] = {
+            "sec-ch-ua-platform": '"Android"',
+            "sec-ch-ua-mobile": "?1",
+            "sec-ch-ua-arch": '"arm"',
+            "sec-ch-ua-bitness": '"64"',
+        }
+    elif key == "cros":
+        prof.update({"platform": "Linux x86_64", "label": "ChromeOS"})
+        prof["hints"] = {"sec-ch-ua-platform": '"Chrome OS"'}
+    match = _UA_CHROME_VERSION.search(text)
+    prof["key"] = key
+    prof["build"] = match.group(1) if match else prof["builds"][0]
+    return prof
+
+
+# 公开别名：建单 / 支付协议用它从 Session UA 推导同一份指纹档案。
+profile_from_session_ua = _profile_from_session_ua
 
 
 def _profile_from_ua(ua: str) -> dict:
@@ -470,6 +517,8 @@ class ChatGPTClient:
     oai_session_id: str = ""
     session_token: str = ""
     device_id: str = ""
+    user_agent: str = ""
+    session_country: str = ""
     extra_cookies: Dict[str, str] = field(default_factory=dict)
     language: str = "en-US"
     timezone: str = "America/New_York"
@@ -494,6 +543,8 @@ class ChatGPTClient:
             account_id=jwt_account_id(token),
             session_token=bundle.session_token,
             device_id=device,
+            user_agent=bundle.user_agent,
+            session_country=bundle.country,
             extra_cookies=dict(bundle.cookies),
             oai_session_id=session_id,
         )
@@ -508,7 +559,10 @@ class ChatGPTClient:
 
     @property
     def profile(self) -> dict:
-        return _pick_profile(getattr(self, "device_id", "") or "")
+        # Session 里带真实 UA 时以其为准，HTTP 头与 Node 哨兵子进程共享同一份档案。
+        return _profile_from_session_ua(self.user_agent) or _pick_profile(
+            getattr(self, "device_id", "") or ""
+        )
 
     @property
     def chrome_build(self) -> str:
@@ -526,6 +580,8 @@ class ChatGPTClient:
 
     @property
     def ua(self) -> str:
+        if self.user_agent:
+            return self.user_agent
         return self.profile["ua"].format(build=self.chrome_build)
 
     @property
@@ -585,10 +641,29 @@ class ChatGPTClient:
             headers["OpenAI-Sentinel-SO-Token"] = self.sentinel_so
         return headers
 
-    def _merge_cookies(self) -> None:
+    def _app_cookie_names(self) -> set[str]:
+        jar = getattr(getattr(self.http, "cookies", None), "jar", None)
+        if not isinstance(jar, CookieJar):
+            return set()
+        return {
+            cookie.name for cookie in jar
+            if cookie.domain in {"", "chatgpt.com", ".chatgpt.com"} and cookie.path == "/"
+        }
+
+    def _merge_cookies(self, previous_names: set[str] | None = None) -> None:
         jar = getattr(self.http, "cookies", None)
         if jar is None:
             return
+        cookie_store = getattr(jar, "jar", None)
+        removed: set[str] = set()
+        if isinstance(cookie_store, CookieJar):
+            known_names = self._app_cookie_names() | (previous_names or set())
+            cookie_store.clear_expired_cookies()
+            removed = known_names - self._app_cookie_names()
+            for name in removed:
+                self.extra_cookies.pop(name, None)
+            if "__Secure-next-auth.session-token" in removed:
+                self.session_token = ""
         gathered: Dict[str, str] = {}
         try:
             getter = getattr(jar, "get_dict", None)
@@ -606,7 +681,7 @@ class ChatGPTClient:
         except Exception:
             gathered = {}
         for name, value in gathered.items():
-            if name and value is not None:
+            if name and name not in removed and value is not None:
                 self.extra_cookies[str(name)] = str(value)
         self.http.headers.update(self._identity_headers())
 
@@ -623,6 +698,7 @@ class ChatGPTClient:
         if not self.session_token:
             return False
         try:
+            previous_names = self._app_cookie_names()
             response = self.http.get(
                 f"{APP_BASE}/api/auth/session",
                 headers=self._route_headers("/api/auth/session"),
@@ -633,6 +709,7 @@ class ChatGPTClient:
             return False
         status = int(getattr(response, "status_code", 0) or 0)
         if status >= 400:
+            _log_upstream_failure("/api/auth/session", response)
             logger.warning("session 刷新失败（HTTP %s），继续用原 session", status)
             return False
         payload = _json(response)
@@ -642,7 +719,16 @@ class ChatGPTClient:
             logger.warning("session 刷新未返回 accessToken（session-token 可能已失效），继续用原 session")
             return False
         self.access_token = token
-        self._merge_cookies()
+        # /api/auth/session 会回带签发时的 statsigContext；同步真实设备身份，
+        # 避免刷新后仍用旧 deviceId / UA 与出口国家对不上。
+        identity = parse_statsig_context(payload)
+        if identity["device_id"]:
+            self.device_id = identity["device_id"]
+        if identity["user_agent"]:
+            self.user_agent = identity["user_agent"]
+        if identity["country"]:
+            self.session_country = identity["country"]
+        self._merge_cookies(previous_names)
         logger.info("session 刷新成功，已与本批次出口对齐")
         return True
 
@@ -695,9 +781,11 @@ class ChatGPTClient:
         self.sentinel_so = so_header_value(token)
 
     def prepare_risk(self, *, flow: str, page_url: str = "", country: str = "") -> None:
-        if country:
-            self.language = locale_for(country)
-            self.timezone = timezone_for(country)
+        # 语言/时区跟随 Session 签发地（与出口 IP 同区）；没有 statsig 国家才用账单国。
+        effective_country = self.session_country or country
+        if effective_country:
+            self.language = locale_for(effective_country)
+            self.timezone = timezone_for(effective_country)
         url = page_url or f"{APP_BASE}/"
         self.warmup(page_url=url)
         self.mint_sentinel(flow=flow, page_url=url)
@@ -753,6 +841,7 @@ class ChatGPTClient:
         self._stripe_http = None
 
     def _raise(self, code: ErrorCode, response: Any, prefix: str) -> None:
+        _log_upstream_failure(prefix, response)
         body = redact_sensitive(str(getattr(response, "text", ""))[:500])
         status = int(getattr(response, "status_code", 0) or 0)
         lowered = body.lower()
@@ -793,8 +882,10 @@ class ChatGPTClient:
             timeout=self.timeout,
         )
         if int(getattr(me, "status_code", 0) or 0) == 401:
+            _log_upstream_failure("/backend-api/me", me)
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         if int(getattr(me, "status_code", 0) or 0) >= 400:
+            _log_upstream_failure("/backend-api/me", me)
             check = self.http.get(
                 f"{APP_BASE}{ACCOUNTS_CHECK_PATH}",
                 params={"timezone_offset_min": "0"},
@@ -802,9 +893,10 @@ class ChatGPTClient:
                 timeout=self.timeout,
             )
             if int(getattr(check, "status_code", 0) or 0) == 401:
+                _log_upstream_failure(ACCOUNTS_CHECK_PATH, check)
                 raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
             if int(getattr(check, "status_code", 0) or 0) >= 400:
-                self._raise(ErrorCode.INVALID_SESSION, me, "读取账号")
+                self._raise(ErrorCode.INVALID_SESSION, check, "读取账号")
             payload = _json(check)
         else:
             payload = _json(me)
@@ -825,6 +917,7 @@ class ChatGPTClient:
         )
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 401:
+            _log_upstream_failure(ACCOUNTS_CHECK_PATH, response)
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         if status >= 400:
             self._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "查询优惠资格")
@@ -867,15 +960,19 @@ class ChatGPTClient:
             seat_quantity=seat_quantity,
             price_interval=price_interval,
         )
+        checkout_url = f"{APP_BASE}/backend-api/payments/checkout"
         response = self.http.post(
-            f"{APP_BASE}/backend-api/payments/checkout",
+            checkout_url,
             json=body,
             headers=self._route_headers("/backend-api/payments/checkout", page_url=page_url),
             timeout=self.timeout,
         )
-        if int(getattr(response, "status_code", 0) or 0) == 401:
+        response_status = int(getattr(response, "status_code", 0) or 0)
+        if response_status == 401:
+            _log_checkout_unauthorized(response, checkout_url, self.http.headers)
+            _log_upstream_failure("/backend-api/payments/checkout", response)
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
-        if int(getattr(response, "status_code", 0) or 0) >= 400:
+        if response_status >= 400:
             self._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "创建结账")
         payload = _json(response)
         raw_url = str(payload.get("url") or payload.get("checkout_url") or "").strip()
@@ -994,6 +1091,7 @@ class ChatGPTClient:
             except Exception:
                 continue
             if int(getattr(response, "status_code", 0) or 0) >= 400:
+                _log_upstream_failure(route, response, level=logging.INFO)
                 continue
             amount, found = quote_from_payload(_json(response), currency)
             if amount is not None:
@@ -1024,6 +1122,7 @@ class ChatGPTClient:
         except Exception:
             return None, currency
         if int(getattr(response, "status_code", 0) or 0) >= 400:
+            _log_upstream_failure("/backend-api/payments/checkout/taxes", response, level=logging.INFO)
             return None, currency
         return quote_from_payload(_json(response), currency)
 
@@ -1038,6 +1137,7 @@ class ChatGPTClient:
         )
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 401:
+            _log_upstream_failure("/backend-api/payments/payment_method", response)
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         if status >= 400:
             self._raise(ErrorCode.PAYMENT_UNKNOWN_STATE, response, "准备支付方式")
@@ -1058,6 +1158,7 @@ class ChatGPTClient:
         )
         payload = _json(response)
         if int(getattr(response, "status_code", 0) or 0) >= 400:
+            _log_upstream_failure(f"/v1/setup_intents/{setup_id}/confirm", response)
             message = (
                 (payload.get("error") or {}).get("message")
                 if isinstance(payload.get("error"), dict)
@@ -1157,6 +1258,7 @@ class ChatGPTClient:
         payload = _json(response)
         token = str(payload.get("id") or "")
         if int(getattr(response, "status_code", 0) or 0) >= 400 or not token:
+            _log_upstream_failure("/v1/confirmation_tokens", response)
             error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
             message = str(error.get("message") or payload.get("message") or "创建 confirmation token 失败")
             raise DomainError(ErrorCode.PAYMENT_UNKNOWN_STATE, redact_sensitive(message))
@@ -1186,6 +1288,8 @@ class ChatGPTClient:
                 headers=self._route_headers("/backend-api/payments/checkout/taxes", page_url=page_url),
                 timeout=self.timeout,
             )
+            if int(getattr(response, "status_code", 0) or 0) >= 400:
+                _log_upstream_failure("/backend-api/payments/checkout/taxes", response)
             taxed = _json(response)
             session = taxed.get("checkout_session") if isinstance(taxed.get("checkout_session"), dict) else {}
             logger.info(
@@ -1686,6 +1790,7 @@ class ChatGPTClient:
             if not removed:
                 break
         if status >= 400:
+            _log_upstream_failure(url, response)
             _raise_stripe(payload, status)
         return payload
 
@@ -1721,6 +1826,7 @@ class ChatGPTClient:
         except Exception:
             return {}
         if int(getattr(response, "status_code", 0) or 0) >= 400:
+            _log_upstream_failure(f"/v1/{kind}/{intent_id}", response)
             return {}
         return _json(response)
 
@@ -1760,6 +1866,7 @@ class ChatGPTClient:
         payload = _json(response)
         status = int(getattr(response, "status_code", 0) or 0)
         if status >= 400:
+            _log_upstream_failure(f"/v1/{kind}/{intent_id}/confirm", response)
             _raise_stripe(payload, status)
         return payload
 
@@ -1774,6 +1881,7 @@ class ChatGPTClient:
             timeout=self.timeout,
         )
         if int(getattr(response, "status_code", 0) or 0) == 401:
+            _log_upstream_failure("/backend-api/subscriptions", response)
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         if int(getattr(response, "status_code", 0) or 0) >= 400:
             self._raise(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, response, "查询订阅")
@@ -1786,6 +1894,73 @@ def _json(response: Any) -> Dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+_CHECKOUT_AUTH_ERROR_CODES = frozenset({
+    "access_denied", "authentication_error", "expired_token", "invalid_session",
+    "invalid_token", "session_expired", "token_expired", "token_revoked", "unauthorized",
+})
+
+
+def _log_upstream_failure(
+    where: str, response: Any, *, limit: int = 4000, level: int = logging.WARNING
+) -> None:
+    """记录上游 >=400 的原始状态码和响应体（脱敏后），方便实测定位。"""
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status < 400:
+        return
+    url = str(getattr(response, "url", "") or "")
+    parts = urlsplit(url)
+    if parts.query:
+        # 查询参数里常带 secret/token/client_secret，统一打码后再落日志。
+        masked = "&".join(f"{key}=***" for key, _ in parse_qsl(parts.query, keep_blank_values=True))
+        url = urlunsplit((parts.scheme, parts.netloc, parts.path, masked, parts.fragment))
+    body = redact_sensitive(str(getattr(response, "text", "") or "")[:limit])
+    logger.log(
+        level,
+        "upstream_error where=%s status=%s url=%s body=%s",
+        where,
+        status,
+        url,
+        body,
+    )
+
+
+def _log_checkout_unauthorized(response: Any, checkout_url: str, configured_headers: Any) -> None:
+    observed_headers = getattr(getattr(response, "request", None), "headers", None)
+    header_source = "request" if observed_headers is not None else "configured"
+    headers = observed_headers if observed_headers is not None else configured_headers
+    present = {name.lower() for name, value in headers.items() if value}
+
+    response_headers = getattr(response, "headers", None) or {}
+    content_type = response_headers.get("content-type") or response_headers.get("Content-Type") or ""
+    media_type = content_type.partition(";")[0].strip().lower()
+    if media_type == "application/json" or media_type.endswith("+json"):
+        body_kind = "json"
+    elif media_type == "text/html":
+        body_kind = "html"
+    else:
+        body_kind = "other"
+
+    content = getattr(response, "content", None)
+    body_bytes = len(content) if isinstance(content, bytes) else None
+    error_code = "unknown"
+    if body_kind == "json" and (body_bytes is None or body_bytes <= 65536):
+        payload = _json(response)
+        for error in (payload.get("error"), payload.get("detail"), payload):
+            if not isinstance(error, dict):
+                continue
+            code = error.get("code") or error.get("type")
+            if isinstance(code, str) and code in _CHECKOUT_AUTH_ERROR_CODES:
+                error_code = code
+                break
+
+    logger.warning(
+        "checkout_unauthorized status_code=401 url=%s header_source=%s "
+        "has_oai_device_id=%s has_user_agent=%s body_kind=%s body_bytes=%s upstream_error_code=%s",
+        checkout_url, header_source, "oai-device-id" in present, "user-agent" in present,
+        body_kind, body_bytes, error_code,
+    )
 
 
 def _account_id(payload: Dict[str, Any]) -> str:

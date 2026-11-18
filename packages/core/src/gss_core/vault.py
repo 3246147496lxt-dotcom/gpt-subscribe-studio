@@ -25,6 +25,11 @@ class OrderSecrets:
     client_version: str = ""
     oai_session_id: str = ""
     proxy: str = ""
+    # Session 签发时的真实身份，支付/求解阶段必须原样复用，不能再随机生成。
+    user_agent: str = ""
+    device_id: str = ""
+    session_country: str = ""
+    exit_country: str = ""
     # 建单时选定的指纹 profile，支付与求解器必须复用同一份
     profile: Optional[Dict[str, Any]] = None
     billing: Dict[str, str] = field(default_factory=dict)

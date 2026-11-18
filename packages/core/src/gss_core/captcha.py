@@ -172,6 +172,7 @@ def verify_challenge(
     publishable_key: str,
     api_version: str,
     ekey: str = "",
+    user_agent: str = "",
 ) -> Dict[str, Any]:
     """Post the solved token to Stripe's verify_challenge endpoint.
 
@@ -198,7 +199,7 @@ def verify_challenge(
     # unlike init/confirm/poll which post from pay.openai.com.
     headers = {"Origin": "https://js.stripe.com", "Referer": "https://js.stripe.com/",
                "Content-Type": "application/x-www-form-urlencoded",
-               "User-Agent": DEFAULT_UA}
+               "User-Agent": user_agent or DEFAULT_UA}
     from urllib.parse import urlencode
     response = session.post(f"https://api.stripe.com/v1/payment_intents/{intent_id}/verify_challenge",
                             data=urlencode(body), headers=headers, timeout=60)
@@ -210,6 +211,11 @@ def verify_challenge(
     if status >= 400:
         error = payload.get("error") if isinstance(payload, dict) else None
         error = error if isinstance(error, dict) else {}
+        logger.warning(
+            "upstream_error where=verify_challenge status=%s body=%s",
+            status,
+            redact_sensitive(str(getattr(response, "text", "") or "")[:4000]),
+        )
         logger.warning("verify_challenge_failed http=%s type=%s code=%s msg=%s", status,
                        error.get("type"), error.get("code"), str(error.get("message") or "")[:200])
         raise DomainError(ErrorCode.PAYMENT_UNKNOWN_STATE,

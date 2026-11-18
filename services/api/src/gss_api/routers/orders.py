@@ -26,15 +26,21 @@ from gss_contracts import (
     Plan,
 )
 from gss_contracts.errors import DomainError, ErrorCode
+from gss_core.billing import address_for
 from gss_core.config import load_settings, use_fake_adapters
 from gss_core.countries import is_supported, normalize_country
 from gss_core.hosted import TeamHostedClient
 from gss_core.plus_protocol import PlusProtocol
 from gss_core.plus_har_protocol import PlusHarProtocol
 from gss_core.stripe_protocol import StripeProtocol, PaymentOutcome
-from gss_core.proxies import align_proxy_region, configured_proxy, session_proxy
+from gss_core.proxies import checkout_proxy_for, exit_country_for
 from gss_core.redaction import redact_sensitive
-from gss_core.chatgpt import ChatGPTClient, clamp_team_seats
+from gss_core.chatgpt import (
+    ChatGPTClient,
+    _pick_profile,
+    clamp_team_seats,
+    profile_from_session_ua,
+)
 from gss_core.session_token import (
     email_from_access_token,
     parse_session,
@@ -64,6 +70,51 @@ from .events import notify_order_update
 router = APIRouter(prefix="/api", tags=["orders"])
 logger = logging.getLogger("gss.orders")
 _team_locks: dict[str, asyncio.Lock] = {}
+
+
+
+def _secret_session_country(secrets: OrderSecrets) -> str:
+    """只返回 Session 签发地；没有 statsig 国家时不做任何账单覆盖。"""
+    return normalize_country(getattr(secrets, "session_country", ""))
+
+
+def _aligned_billing(
+    billing: dict, country: str, preferred: dict | None = None
+) -> dict:
+    """Session 签发地存在时，账单国家与默认地址模板一起对齐。
+
+    preferred 是建单时已生成的地址（vault.billing）；存在时复用它，
+    避免 prepare / pay 两次调用随机模板导致地址不一致。
+    """
+    code = normalize_country(country)
+    current = dict(billing or {})
+    if not code:
+        return current
+    if (
+        normalize_country(str(current.get("country") or "")) == code
+        and current.get("line1")
+        and current.get("city")
+        and current.get("postal_code")
+    ):
+        current["country"] = code
+        return current
+    preferred = dict(preferred or {})
+    if (
+        normalize_country(str(preferred.get("country") or "")) == code
+        and preferred.get("line1")
+        and preferred.get("city")
+        and preferred.get("postal_code")
+    ):
+        result = dict(preferred)
+        result["email"] = str(current.get("email") or preferred.get("email") or "")
+        if current.get("name"):
+            result["name"] = str(current["name"])
+        return result
+    template = address_for(code)
+    template["email"] = str(current.get("email") or "")
+    if current.get("name"):
+        template["name"] = str(current["name"])
+    return template
 
 
 def _assert_saved_card_resolved(secrets: OrderSecrets) -> None:
@@ -141,6 +192,7 @@ def _to_out(order: Order) -> OrderOut:
         price_interval=view.price_interval,
         confirm_return_url=view.confirm_return_url,
         session_email=session_email or None,
+        country_aligned_to_session=bool(getattr(view, "country_aligned_to_session", False)),
     )
 
 
@@ -245,14 +297,49 @@ async def create_order(
     except ValueError as exc:
         raise _error(status.HTTP_401_UNAUTHORIZED, ErrorCode.INVALID_SESSION, str(exc))
     
-    country = normalize_country(payload.billing_country)
+    requested_country = normalize_country(payload.billing_country)
+    country = requested_country
+    country_aligned = False
+
+    def _apply_session_country(session_country: str, *, source: str) -> None:
+        """Session 签发地存在时，订单国家/币种/地址模板三者一起跟随。"""
+        nonlocal country, country_aligned
+        code = normalize_country(session_country)
+        if not code:
+            return
+        if not is_supported(code):
+            raise _error(
+                status.HTTP_400_BAD_REQUEST,
+                ErrorCode.COMPLIANCE_BLOCKED,
+                f"Session 签发地 {code} 不在支持列表",
+            )
+        if code != country:
+            logger.info(
+                "country_aligned_to_session source=%s requested_billing_country=%s session_country=%s",
+                source,
+                country,
+                code,
+            )
+            country = code
+            country_aligned = True
+
+    _apply_session_country(bundle.country, source="session")
     if not is_supported(country):
         raise _error(status.HTTP_400_BAD_REQUEST, ErrorCode.COMPLIANCE_BLOCKED, f"不支持的地区: {payload.billing_country}")
-    
+
     # 换 token 与后续提链、支付共用同一个出口（同一 sid），所以只算一次。
-    exit_proxy = align_proxy_region(
-        session_proxy("checkout", country) or configured_proxy("checkout"),
+    # 出口国家与订单账单国都取 Session 签发地，账单国仅在没有签发地时兜底。
+    exit_country = country
+    logger.info(
+        "checkout_exit_country session_country=%s billing_country=%s exit_country=%s",
+        bundle.country or "-",
         country,
+        exit_country or "-",
+    )
+    exit_proxy = checkout_proxy_for(
+        "checkout",
+        session_country=country,
+        billing_country=requested_country,
     )
 
     # 只粘贴了 session token：先用本单出口换 accessToken，再按完整 session 继续。
@@ -272,13 +359,36 @@ async def create_order(
                 "session token 已失效或无法换取 accessToken，请重新导出 session",
             )
         bundle.access_token = client.access_token
+        bundle.device_id = client.device_id or bundle.device_id
+        bundle.user_agent = client.user_agent or bundle.user_agent
+        bundle.country = client.session_country or bundle.country
         raw_session = json.dumps({
             "accessToken": client.access_token,
             "sessionToken": client.session_token,
             "deviceId": client.device_id,
             "sessionId": client.oai_session_id,
+            "userAgent": client.user_agent,
             "cookies": client.extra_cookies,
+            "statsigContext": {
+                "deviceId": client.device_id,
+                "userAgent": client.user_agent,
+                "country": client.session_country,
+            },
         })
+        # 刷新响应可能第一次带回 statsig 国家：此时重建订单国家与出口，不能沿用旧 SID。
+        previous_country = country
+        _apply_session_country(bundle.country, source="session_refresh")
+        if country != previous_country:
+            exit_country = country
+            exit_proxy = checkout_proxy_for(
+                "checkout",
+                session_country=country,
+                billing_country=requested_country,
+            )
+            logger.info(
+                "checkout_exit_country_rebuilt source=session_refresh exit_country=%s",
+                exit_country,
+            )
         logger.info("已从 session token 换取 accessToken")
 
     if not bundle.access_token:
@@ -308,15 +418,22 @@ async def create_order(
     )
     store.create_order(order, idempotency_key)
     store.add_job(Job(order_id=order.id, stage="checkout"))
-    # 指纹 profile：与建单 client 用同一个 device_id 推导，保证全程一致
-    try:
-        from gss_core.chatgpt import _pick_profile as _pick_prof
-        _dev = getattr(bundle, "device_id", "") or ""
-        _profile = _pick_prof(_dev)
-    except Exception:
-        _profile = None
-    vault.put(order.id, OrderSecrets(session=raw_session, proxy=exit_proxy or "",
-                                  profile=_profile))
+    view = store.view(order.id)
+    view.country_aligned_to_session = country_aligned
+    # 指纹 profile：Session 真实 UA 优先；只有完全缺失时才按 device_id 派生。
+    _profile = profile_from_session_ua(bundle.user_agent) or _pick_profile(bundle.device_id)
+    _billing = address_for(country)
+    _billing["email"] = email_from_access_token(bundle.access_token) or ""
+    vault.put(order.id, OrderSecrets(
+        session=raw_session,
+        proxy=exit_proxy or "",
+        profile=_profile,
+        billing=_billing,
+        user_agent=bundle.user_agent,
+        device_id=bundle.device_id,
+        session_country=bundle.country,
+        exit_country=exit_country,
+    ))
     # 建单重试可能换了 SID —— 用最终生效的出口覆盖，保证支付同出口
 
     pipeline = build_pipeline()
@@ -447,6 +564,7 @@ async def quote_team(order_id: str, payload: TeamQuoteRequest) -> OrderOut:
             return _to_out(order)
         billing = {k: v.strip() for k, v in payload.billing.model_dump().items()} if payload.billing else None
         if billing:
+            billing = _aligned_billing(billing, _secret_session_country(secrets), getattr(secrets, "billing", None))
             billing["country"] = billing["country"].upper()
             if not is_supported(billing["country"]):
                 raise HTTPException(400, "不支持的支付账单国家")
@@ -485,6 +603,7 @@ async def prepare_team(order_id: str, payload: TeamPrepareRequest) -> dict:
         if secrets is None:
             raise _error(401, ErrorCode.SESSION_EXPIRED, "session 已过期")
         billing = {k: v.strip() for k, v in payload.billing.model_dump().items()}
+        billing = _aligned_billing(billing, _secret_session_country(secrets), getattr(secrets, "billing", None))
         billing["country"] = billing["country"].upper()
         if not is_supported(billing["country"]):
             raise HTTPException(400, "不支持的支付账单国家")
@@ -562,7 +681,8 @@ async def _solve_challenge(order_id: str, secrets, view):
         verified = await asyncio.to_thread(verify_challenge, client.stripe_http, intent_id=intent_id,
                                            client_secret=client_secret, token=token,
                                            publishable_key=secrets.publishable_key,
-                                           api_version="2026-03-25.dahlia")
+                                           api_version="2026-03-25.dahlia",
+                                           user_agent=agent)
         logger.info("challenge_solved id=%s elapsed=%.1f status=%s", order_id,
                     time.monotonic() - started, verified.get("status"))
         result = _hosted_result({"payment_intent": verified}, secrets.checkout_session_id,
@@ -658,6 +778,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     if order.plan is Plan.TEAM and not use_fake_adapters():
         context = secrets.team_context
         address = {k: v.strip() for k, v in payload.billing.model_dump().items()} if payload.billing else dict(secrets.billing)
+        address = _aligned_billing(address, _secret_session_country(secrets), getattr(secrets, "billing", None))
         address["country"] = address.get("country", "").upper()
         address.setdefault("email", "")
         if not context or context.get("context_id") != payload.team_context_id:
@@ -697,6 +818,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
 
     if payload.billing is not None:
         custom = {k: v.strip() for k, v in payload.billing.model_dump().items()}
+        custom = _aligned_billing(custom, _secret_session_country(secrets), getattr(secrets, "billing", None))
         custom["country"] = custom["country"].upper()
         # order.billing_country 是创建结账的地区（决定币种）；
         # custom.country 是支付账单国家，独立用于 PaymentMethod 和 Stripe tax_region。
@@ -964,19 +1086,34 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     settings = load_settings()
     captcha_key = getattr(settings, "captcha_api_key", "") or ""
     captcha_url = getattr(settings, "captcha_api_url", "https://api.yescaptcha.com")
-    # 出口按「用户选择的账单地区」自动对齐，并且每次支付用新的 SID：
-    # 复用配置里固定的 SID 会一直撞同一个出口 IP，抽到坏 IP 时整单必挂。
-    proxy = (
-        payload.proxy
-        or session_proxy("checkout", payload.billing.country)
-        or align_proxy_region(configured_proxy("checkout"), payload.billing.country)
-    )
 
     secrets = vault.get(order_id)
     if secrets is None:
         raise _error(401, ErrorCode.SESSION_EXPIRED, "订单凭证已过期，请重新创建结账")
     _assert_saved_card_resolved(secrets)
     session_raw = secrets.session or ""
+    try:
+        session_bundle = parse_session_bundle(session_raw)
+    except ValueError:
+        session_bundle = None
+    # 出口按 Session 签发地（statsigContext.country）自动对齐，账单国只兜底；
+    # 每次支付用新的 SID：复用配置里固定的 SID 会一直撞同一个出口 IP。
+    session_country = (
+        _secret_session_country(secrets)
+        or (session_bundle.country if session_bundle else "")
+    )
+    exit_country = exit_country_for(session_country, payload.billing.country)
+    proxy = payload.proxy or checkout_proxy_for(
+        "checkout",
+        session_country=exit_country,
+        billing_country=payload.billing.country,
+    )
+    logger.info(
+        "protocol_pay_exit_country session_country=%s billing_country=%s exit_country=%s",
+        session_country or "-",
+        payload.billing.country or "-",
+        exit_country or "-",
+    )
     publishable_key = (
         (payload.publishable_key or "")
         or (getattr(view, "publishable_key", "") or "")
@@ -987,6 +1124,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     pm_id = resolve_protocol_payment_method(payload)
     card = payload.card.model_dump() if payload.card else {}
     billing = {k: (v or "").strip() for k, v in payload.billing.model_dump().items()}
+    billing = _aligned_billing(billing, _secret_session_country(secrets), getattr(secrets, "billing", None))
     billing["country"] = (billing.get("country") or "US").upper()
 
     # custom checkout 的会话 id 有两种：oaics_（ChatGPT 内部）与 cs_live_（Stripe 自定义）。
@@ -1012,6 +1150,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 account_id=secrets.account_id,
                 checkout_id=getattr(view, "checkout_session_id", "") or "",
                 confirm_return_url=getattr(view, "confirm_return_url", "") or "",
+                user_agent=getattr(secrets, "user_agent", "") or "",
+                device_id=getattr(secrets, "device_id", "") or "",
             )
             try:
                 return hp.pay_from_url()
@@ -1024,6 +1164,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 publishable_key=publishable_key, card=card, billing=billing,
                 proxy=proxy, currency=currency,
                 profile=getattr(secrets, "profile", None),
+                user_agent=getattr(secrets, "user_agent", "") or "",
             )
             pp.external_pm = pm_id
             try:
@@ -1034,6 +1175,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
             proxy=proxy, captcha_key=captcha_key, captcha_url=captcha_url,
             card=card, billing=billing,
             profile=getattr(secrets, "profile", None),
+            user_agent=getattr(secrets, "user_agent", "") or "",
             publishable_key=publishable_key,
         )
         # 默认全关（批量模式）；网页上勾选后逐项打开

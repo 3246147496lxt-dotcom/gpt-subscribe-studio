@@ -60,7 +60,13 @@ from gss_core.chatgpt import (
     redact_sensitive,
     stripe_verify_url,
 )
-from gss_core.har_device import DeviceProfile, device_for_account, g_state_cookie, oai_telemetry_header
+from gss_core.har_device import (
+    DeviceProfile,
+    apply_user_agent,
+    device_for_account,
+    g_state_cookie,
+    oai_telemetry_header,
+)
 from gss_core.har_telemetry import (
     PHASE_CAPTCHA,
     PHASE_CARD_ENTRY,
@@ -128,6 +134,8 @@ class PlusHarProtocol:
         telemetry: Optional[str] = None,
         client: Optional[ChatGPTClient] = None,
         read_only: bool = False,
+        user_agent: str = "",
+        device_id: str = "",
     ) -> None:
         self.session = session or ""
         self.checkout_url = checkout_url or ""
@@ -155,13 +163,18 @@ class PlusHarProtocol:
 
         if device is None and account_id:
             device = device_for_account(account_id, self.country)
-        self.device = device or DeviceProfile.random(country=self.country)
+        self.device = device or DeviceProfile.random(
+            country=self.country, seed=device_id or None
+        )
         if isinstance(profile, dict) and profile.get("os_key"):
             # Only a full har_device dict restores an identity; the legacy
             # build/screen profile cannot describe a coherent device here.
             merged = dict(self.device.to_dict())
             merged.update({k: v for k, v in profile.items() if k in merged})
             self.device = DeviceProfile.from_dict(merged)
+        # Session 的真实 UA 优先于随机设备档案。
+        if user_agent:
+            self.device = apply_user_agent(self.device, user_agent)
 
         self.mode = (telemetry or os.environ.get("GSS_HAR_TELEMETRY", "full")).lower()
         self.read_only = bool(read_only)
@@ -253,7 +266,7 @@ class PlusHarProtocol:
                 session.cookies.set(str(name), str(value), domain="chatgpt.com")
             except Exception:  # noqa: BLE001
                 continue
-        self._web = _RecordingSession(session, self._sink, "web") if self._sink else session
+        self._web = _RecordingSession(session, self._sink, "web")
         return self._web
 
     def _browser_session(self, headers: Dict[str, str]) -> Any:
@@ -267,7 +280,7 @@ class PlusHarProtocol:
             session.proxies = {"http": self.proxy, "https": self.proxy}
         session.headers.clear()
         session.headers.update(headers)
-        return _RecordingSession(session, self._sink, "stripe") if self._sink else session
+        return _RecordingSession(session, self._sink, "stripe")
 
     def _stripe_session(self) -> Any:
         if self._stripe is None:
@@ -1196,6 +1209,13 @@ class _RecordingSession:
         return getattr(self._inner, name)
 
     def _dump(self, method: str, url: str, kwargs: Dict[str, Any], response: Any) -> None:
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status >= 400:
+            body = redact_sensitive(str(getattr(response, "text", "") or "")[:4000])
+            logger.warning(
+                "upstream_error where=har_%s method=%s status=%s url=%s body=%s",
+                self._label, method, status, url, body,
+            )
         if self._sink is None:
             return
         body = kwargs.get("content") or kwargs.get("data") or kwargs.get("json") or ""

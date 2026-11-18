@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict
+
+_COUNTRY = re.compile(r"^[A-Z]{2}$")
 
 
 @dataclass
@@ -14,6 +17,9 @@ class SessionBundle:
     device_id: str = ""
     oai_session_id: str = ""
     cookies: Dict[str, str] = field(default_factory=dict)
+    # statsigContext 是 Session 签发时浏览器上报的真实身份，优先级高于任何伪造档案。
+    user_agent: str = ""
+    country: str = ""
 
 
 def parse_session(raw: str) -> str:
@@ -74,21 +80,24 @@ def _from_mapping(data: Any) -> SessionBundle:
         or cookies.get("__Secure-next-auth.session-token")
         or inner.session_token
     )
+    # statsigContext 优先：它是 Session 签发时真实浏览器的 deviceId / UA / 国家，
+    # 顶层字段和 cookie 可能是旧导出里残留的值。
+    statsig = parse_statsig_context(data)
     device_id = (
-        _first_string(data, ("oai-did", "oai_did", "deviceId", "device_id"))
+        statsig["device_id"]
+        or _first_string(data, ("oai-did", "oai_did", "deviceId", "device_id"))
         or cookies.get("oai-did")
         or inner.device_id
     )
-    statsig = data.get("statsigContext")
+    user_agent = statsig["user_agent"] or inner.user_agent
+    country = statsig["country"] or inner.country
     session_id = (
         _first_string(data, ("sessionId", "session_id", "oai-session-id", "oai_session_id"))
         or inner.oai_session_id
     )
-    if isinstance(statsig, dict):
-        if not device_id:
-            device_id = _first_string(statsig, ("deviceId", "device_id"))
-        if not session_id:
-            session_id = _first_string(statsig, ("sessionId", "session_id"))
+    if not session_id:
+        statsig_mapping = _statsig_mapping(data)
+        session_id = _first_string(statsig_mapping, ("sessionId", "session_id"))
     if not token and isinstance(nested, str) and len(nested) > 20:
         token = nested.strip()
     if not token:
@@ -96,13 +105,16 @@ def _from_mapping(data: Any) -> SessionBundle:
     if session_token:
         cookies.setdefault("__Secure-next-auth.session-token", session_token)
     if device_id:
-        cookies.setdefault("oai-did", device_id)
+        # 强制覆盖：请求头 oai-device-id 与 Cookie oai-did 必须同为 statsig 的 deviceId。
+        cookies["oai-did"] = device_id
     return SessionBundle(
         access_token=token,
         session_token=session_token,
         device_id=device_id,
         oai_session_id=session_id,
         cookies=cookies,
+        user_agent=user_agent,
+        country=country,
     )
 
 
@@ -112,6 +124,62 @@ def _first_string(data: Dict[str, Any], keys: tuple[str, ...]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _statsig_mapping(data: Any) -> Dict[str, Any]:
+    """取出 statsigContext；兼容 JSON 字符串和嵌套 session 两种导出格式。"""
+    if not isinstance(data, dict):
+        return {}
+    for key in ("statsigContext", "statsig_context", "statsig"):
+        raw = data.get(key)
+        if isinstance(raw, dict) and raw:
+            return raw
+        if isinstance(raw, str) and raw.strip().startswith("{"):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+    nested = data.get("session")
+    if isinstance(nested, dict):
+        return _statsig_mapping(nested)
+    return {}
+
+
+def _clean_user_agent(value: Any) -> str:
+    """只接受浏览器真实 UA，避免把空串/多行/伪造串写进请求头。"""
+    text = str(value or "").strip()
+    if not text or len(text) > 512 or "\r" in text or "\n" in text:
+        return ""
+    if not text.lower().startswith("mozilla/"):
+        return ""
+    return text
+
+
+def _first_country(data: Dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str):
+            code = value.strip().upper()
+            if _COUNTRY.match(code):
+                return code
+    return ""
+
+
+def parse_statsig_context(data: Any) -> Dict[str, str]:
+    """提取 Session 签发时的设备身份：deviceId、User-Agent、国家码。
+
+    返回的键固定为 device_id / user_agent / country，缺省为空串。
+    """
+    statsig = _statsig_mapping(data)
+    return {
+        "device_id": _first_string(statsig, ("deviceId", "device_id", "deviceID", "did")),
+        "user_agent": _clean_user_agent(
+            _first_string(statsig, ("userAgent", "user_agent", "ua"))
+        ),
+        "country": _first_country(statsig, ("country", "countryCode", "country_code")),
+    }
 
 
 def _cookies_of(data: Dict[str, Any]) -> Dict[str, str]:
@@ -145,7 +213,7 @@ def _parse_cookie_header(text: str) -> Dict[str, str]:
     return cookies
 
 
-__all__ = ["SessionBundle", "parse_session", "parse_session_bundle"]
+__all__ = ["SessionBundle", "parse_session", "parse_session_bundle", "parse_statsig_context"]
 
 def email_from_access_token(access_token: str) -> str:
     """从 ChatGPT accessToken（JWT）里取账户邮箱。
