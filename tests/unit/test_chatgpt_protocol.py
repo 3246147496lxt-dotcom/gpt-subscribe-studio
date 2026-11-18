@@ -1078,3 +1078,17 @@ def test_quote_currency_prefers_checkout_state_over_unrelated_nested_currency() 
     amount, currency = quote_from_payload(payload, "PHP")
     assert currency == "PHP"
     assert amount == Decimal("1100.00")
+
+
+def test_token_revoked_is_reported_as_actionable_session_error() -> None:
+    client = ChatGPTClient("tok")
+    response = SimpleNamespace(
+        status_code=401,
+        text='{"error":{"message":"Encountered invalidated oauth token","code":"token_revoked"}}',
+        url="https://chatgpt.com/backend-api/payments/checkout",
+    )
+    with pytest.raises(DomainError) as exc:
+        client._raise(ErrorCode.INVALID_SESSION, response, "创建结账")
+    assert exc.value.code is ErrorCode.INVALID_SESSION
+    assert "token_revoked" in exc.value.message
+    assert "重新登录" in exc.value.message

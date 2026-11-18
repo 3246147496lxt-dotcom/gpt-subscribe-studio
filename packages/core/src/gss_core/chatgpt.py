@@ -892,13 +892,23 @@ class ChatGPTClient:
         self._http = None
         self._stripe_http = None
 
+    @staticmethod
+    def _unauthorized_message(response: Any) -> str:
+        body = str(getattr(response, "text", "") or "").lower()
+        if "token_revoked" in body or "invalidated oauth token" in body:
+            return "Session 已被上游撤销（token_revoked），请重新登录 ChatGPT 后导出新 session"
+        return "Session 无效或已过期"
+
     def _raise(self, code: ErrorCode, response: Any, prefix: str) -> None:
         _log_upstream_failure(prefix, response)
         body = redact_sensitive(str(getattr(response, "text", ""))[:500])
         status = int(getattr(response, "status_code", 0) or 0)
         lowered = body.lower()
         if status == 401:
-            raise DomainError(ErrorCode.INVALID_SESSION, f"{prefix}: session 无效或已过期")
+            raise DomainError(
+                ErrorCode.INVALID_SESSION,
+                f"{prefix}: {self._unauthorized_message(response)}",
+            )
         if "unusual activity" in lowered:
             raise DomainError(
                 ErrorCode.CHECKOUT_UPSTREAM_ERROR,
@@ -1023,7 +1033,7 @@ class ChatGPTClient:
         if response_status == 401:
             _log_checkout_unauthorized(response, checkout_url, self.http.headers)
             _log_upstream_failure("/backend-api/payments/checkout", response)
-            raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
+            raise DomainError(ErrorCode.INVALID_SESSION, self._unauthorized_message(response))
         if response_status >= 400:
             self._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "创建结账")
         payload = _json(response)
