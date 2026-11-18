@@ -240,12 +240,12 @@ def rotate_proxy_sid(proxy: str) -> str:
 
 
 def exit_country_for(session_country: str = "", billing_country: str = "") -> str:
-    """选择代理出口国家：Session 签发地（statsigContext.country）优先，账单国兜底。
+    """选择代理出口国家：订单目标国家（billing_country）优先，Session 签发地兜底。
 
-    出口 IP 必须与 Session 签发地一致，否则 Cloudflare / Stripe 会把同一次
-    结账判成跨国异常；账单国只在 Session 没带国家时兜底。
+    跨区充值以目标国家为准；Session 签发地只用于判断是否需要重签发，
+    不能反过来覆盖目标国家。
     """
-    for candidate in (session_country, billing_country):
+    for candidate in (billing_country, session_country):
         code = normalize_region(candidate)
         if _COUNTRY_CODE.match(code):
             return code
@@ -263,14 +263,14 @@ def session_proxy(role: str, region: str) -> str | None:
 def session_proxy_for(
     role: str, *, session_country: str = "", billing_country: str = ""
 ) -> str | None:
-    """按 Session 签发地生成出口；缺失时才回退到账单国。"""
+    """按订单目标国家生成出口；缺失时才回退到 Session 签发地。"""
     return session_proxy(role, exit_country_for(session_country, billing_country))
 
 
 def checkout_proxy_for(
     role: str, *, session_country: str = "", billing_country: str = ""
 ) -> str | None:
-    """建单/支付统一入口：Session 签发地优先生成出口，并强制对齐地区。"""
+    """建单/支付统一入口：目标国家优先生成出口，并强制对齐地区。"""
     country = exit_country_for(session_country, billing_country)
     return align_proxy_region(
         session_proxy(role, country) or configured_proxy(role),

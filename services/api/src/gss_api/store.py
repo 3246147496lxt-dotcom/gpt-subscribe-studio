@@ -31,7 +31,7 @@ class OrderView:
     price_interval: Optional[str] = None
     confirm_return_url: Optional[str] = None
     protocol_saved_result: Optional[Dict[str, Any]] = None
-    country_aligned_to_session: bool = False
+    session_reissued_for_country: bool = False
 
 
 class InMemoryStore:

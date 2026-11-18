@@ -47,6 +47,10 @@ class CheckoutRequest:
     workspace_name: str = ""
     seat_quantity: int = 5
     price_interval: str = "month"
+    # 跨区重签发后必须全程复用同一出口 IP，禁止 adapter 轮换 SID。
+    pin_proxy: bool = False
+    # 本单已在目标国家重签发；不要再刷新 session，避免旧 statsig 覆盖新身份。
+    session_reissued: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,6 +108,7 @@ class PaymentRequest:
     team_context: Optional[Dict[str, Any]] = None
     passive_captcha_token: Optional[str] = None
     rv_timestamp: Optional[str] = None
+    session_reissued: bool = False
 
 
 @dataclass(frozen=True)

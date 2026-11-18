@@ -38,7 +38,7 @@ def flow(monkeypatch):
              "after_confirm": "succeeded", "active": True, "closed": 0, "created": 0}
     body = {"card": {"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2040"},
             "billing": {"name": "Fixture Holder", "email": "fixture@example.test", "line1": "Fixture Street",
-                        "city": "Portland", "state": "OR", "postal_code": "97211", "country": "US"},
+                        "city": "Portland", "state": "OR", "postal_code": "97211", "country": "JP"},
             "expected_amount": "1363", "expected_currency": "JPY"}
     checkout_id = "oaics_direct_fixture"
     def record(name, **details):
@@ -58,7 +58,7 @@ def flow(monkeypatch):
                 "publishable_key": state.get("response_key", "pk_test_direct"), "account_id": state.get("response_account", state["account"]),
                 "customer_session_client_secret": state.get("response_cuss", "cuss_fixture"),
                 "status": state["page_status"], "payment_status": state["payment_status"],
-                "billing_details": {"country": "US", "currency": state.get("response_currency", "JPY")},
+                "billing_details": {"country": "JP", "currency": state.get("response_currency", "JPY")},
                 "checkout_state": {"currency": state.get("response_currency", "JPY"),
                     "total": {"subtotal": {"minorUnitsAmount": 2727}, "discount": {"minorUnitsAmount": 1364},
                               "total": {"minorUnitsAmount": state["minor"]}}},
@@ -94,7 +94,7 @@ def flow(monkeypatch):
             if self.service == "app" and url == APP_BASE + "/backend-api/payments/checkout/taxes":
                 record("taxes", body=kwargs["json"])
                 assert kwargs["json"]["checkout_session_id"] == checkout_id
-                assert kwargs["json"]["billing_country"] == "US"
+                assert kwargs["json"]["billing_country"] == "JP"
                 assert kwargs["json"]["currency"].lower() == "jpy"
                 value = page()
                 if state.get("missing_total"): value["checkout_state"]["total"].pop("total")
@@ -108,7 +108,7 @@ def flow(monkeypatch):
                 record("token_create", body=form)
                 assert form["key"] == "pk_test_direct"
                 assert form["payment_method_data[card][number]"] == body["card"]["number"]
-                assert form["payment_method_data[billing_details][address][country]"] == "US"
+                assert form["payment_method_data[billing_details][address][country]"] == "JP"
                 assert not any("hcaptcha" in k or "user_agent" in k or "time_on_page" in k for k in form)
                 if state.get("token_entered"):
                     state["token_entered"].set()

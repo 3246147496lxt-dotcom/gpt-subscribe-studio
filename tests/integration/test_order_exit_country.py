@@ -1,4 +1,4 @@
-"""建单出口必须跟随 Session 签发地，而不是用户选择的账单国。"""
+"""建单出口必须跟随订单目标充值国家。"""
 
 from __future__ import annotations
 
@@ -36,31 +36,21 @@ def _configure_proxy(tmp_path, monkeypatch):
     monkeypatch.setenv("GSS_USE_FAKE", "1")
 
 
-def test_create_order_pins_exit_to_statsig_country(tmp_path, monkeypatch):
+def test_create_order_pins_exit_to_target_billing_country(tmp_path, monkeypatch):
     _configure_proxy(tmp_path, monkeypatch)
     store.clear()
     api = TestClient(create_app())
-    session = json.dumps(
-        {
-            "accessToken": "tok_fixture",
-            "sessionToken": "sess_fixture",
-            "statsigContext": {
-                "deviceId": "did-fixture",
-                "userAgent": UA,
-                "country": "JP",
-            },
-        }
-    )
+    session = json.dumps({"accessToken": "tok_fixture"})
     response = api.post(
         "/api/orders",
-        json={"plan": "plus", "billing_country": "US", "session": session},
+        json={"plan": "plus", "billing_country": "PH", "session": session},
     )
     assert response.status_code == 201, response.text
     order_id = response.json()["id"]
     try:
         secrets = vault.get(order_id)
         assert secrets is not None
-        assert proxy_exit_region(secrets.proxy) == "JP"
+        assert proxy_exit_region(secrets.proxy) == "PH"
     finally:
         vault.drop(order_id)
         store.clear()

@@ -19,8 +19,15 @@ def _identifier(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
-def restore_account(client: ChatGPTClient, expected: str = "") -> str:
-    if client.refresh_session():
+def restore_account(
+    client: ChatGPTClient, expected: str = "", *, trust_statsig: bool = True
+) -> str:
+    refreshed = (
+        client.refresh_session()
+        if trust_statsig
+        else client.refresh_session(trust_statsig=False)
+    )
+    if refreshed:
         client.account_id = jwt_account_id(client.access_token)
     client.hydrate()
     account_id = str(client.account_id or "")
@@ -29,9 +36,11 @@ def restore_account(client: ChatGPTClient, expected: str = "") -> str:
     return account_id
 
 
-def verification_session(client: ChatGPTClient, expected_account: str) -> str:
+def verification_session(
+    client: ChatGPTClient, expected_account: str, *, trust_statsig: bool = True
+) -> str:
     """Carry renewed credentials to the normal subscription adapter, only in memory."""
-    restore_account(client, expected_account)
+    restore_account(client, expected_account, trust_statsig=trust_statsig)
     return json.dumps({
         "accessToken": client.access_token,
         "sessionToken": client.session_token,

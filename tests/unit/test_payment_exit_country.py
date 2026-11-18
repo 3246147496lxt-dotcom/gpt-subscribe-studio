@@ -1,4 +1,4 @@
-"""支付 adapter 不能把 Session 出口按账单国改回去。"""
+"""支付 adapter 使用订单目标国家，不跟随 Session 签发地。"""
 
 from __future__ import annotations
 
@@ -50,11 +50,11 @@ def test_payment_proxy_follows_session_country(tmp_path, monkeypatch):
 
     req = PaymentRequest(
         checkout_url="https://chatgpt.com/checkout/openai_llc/cs_test_fixture",
-        country="US",
+        country="PH",
         payment_method_token="pm_fixture",
         checkout_session_id="cs_test_fixture",
         publishable_key="pk_test_fixture",
-        billing={"country": "US"},
+        billing={"country": "PH"},
         plan="team",
         session=json.dumps(
             {
@@ -64,4 +64,4 @@ def test_payment_proxy_follows_session_country(tmp_path, monkeypatch):
         ),
     )
     assert asyncio.run(adapter.pay(req)) == "ok"
-    assert proxy_exit_region(captured["proxy"]) == "JP"
+    assert proxy_exit_region(captured["proxy"]) == "PH"

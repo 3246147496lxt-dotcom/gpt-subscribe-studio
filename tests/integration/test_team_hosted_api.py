@@ -54,7 +54,7 @@ def test_prepare_requotes_before_pm_and_keeps_egp(setup_team):
     assert r.json()["order"]["billing_country"] == "EG"
     assert r.json()["context"]["checkout_config_id"] == "fixture-config-updated"
     assert "billing" not in r.json()["context"]
-    assert calls[0][1]["billing"]["country"] == "US"
+    assert calls[0][1]["billing"]["country"] == "EG"
     assert store.get_order(order_id).status is OrderStatus.AWAITING_PAYMENT
 
 
@@ -93,7 +93,7 @@ def test_mutated_billing_requires_prepare_again(setup_team):
     client, order_id, _ = setup_team
     client.post(f"/api/orders/{order_id}/team/prepare", json={"billing": BILLING})
     r = client.post(f"/api/orders/{order_id}/pay", json={"payment_method_token": "pm_fixture", "team_context_id": "fixture-context",
-                                                     "billing": {**BILLING, "city": "Changed"}})
+                                                     "billing": {**BILLING, "country": "EG", "city": "Changed"}})
     assert r.status_code == 409
 
 

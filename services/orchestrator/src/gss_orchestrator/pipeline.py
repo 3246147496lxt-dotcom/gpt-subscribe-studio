@@ -71,6 +71,8 @@ class OrderPipeline:
         workspace_name: str = "",
         seat_quantity: int = 5,
         price_interval: str = "month",
+        pin_proxy: bool = False,
+        session_reissued: bool = False,
     ) -> CheckoutResult:
         """阶段一：生成托管结账链接。``mode`` 非法时拒绝（含 promo 未确认）。"""
 
@@ -87,6 +89,8 @@ class OrderPipeline:
             workspace_name=workspace_name,
             seat_quantity=seat_quantity,
             price_interval=price_interval,
+            pin_proxy=pin_proxy,
+            session_reissued=session_reissued,
         )
         return await self.deps.checkout.create_checkout(req)
 
@@ -108,6 +112,7 @@ class OrderPipeline:
         team_context: Optional[Dict[str, Any]] = None,
         passive_captcha_token: Optional[str] = None,
         rv_timestamp: Optional[str] = None,
+        session_reissued: bool = False,
     ) -> PaymentResult:
         """阶段二：卡支付。按 ``card_source`` 校验必备入参（凭证只在此处入参传递）。"""
 
@@ -132,6 +137,7 @@ class OrderPipeline:
             publishable_key=publishable_key,
             billing=billing, plan=plan, team_context=team_context,
             passive_captcha_token=passive_captcha_token, rv_timestamp=rv_timestamp,
+            session_reissued=session_reissued,
         )
         return await self.deps.payment.pay(req)
 

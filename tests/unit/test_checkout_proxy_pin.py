@@ -86,8 +86,8 @@ def test_preflight_uses_proxy_and_accepts_unauthenticated_stripe_response(monkey
     assert calls[-1] == "closed"
 
 
-def test_checkout_proxy_follows_session_country_not_billing(tmp_path, monkeypatch):
-    """建单链路不能把已 pin 的 Session 出口按账单国改回去。"""
+def test_checkout_proxy_follows_target_billing_country(tmp_path, monkeypatch):
+    """建单链路以订单 billing_country 为准，不被旧 statsig 国家改走。"""
     import json
 
     from gss_core.proxies import proxy_exit_region
@@ -116,7 +116,7 @@ def test_checkout_proxy_follows_session_country_not_billing(tmp_path, monkeypatc
     req = CheckoutRequest(
         session=session,
         plan=Plan.PLUS,
-        billing_country="US",
+        billing_country="PH",
         billing_mode=BillingMode.STANDARD,
         proxy=None,
     )
@@ -126,4 +126,4 @@ def test_checkout_proxy_follows_session_country_not_billing(tmp_path, monkeypatc
         adapter, "_create", lambda request, proxy: seen.append(proxy) or created()
     )
     asyncio.run(adapter.create_checkout(req))
-    assert seen and proxy_exit_region(seen[0]) == "JP"
+    assert seen and proxy_exit_region(seen[0]) == "PH"

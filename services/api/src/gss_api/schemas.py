@@ -97,8 +97,8 @@ class OrderOut(BaseModel):
     confirm_return_url: Optional[str] = None
     # 从 accessToken(JWT) 解析出的账户邮箱，用于前端预填账单邮箱
     session_email: Optional[str] = None
-    # Session 签发地与请求账单国不一致时，后端已自动对齐
-    country_aligned_to_session: bool = False
+    # 跨区充值：已丢弃旧 accessToken，在目标国家出口重签发 session
+    session_reissued_for_country: bool = False
 
 
 class ErrorOut(BaseModel):

@@ -199,7 +199,7 @@ async def pay(self, req: PaymentRequest) -> PaymentResult:
 ```
 
 **代理策略**：
-- checkout_proxy：访问结账页面时使用（Session 签发地 `statsigContext.country` 优先，缺失回退账单国家）
+- checkout_proxy：访问结账页面时使用（订单 `billing_country` 目标国家；跨区时先在该国家重签发 session）
 - approve_proxy：提交支付时使用（可能需要不同的代理）
 
 **3DS 处理**：

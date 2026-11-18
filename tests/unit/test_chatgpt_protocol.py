@@ -1055,10 +1055,10 @@ def test_prepare_risk_uses_session_country_over_billing(monkeypatch) -> None:
     assert client.timezone == timezone_for("JP")
 
 
-def test_exit_country_prefers_session_issuer() -> None:
-    assert exit_country_for("JP", "US") == "JP"
-    assert exit_country_for("", "us") == "US"
+def test_exit_country_prefers_target_country() -> None:
+    assert exit_country_for("US", "PH") == "PH"
+    assert exit_country_for("US", "") == "US"
     assert exit_country_for("", "") == ""
-    # 非法国家码不能覆盖后面的有效值。
-    assert exit_country_for("USA", "PH") == "PH"
-    assert exit_country_for("japan", "") == ""
+    # 非法目标国家码才回退到 Session 签发地。
+    assert exit_country_for("PH", "USA") == "PH"
+    assert exit_country_for("PH", "japan") == "PH"

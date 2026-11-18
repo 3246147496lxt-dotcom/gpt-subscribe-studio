@@ -33,10 +33,8 @@ from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.proxies import (
     align_proxy_region,
     configured_proxy,
-    exit_country_for,
     session_proxy,
 )
-from gss_core.session_token import parse_session_bundle
 
 
 class PaymentAdapterBase:
@@ -93,12 +91,6 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
         # forces an extra verification step.
         billing_country = str((req.billing or {}).get("country") or "").upper()
         target_country = billing_country if str(req.plan or "").lower() == "team" and billing_country else req.country
-        # Session 签发地优先于账单国；否则已 pin 的出口会被账单国改回去。
-        try:
-            session_country = parse_session_bundle(req.session).country
-        except ValueError:
-            session_country = ""
-        target_country = exit_country_for(session_country, target_country)
         proxy = align_proxy_region(
             req.checkout_proxy
             or req.approve_proxy
@@ -117,9 +109,10 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
             finally:
                 client.close()
         page_url = req.checkout_url if str(req.checkout_url or "").startswith(APP_BASE) else f"{APP_BASE}/"
-        # 支付阶段出口同样已对齐 Session 签发地：先刷新 session 再 warmup，
-        # 让确认请求的 cookie/凭证与本批次出口同批次。软失败不阻断。
-        client.refresh_session()
+        # 重签发过的 session 已经绑定目标国家出口；再次刷新可能被旧 statsig
+        # 覆盖设备/UA，所以只在普通订单上刷新。
+        if not req.session_reissued:
+            client.refresh_session()
         client.warmup(page_url=page_url)
         pk = req.publishable_key or ""
         if not pk:

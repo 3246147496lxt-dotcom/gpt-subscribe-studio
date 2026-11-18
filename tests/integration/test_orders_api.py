@@ -131,8 +131,8 @@ def test_team_hosted_checkout_requires_seats_and_returns_link() -> None:
 
 
 @pytest.mark.parametrize("payment_country,state", [("US", "OR"), ("JP", "Tokyo")])
-def test_team_egypt_checkout_preserves_currency_with_independent_billing(monkeypatch, payment_country, state) -> None:
-    """EG / EGP 创建 Team；支付地址的国家独立传到适配器，不改订单币种。"""
+def test_team_egypt_checkout_aligns_payment_billing_to_order(monkeypatch, payment_country, state) -> None:
+    """EG / EGP 创建 Team；支付地址国家被对齐到订单目标国家。"""
     from gss_api.runtime import build_pipeline
     pipeline = build_pipeline()
     monkeypatch.setattr("gss_api.routers.orders.build_pipeline", lambda: pipeline)
@@ -161,11 +161,11 @@ def test_team_egypt_checkout_preserves_currency_with_independent_billing(monkeyp
     assert result["status"] == "delivered"
     assert result["billing_country"] == "EG"
     assert result["currency"] == "EGP"
-    assert result["billing"]["country"] == payment_country
+    assert result["billing"]["country"] == "EG"
     request = pipeline.deps.payment.calls[0]
     assert request.country == "EG"
-    assert request.billing["country"] == payment_country
-    assert request.billing["state"] == state
+    assert request.billing["country"] == "EG"
+    assert request.billing["postal_code"]
     assert request.payment_method_token == "pm_fake"
 
 
@@ -231,7 +231,7 @@ def test_pay_uses_manual_billing_address() -> None:
     assert paid.json()["billing"]["country"] == "US"
 
 
-def test_pay_accepts_independent_billing_country_without_changing_order_region() -> None:
+def test_pay_aligns_billing_to_order_country() -> None:
     store.clear()
     client = TestClient(create_app())
     order_id = _create_us_order(client)
@@ -253,7 +253,7 @@ def test_pay_accepts_independent_billing_country_without_changing_order_region()
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "delivered"
-    assert resp.json()["billing"]["country"] == "JP"
+    assert resp.json()["billing"]["country"] == "US"
     assert resp.json()["billing_country"] == "US"
     assert resp.json()["currency"] == "USD"
 
@@ -340,7 +340,7 @@ def test_checkout_effective_proxy_is_kept_only_in_memory(monkeypatch):
 
 
 @pytest.mark.parametrize("checkout_country,billing_country,currency", [("EG", "US", "EGP"), ("US", "JP", "USD")])
-def test_plus_input_payment_keeps_checkout_currency_and_independent_billing(monkeypatch, checkout_country, billing_country, currency):
+def test_plus_input_payment_aligns_billing_to_checkout_country(monkeypatch, checkout_country, billing_country, currency):
     from gss_api.runtime import build_pipeline
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     pipeline = build_pipeline()
@@ -357,7 +357,7 @@ def test_plus_input_payment_keeps_checkout_currency_and_independent_billing(monk
     assert result["status"] == "delivered"
     assert result["billing_country"] == checkout_country
     assert result["currency"] == currency
-    assert result["billing"]["country"] == billing_country
+    assert result["billing"]["country"] == checkout_country
     request = pipeline.deps.payment.calls[0]
     assert request.country == checkout_country
-    assert request.billing["country"] == billing_country
+    assert request.billing["country"] == checkout_country

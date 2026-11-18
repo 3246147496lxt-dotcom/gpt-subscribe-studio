@@ -1,81 +1,72 @@
-# Session 身份对齐修复摘要（2026-11-18）
+# 目标国家充值 + Session 重签发修复摘要（2026-11-18）
 
-目标：让订单国家、代理出口、账单地址、币种、设备指纹与 Session 签发时的
-`statsigContext` 完全一致，并让上游 4xx/5xx 可观测。
+目标：允许在任意国家签发的 Session 上，按订单指定的 `billing_country`
+（例如 PH 菲律宾）完成低价区充值；跨区时在目标国家出口重签发，并保证
+「重签发 → 建单 → Stripe 扣款」全链路同一 IP、同一 UA。
 
-## 1. 国家三位一体
+## 1. 目标国家优先
 
-有 `statsigContext.country` 时：
+- `Order.billing_country` 使用请求的 `billing_country`
+- 币种由 `currency_for(target_country)` 推导
+- 默认账单地址由 `address_for(target_country)` 生成，写入 `OrderSecrets.billing`
+- 代理出口按 `target_country` 生成一次并 pin 住
+- 响应字段：`session_reissued_for_country`（是否发生跨区重签发）
+- 目标国家不在支持列表时返回 400 `COMPLIANCE_BLOCKED`
 
-- `Order.billing_country` 直接使用签发地，忽略请求里的 `billing_country`
-- 币种由 `currency_for(签发地)` 推导
-- 默认账单地址由 `address_for(签发地)` 生成，并写入 `OrderSecrets.billing`
-- 代理出口使用同一国家
-- 响应新增 `country_aligned_to_session=true`，日志记录
-  `country_aligned_to_session source=session requested_billing_country=... session_country=...`
-- 签发地不在支持列表时返回 400 `COMPLIANCE_BLOCKED`
+## 2. 跨区重签发（`ChatGPTClient.reauthorize_for_country`）
 
-没有 `statsigContext.country` 时保持原行为：使用请求的 `billing_country`。
+仅当 `statsigContext.country` 存在且与目标国家不同时触发：
 
-## 2. vault 保留 Session 身份
+1. 丢弃旧 `accessToken`
+2. 只保留 `__Secure-next-auth.session-token`
+3. 生成新的 `oai-did`（UUID4）和匹配的桌面 Chrome UA
+4. 挂目标国家粘性代理，调用 `GET /api/auth/session`
+5. 只接受新 `accessToken` / 新 Cookie，忽略响应里可能回带的旧 statsig 环境
+6. 后续 `prepare_risk`（Node 哨兵）、`create_checkout`、Stripe 支付复用
+   同一个 client / proxy / UA
 
-`OrderSecrets` 新增：
+跨区但缺少 sessionToken 时直接 401，提示重新导出完整 session。
 
-- `user_agent`：`statsigContext.userAgent`
-- `device_id`：`statsigContext.deviceId`（同时写 `oai-device-id` / Cookie `oai-did`）
-- `session_country`：Session 签发地
-- `exit_country`：本单实际出口国家
+## 3. 全链路粘性
 
-`profile` 不再由 `_pick_profile()` 随机决定，而是由 Session UA 推导
-（`profile_from_session_ua`）；仅当 UA 完全缺失时才回退到 device_id 派生。
-
-## 3. 全链路 UA 透传
-
-以下入口新增/使用 `user_agent`：
-
-- `StripeProtocol`
-- `PlusProtocol`
-- `PlusHarProtocol`（通过 `apply_user_agent` 覆盖 `DeviceProfile` 的
-  UA / chrome_build / chrome_major / platform / client hints）
-- `captcha.verify_challenge`
-- `captcha.solve_hcaptcha`（支付 adapter 现在会传 proxy + UA）
-
-硬编码 UA 只作为完全缺失时的 fallback，不再在正常链路生效。
+- `create_order` 只生成一次 `exit_proxy`，重签发、建单、支付共用
+- `CheckoutRequest.pin_proxy=True`：checkout adapter 不轮换 SID
+- `_create_checkout_with_retry` 在 pin 模式下即使代理报错也不换 SID
+- `pay-protocol` 优先复用 `OrderSecrets.proxy`，不再每次生成新 SID
+- `pay` / Team prepare / quote 全部使用同一个 `secrets.proxy`
+- UA 从 vault 的 `user_agent` 透传到 `StripeProtocol` / `PlusProtocol` /
+  `PlusHarProtocol` / `captcha.verify_challenge`
 
 ## 4. 上游错误透传
 
-所有关键请求在 `>=400` 时记录：
+所有关键请求 `>=400` 时记录：
 
-- 原始 HTTP 状态码
-- 请求 URL（query 值统一打码为 `***`）
+- 原始状态码
+- URL（query 值统一打码）
 - 响应体原文（`redact_sensitive`，最多 4000 字符）
 
-覆盖：`refresh_session`、`/backend-api/me`、accounts check、优惠资格、
-`create_checkout`、subscriptions、Stripe form/intent/confirm/setup_intent/
-confirmation_tokens、hosted checkout、tokenize、captcha verify、
-StripeProtocol 的 `_post` / `_get`、PlusProtocol 的 Stripe 提交、
-PlusHarProtocol 的 web/stripe/m 会话。
+覆盖 `refresh_session`、账号补查、`create_checkout`、Stripe form/intent/
+confirm、hosted checkout、tokenize、captcha verify、Plus/HAR 会话。
 
 ## 5. 验证
 
 ```bash
 uv run python -m pytest tests
-# 377 passed
+# 383 passed
 ```
 
-新增回归测试：
+新增/更新：
 
-- `tests/integration/test_country_alignment.py`
-- `tests/integration/test_order_exit_country.py`
-- `tests/unit/test_exit_country.py`
-- `tests/unit/test_payment_exit_country.py`
-- `tests/unit/test_protocol_user_agent.py`
-- `tests/unit/test_chatgpt_protocol.py`（statsig 优先级 / 上游日志）
-- `tests/unit/test_session_refresh.py`（刷新日志脱敏）
+- `tests/integration/test_country_alignment.py`（跨区重签发 + 目标国家）
+- `tests/integration/test_order_exit_country.py`（目标国家出口）
+- `tests/unit/test_session_reauth.py`（丢弃旧身份、只用 sessionToken）
+- `tests/unit/test_payment_exit_country.py`（支付目标国家）
+- `tests/unit/test_checkout_proxy_pin.py`（pin 出口）
+- `tests/unit/test_protocol_user_agent.py`（UA 透传）
 
-## 6. 仍需真实 Session 验证
+## 6. 真实 Session 待验证
 
-- `/api/auth/session` 是否稳定回带 `statsigContext`
-- 非 Chrome UA（Safari/Firefox/Edge）的 client hints
+- 目标国家代理是否允许 `GET /api/auth/session`
+- 重签发后的 accessToken 是否被目标国家 IP 上下文接受
 - `curl_cffi` TLS impersonate 目前仍固定 `chrome150`
-- 支付阶段 Stripe 是否接受「Session 签发地 = 账单国」的地址模板
+- 非 Chrome UA 的 client hints

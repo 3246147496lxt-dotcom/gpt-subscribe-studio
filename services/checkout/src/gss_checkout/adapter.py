@@ -22,11 +22,9 @@ from gss_core.countries import country_codes, currency_for
 from gss_core.proxies import (
     align_proxy_region,
     configured_proxy,
-    exit_country_for,
     rotate_proxy_sid,
     session_proxy,
 )
-from gss_core.session_token import parse_session_bundle
 
 logger = logging.getLogger("gss.checkout")
 _STRIPE_PROXY_CHECK_URL = "https://api.stripe.com/v1/payment_methods"
@@ -103,22 +101,18 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
     async def create_checkout(self, req: CheckoutRequest) -> CheckoutResult:
         if not req.session:
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法创建结账")
-        # 出口国家以 Session 签发地为准，账单国只兜底。调用方传入的 req.proxy
-        # （建单时已 pin 的出口）也要按签发地复核，不能被账单国改回去。
-        try:
-            session_country = parse_session_bundle(req.session).country
-        except ValueError:
-            session_country = ""
-        exit_country = exit_country_for(session_country, req.billing_country)
+        # 目标充值国家由订单的 billing_country 决定；跨区场景会先在目标国家
+        # 重签发 session，再带着同一个 pin 出口进入这里。
         proxy = align_proxy_region(
-            req.proxy or session_proxy("checkout", exit_country) or configured_proxy("checkout"),
-            exit_country,
+            req.proxy or session_proxy("checkout", req.billing_country) or configured_proxy("checkout"),
+            req.billing_country,
         )
         used_proxy = proxy
         created = None
         if req.plan is Plan.TEAM:
             # Team 只允许通过已预检的代理访问上游；候选为原 SID + 最多两个新 SID。
-            for candidate in _team_proxy_candidates(proxy):
+            candidates = [proxy] if req.pin_proxy else _team_proxy_candidates(proxy)
+            for candidate in candidates:
                 reachable = await asyncio.to_thread(
                     _probe_stripe_proxy,
                     candidate,
@@ -146,6 +140,8 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
                 created = await asyncio.to_thread(self._create, req, proxy)
             except DomainError as exc:
                 if exc.code is not ErrorCode.CHECKOUT_UPSTREAM_ERROR or "异常流量" not in str(exc):
+                    raise
+                if req.pin_proxy:
                     raise
                 rotated = rotate_proxy_sid(proxy or "")
                 if not rotated or rotated == proxy:
@@ -175,9 +171,10 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
     def _create(self, req: CheckoutRequest, proxy: Optional[str]):
         client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
         client.timeout = float(self.timeout)
-        # 出口已对齐 Session 签发地：先用同一出口刷新 session，让 accessToken/cookie
-        # 与本次 IP 同批次，降低 403 与 unusual activity 概率。软失败不阻断。
-        client.refresh_session()
+        # 跨区重签发后的 session 已经是目标 IP 上刚换好的，不能再刷一次：
+        # 服务端可能回带旧 statsig，覆盖掉刚生成的设备/UA。
+        if not req.session_reissued:
+            client.refresh_session()
         try:
             return client.create_checkout(
                 plan=str(req.plan),

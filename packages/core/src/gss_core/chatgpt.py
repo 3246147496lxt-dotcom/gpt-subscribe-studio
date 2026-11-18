@@ -549,6 +549,56 @@ class ChatGPTClient:
             oai_session_id=session_id,
         )
 
+    @classmethod
+    def reauthorize_for_country(
+        cls, raw: str, *, proxy: Optional[str], country: str
+    ) -> "ChatGPTClient":
+        """跨区充值：只保留 sessionToken，在目标国家出口上重签发 accessToken。
+
+        旧 accessToken / 旧 statsigContext 一律丢弃；deviceId 与 UA 重新生成，
+        保证新 token 绑定的是目标国家的 IP + 新设备指纹。
+        """
+        bundle = parse_session_bundle(raw)
+        if not bundle.session_token:
+            raise DomainError(
+                ErrorCode.INVALID_SESSION,
+                "跨区充值需要完整 Session（缺少 __Secure-next-auth.session-token）",
+            )
+        device = str(uuid.uuid4())
+        profile = _pick_profile(device)
+        user_agent = profile["ua"].format(build=profile["build"])
+        session_cookie = "__Secure-next-auth.session-token"
+        client = cls(
+            access_token="",
+            proxy=proxy,
+            session_token=bundle.session_token,
+            device_id=device,
+            user_agent=user_agent,
+            oai_session_id=str(uuid.uuid4()),
+            session_country=country,
+            language=locale_for(country),
+            timezone=timezone_for(country),
+            extra_cookies={session_cookie: bundle.session_token},
+        )
+        try:
+            if not client.refresh_session(trust_statsig=False):
+                raise DomainError(
+                    ErrorCode.INVALID_SESSION,
+                    f"无法在目标国家 {country} 重签发 Session，请检查该国家出口代理是否可用",
+                )
+            rotated = client.extra_cookies.get(session_cookie, "")
+            if rotated:
+                client.session_token = rotated
+            # 刷新响应可能回带旧 oai-did；强制回到本次新生成的设备标识。
+            client.extra_cookies["oai-did"] = client.device_id
+            client.session_country = country
+            if client._http is not None:
+                client._http.headers.update(client._identity_headers())
+            return client
+        except Exception:
+            client.close()
+            raise
+
     def _cookie_header(self) -> str:
         values: Dict[str, str] = dict(self.extra_cookies)
         if self.session_token:
@@ -685,7 +735,7 @@ class ChatGPTClient:
                 self.extra_cookies[str(name)] = str(value)
         self.http.headers.update(self._identity_headers())
 
-    def refresh_session(self) -> bool:
+    def refresh_session(self, *, trust_statsig: bool = True) -> bool:
         """用当前出口 IP 请求 /api/auth/session，换取与本批次出口一致的 accessToken 与 cookie。
 
         结账地区由出口代理决定（align_proxy_region），session 本身不绑定国家；
@@ -719,15 +769,17 @@ class ChatGPTClient:
             logger.warning("session 刷新未返回 accessToken（session-token 可能已失效），继续用原 session")
             return False
         self.access_token = token
-        # /api/auth/session 会回带签发时的 statsigContext；同步真实设备身份，
-        # 避免刷新后仍用旧 deviceId / UA 与出口国家对不上。
-        identity = parse_statsig_context(payload)
-        if identity["device_id"]:
-            self.device_id = identity["device_id"]
-        if identity["user_agent"]:
-            self.user_agent = identity["user_agent"]
-        if identity["country"]:
-            self.session_country = identity["country"]
+        # /api/auth/session 会回带签发时的 statsigContext；普通刷新时同步真实
+        # 设备身份。跨区重签发时 trust_statsig=False：只接受新 token/cookie，
+        # 不允许旧的 statsig 环境字段覆盖刚生成的干净设备。
+        if trust_statsig:
+            identity = parse_statsig_context(payload)
+            if identity["device_id"]:
+                self.device_id = identity["device_id"]
+            if identity["user_agent"]:
+                self.user_agent = identity["user_agent"]
+            if identity["country"]:
+                self.session_country = identity["country"]
         self._merge_cookies(previous_names)
         logger.info("session 刷新成功，已与本批次出口对齐")
         return True
