@@ -25,7 +25,7 @@ import { OrderSummary } from "../components/OrderSummary";
 import { OrderProgress, type CheckoutClock, type ProgressActivity } from "../components/OrderProgress";
 import { getOrderFlow } from "../orderFlow";
 import { PlanPicker, type TeamValues } from "../components/PlanPicker";
-import { REGIONS } from "../plans";
+import { SettlementRegion } from "../components/SettlementRegion";
 import { ResultPanel } from "../components/ResultPanel";
 import { SessionField } from "../components/SessionField";
 import { verifiedPayerBilling } from "../components/FixedPayerBilling";
@@ -495,36 +495,33 @@ export function OrderNew({ onRecord }: Props) {
                 onTeam={setTeam}
                 disabled={busy}
               />
-              <Select
-                label="出口国家（代理 / Session 重签发）"
-                description={plan === "team"
-                  ? "默认跟随上面的地区。低价区示例：地区 US、出口 PH，代理与重签发走 PH，账单/税务走 US。"
-                  : "决定结算币种、代理出口与 Session 重签发；账单地址固定使用服务端已核验的美国免税地址，不随出口变化。"}
-                placeholder={plan === "team" ? "默认跟随地区" : "默认使用当前代理地区"}
-                searchable
-                data={REGIONS.map((item) => ({ value: item.code, label: `${item.label} (${item.code})` }))}
-                value={exitCountry || null}
-                onChange={(value) => setExitCountry(value ?? "")}
+              <SettlementRegion
+                team={plan === "team"}
+                value={exitCountry}
+                onChange={setExitCountry}
                 disabled={busy || Boolean(order)}
               />
               <SessionField value={session} onChange={setSession} team={plan === "team"} disabled={busy} />
-              <div>
-                <Text size="sm" fw={600} mb={6}>支付方式</Text>
-                <SegmentedControl
-                  fullWidth
-                  value={pmMode}
-                  onChange={(value) => setPmMode(value as "server" | "stripe")}
-                  disabled={busy || Boolean(order)}
-                  data={[
-                    { value: "server", label: "协议提交（服务端提交卡号）" },
-                    { value: "stripe", label: teamOrder ? "Stripe 输入框（浏览器换 pm_）" : "输入框模式不可用", disabled: !teamOrder },
-                  ]}
-                />
-                <Text size="xs" c="dimmed" mt={6}>
-                  {!teamOrder ? "浏览器支付标识不能核验其账单归属，不接受此方式付款。"
-                    : "协议提交由服务端向 Stripe 换 pm_；Stripe 输入框让卡号只进 Stripe iframe。"}
-                </Text>
-              </div>
+              {teamOrder ? (
+                <div>
+                  <Text size="sm" fw={600} mb={6}>支付方式</Text>
+                  <SegmentedControl
+                    fullWidth
+                    value={pmMode}
+                    onChange={(value) => setPmMode(value as "server" | "stripe")}
+                    disabled={busy || Boolean(order)}
+                    data={[
+                      { value: "server", label: "协议提交（服务端提交卡号）" },
+                      { value: "stripe", label: "Stripe 输入框（浏览器换 pm_）" },
+                    ]}
+                  />
+                  <Text size="xs" c="dimmed" mt={6}>
+                    协议提交由服务端向 Stripe 换 pm_；Stripe 输入框让卡号只进 Stripe iframe。
+                  </Text>
+                </div>
+              ) : (
+                <Text size="sm">支付方式：由服务端提交卡号。</Text>
+              )}
               {plan === "plus" && (
                 <Paper withBorder p="md" radius="md">
                   <Stack gap="sm">
@@ -582,7 +579,7 @@ export function OrderNew({ onRecord }: Props) {
               )}
               <Text size="xs" c="dimmed">
                 {plan === "plus"
-                  ? pmMode === "server" ? "协议模式：沿用当前订单 checkout，每次随机生成一套设备（UA/UA-CH/屏幕/时区/guid-muid-sid），先发 m.stripe.com/6 指纹与 r.stripe.com/b 事件流，再核算税费、创建 confirmation_tokens、完成 ChatGPT confirm 与 PaymentIntent confirm，最后 GET checkout 核对 complete / paid 并查询订阅。" : "此方式不能核验付款方账单归属，无法提交。"
+                  ? pmMode === "server" ? "此模式的付款请求使用随机生成的设备标识。建议使用官方结账。" : "此方式不能核验付款方账单归属，无法提交。"
                   : "结账地区由上面选的地区决定。session 只在内存中使用，不写数据库。"}
               </Text>
             </Stack>

@@ -7,7 +7,7 @@ POST /api/payments/quick-pay
 GET  /api/payments/quick-pay/{job_id}
 ```
 
-`Idempotency-Key` 必填。
+`Idempotency-Key` 必填。`billing` 可省略，后端会使用本单已核验的固定美国免税账单。
 
 ## POST /api/payments/quick-pay
 

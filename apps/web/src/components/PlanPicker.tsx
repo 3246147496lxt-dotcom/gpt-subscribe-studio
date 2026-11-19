@@ -84,7 +84,7 @@ export function PlanPicker({ plan, onPlan, country, onCountry, team, onTeam, dis
         </div>
       )}
 
-      {family === "team" ? (
+      {family === "team" && (
         <Select
           label="创建结账地区"
           description="决定结账币种；可选择埃及（EG / EGP），支付账单国家单独填写。"
@@ -96,10 +96,6 @@ export function PlanPicker({ plan, onPlan, country, onCountry, team, onTeam, dis
           onChange={(value) => onCountry(value ?? "")}
           disabled={disabled}
         />
-      ) : (
-        <Text size="sm" role="note" data-testid="fixed-order-billing-country">
-          账单国家由服务端使用付款方已核验的固定账单确定，不可编辑。
-        </Text>
       )}
 
       {family === "team" && (

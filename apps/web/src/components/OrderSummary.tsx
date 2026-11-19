@@ -67,7 +67,9 @@ export function OrderSummary({ plan, country, order, seats, progress = getOrderF
         <p className="order-receipt-caption">本次应付</p>
         <p className="order-receipt-amount" data-placeholder={!due || undefined}>{due ?? amountPlaceholder}</p>
         {order?.quote_error && <p className="order-receipt-note order-receipt-error">{order.quote_error}</p>}
-        {currentPlan === "team" && due && <p className="order-receipt-note">Stripe 当前报价，确认前会按账单地址重算税费。</p>}
+        <p className="order-receipt-note">{currentPlan === "team" && due
+          ? "当前为 Stripe 报价，确认前按账单地址重算税费。"
+          : "实际应付以结账报价为准。"}</p>
 
         <p className="order-receipt-status">{progress.label}</p>
       </section>

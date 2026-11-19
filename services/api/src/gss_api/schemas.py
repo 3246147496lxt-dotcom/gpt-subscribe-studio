@@ -176,7 +176,7 @@ class QuickPayRequest(AddressedRequest):
     exit_country: Optional[str] = None
     session: str = Field(repr=False)
     card: CardIn = Field(repr=False)
-    billing: BillingIn
+    billing: Optional[BillingIn] = None
     mode: ModeIn = Field(default_factory=ModeIn)
     promo_code: str = ""
     promo_campaign_id: str = ""

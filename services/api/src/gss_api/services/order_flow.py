@@ -17,7 +17,7 @@ from fastapi import HTTPException
 from gss_contracts.errors import DomainError
 from gss_core.redaction import redact_sensitive
 
-from ..schemas import OrderCreateRequest, QuickPayRequest
+from ..schemas import BillingIn, OrderCreateRequest, QuickPayRequest
 from ..routers import orders, protocol_cards
 
 logger = logging.getLogger("gss.quick_pay")
@@ -133,9 +133,10 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             return job
 
         job.stage = "confirming_payment"
+        order_billing = BillingIn(**order.billing) if getattr(order, "billing", None) else None
         bind_payload = protocol_cards.BindProtocolRequest(
             card=payload.card,
-            billing=payload.billing,
+            billing=payload.billing or order_billing,
             expected_amount=str(order.amount or ""),
             expected_currency=str(order.currency or ""),
         )

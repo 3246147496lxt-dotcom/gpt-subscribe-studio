@@ -91,13 +91,10 @@ test("unverified or incomplete non-Team billing exposes no card entry, provider 
 
 test("new Plus order configuration does not offer opaque browser-created payment tokens", () => {
   const html = renderToStaticMarkup(<MantineProvider><OrderNew onRecord={() => {}} /></MantineProvider>);
-  assert.ok(html.includes("协议提交（服务端提交卡号）"));
-  assert.ok(html.includes("输入框模式不可用"));
-  assert.ok(!html.includes("Stripe 输入框（浏览器换 pm_）"));
-  assert.ok(html.includes("confirmation_tokens"));
-  assert.ok(html.includes("ChatGPT confirm"));
-  assert.ok(html.includes("PaymentIntent confirm"));
-  assert.ok(html.includes("GET checkout"));
+  assert.ok(html.includes("由服务端提交卡号"));
+  assert.ok(html.includes("付款请求使用随机生成的设备标识"));
+  assert.ok(!html.includes('value="server"'));
+  assert.ok(!html.includes('value="stripe"'));
   for (const marker of ["协议绑卡并支付", "先绑卡", "重新提链", "再次提链", "服务端绑卡"]) {
     assert.ok(!html.includes(marker), marker);
   }
@@ -106,9 +103,13 @@ test("new Plus order configuration does not offer opaque browser-created payment
 
 test("创建非 Team 订单之前账单国家只读，出口可不选", () => {
   const html = renderToStaticMarkup(<MantineProvider><OrderNew onRecord={() => {}} /></MantineProvider>);
-  assert.match(html, /data-testid="fixed-order-billing-country"[^>]*>[^<]*不可编辑/);
-  assert.ok(html.includes("默认由服务端确定"));
-  assert.ok(html.includes("选择出口不会更改账单"));
+  assert.ok(!html.includes("fixed-order-billing-country"));
+  assert.match(html, /class="settlement-region__summary"[^>]+aria-expanded="false"/);
+  assert.ok(html.includes("沿用当前代理地区"));
+  assert.ok(!html.includes("选择结算地区（代理出口）"));
+  assert.ok(html.includes("账单地址固定使用"));
+  assert.ok(html.includes("不随出口变化"));
+  assert.doesNotMatch(html, />创建结账地区</);
   assert.doesNotMatch(html, /用于创建结账并对齐出口代理|低价区示例|请选择创建结账的地区/);
 });
 
