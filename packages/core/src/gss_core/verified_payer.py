@@ -110,11 +110,18 @@ def verify_claims(*claims, order_billing=None, verification_id=None) -> Verified
     return profile
 
 
+def split_exit_billing_allowed() -> bool:
+    """Lab-only escape hatch for PH exit + US tax-free billing."""
+    return os.environ.get("GSS_ALLOW_SPLIT_EXIT_BILLING", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def checkout_address(country: str, declared_country: str, claim=None) -> VerifiedBilling:
     """The existing channel puts its country into checkout billing details. Never correct a mismatch."""
     try:
         profile = verify_claims(claim)
-        if any(value.strip().upper() != profile["country"] for value in (country, declared_country)):
+        if declared_country.strip().upper() != profile["country"]:
+            raise BillingMismatch
+        if not split_exit_billing_allowed() and country.strip().upper() != profile["country"]:
             raise BillingMismatch
         return profile
     except MissingProfile:
@@ -147,6 +154,10 @@ def check_observed_billing(payload, expected: dict) -> None:
             if value is None or value == "":
                 continue
             wanted = expected.get(field, "")
+            if field == "country" and split_exit_billing_allowed():
+                # Lab split mode: the upstream checkout echoes the exit country
+                # (PH) while the payer address remains US; do not veto it.
+                continue
             if isinstance(value, str):
                 value = value.strip()
                 if field == "country":

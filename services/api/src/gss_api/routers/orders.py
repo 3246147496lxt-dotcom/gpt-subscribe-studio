@@ -50,7 +50,7 @@ from gss_core.session_token import (
     parse_session_bundle,
 )
 from gss_core.vault import OrderSecrets, vault
-from gss_core.verified_payer import ObservedBillingConflict
+from gss_core.verified_payer import ObservedBillingConflict, split_exit_billing_allowed
 from gss_core.saved_card_protocol import _minor
 from gss_core.saved_cards import verification_session
 from gss_orchestrator.pipeline import apply_payment_result, assert_deliverable
@@ -165,7 +165,10 @@ def _verified_order_billing(order, secrets: OrderSecrets, *claims):
             supplied.append(claim)
     verified = require_verified_billing(*supplied, secrets.billing, order_billing=view.billing,
                                         verification_id=view.billing_verification_id)
-    if any(code != verified["country"] for code in (order.billing_country, view.exit_country, secrets.exit_country)):
+    codes = [order.billing_country]
+    if not split_exit_billing_allowed():
+        codes += [view.exit_country, secrets.exit_country]
+    if any(code != verified["country"] for code in codes):
         raise HTTPException(409, "订单账单国家与核验记录不一致，未提交。")
     return verified
 
@@ -557,7 +560,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         raise HTTPException(409, "结账账单国家与已核验账单不一致，未创建订单。")
     exit_country = normalize_country(payload.exit_country or country)
     # This channel also uses the exit in its checkout billing details; do not silently substitute.
-    if verified is not None and exit_country != country:
+    if verified is not None and exit_country != country and not split_exit_billing_allowed():
         raise HTTPException(409, "所选出口与本渠道的固定账单不兼容，未创建订单。")
     pipeline = None
     if non_team:
