@@ -466,7 +466,16 @@ class PlusHarProtocol:
                 "Sentinel 风控令牌签发失败，已停止确认，未提交支付。",
             ) from exc
         logger.info("plus_har_sentinel_ok flow=%s elapsed=%.2f", flow, time.monotonic() - started)
-        sentinel_ping(self._web_session(), self.device, timeout=min(self.timeout, 20.0))
+        ping_started = time.monotonic()
+        try:
+            sentinel_ping(self._web_session(), self.device, timeout=min(self.timeout, 5.0))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "plus_har_sentinel_ping_failed flow=%s type=%s elapsed=%.2f",
+                flow, type(exc).__name__, time.monotonic() - ping_started,
+            )
+        else:
+            logger.info("plus_har_sentinel_ping_ok flow=%s elapsed=%.2f", flow, time.monotonic() - ping_started)
 
     def _prelude(self) -> None:
         if self.mode == "off":
