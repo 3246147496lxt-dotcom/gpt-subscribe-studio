@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test:team": "node scripts/test-team.mjs",
     "test:saved-card": "node scripts/test-saved-card.mjs",
-    "test:protocol-bind": "node scripts/test-protocol-bind.mjs"
+    "test:protocol-bind": "node scripts/test-protocol-bind.mjs",
+    "test:purchase-intent": "node scripts/test-purchase-intent.mjs"
   },
   "dependencies": {
     "@mantine/core": "^9.7.2",

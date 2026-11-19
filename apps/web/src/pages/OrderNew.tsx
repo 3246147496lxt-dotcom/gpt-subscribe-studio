@@ -17,6 +17,7 @@ import {
   type Plan,
   type PromoEligibility,
 } from "../api/client";
+import { forgetPurchase, openNonTeamPurchase, readPurchaseIntent } from "../api/purchaseIntent";
 import { SUCCESS_STATUSES, isSettled } from "../api/history";
 import { subscribeOrderUpdates, type OrderUpdateEvent } from "../api/events";
 import { loadStripe, type StripeCardHandle } from "../card-payment/CardFields";
@@ -48,6 +49,7 @@ export function OrderNew({ onRecord }: Props) {
   const currentOrderId = useRef<string | null>(null);
   currentOrderId.current = order?.id || null;
   const [result, setResult] = useState<Order | null>(null);
+  const [readOnlyOrderId, setReadOnlyOrderId] = useState<string | null>(null);
   const [addr, setAddr] = useState<BillingInput | null>(null);
   const [card, setCard] = useState<StripeCardHandle | null>(null);
   const [teamCard, setTeamCard] = useState<TeamCardDraft>(emptyTeamCard);
@@ -73,6 +75,13 @@ export function OrderNew({ onRecord }: Props) {
   const linkOnly = Boolean(order && hosted && !order.publishable_key);
   const step = result ? 2 : order ? 1 : 0;
 
+  // Unknown or inaccessible storage must never look like permission to start a new purchase.
+  let purchaseKind: "pending" | "order" | "unavailable" | undefined;
+  if (!teamOrder) {
+    try { purchaseKind = readPurchaseIntent(window.sessionStorage)?.kind; }
+    catch { purchaseKind = "unavailable"; }
+  }
+
   function finish(next: Order) {
     setResult(next);
     onRecord(next);
@@ -95,8 +104,14 @@ export function OrderNew({ onRecord }: Props) {
 
   function reset() {
     if (busy || protocolBusy) return;
+    if (!teamOrder && purchaseKind) {
+      if (!window.confirm("开始另一笔购买？原订单不会被撤销。若付款结果不明，请先核对原单。")) return;
+      try { forgetPurchase(window.sessionStorage); }
+      catch { setError("无法重置当前标签页的购买标记，未开始新购买。"); return; }
+    }
     setOrder(null);
     setResult(null);
+    setReadOnlyOrderId(null);
     setCard(null);
     setTeamCard(emptyTeamCard());
     setTeamBilling({ name: "", line1: "", city: "", state: "", postal_code: "", country: "US" });
@@ -147,7 +162,7 @@ export function OrderNew({ onRecord }: Props) {
   const handledSecret = useRef("");
   useEffect(() => {
     const secret = result?.next_action?.client_secret;
-    if (!result || (result.plan === "plus" && pmMode === "server") || result.status !== "requires_action" || !secret || !result.publishable_key) return;
+    if (!result || result.id === readOnlyOrderId || (result.plan === "plus" && pmMode === "server") || result.status !== "requires_action" || !secret || !result.publishable_key) return;
     if (handledSecret.current === secret) return;
     handledSecret.current = secret;
     const id = result.id;
@@ -179,7 +194,7 @@ export function OrderNew({ onRecord }: Props) {
         setResult((prev) => (prev ? { ...prev, last_error: `${message}；可打开官方结账页完成验证后查询。` } : prev));
       }
     })();
-  }, [result, onRecord, pmMode]);
+  }, [result, onRecord, pmMode, readOnlyOrderId]);
 
   // 支付已提交但订阅还没确认（verifying）：自动重查，避免页面一直转圈。
   const verifyingId = result && result.plan !== "team" && (result.plan !== "plus" || pmMode === "stripe") && result.status === "verifying" ? result.id : "";
@@ -191,7 +206,9 @@ export function OrderNew({ onRecord }: Props) {
         await new Promise((resolve) => window.setTimeout(resolve, 4000));
         if (stopped) return;
         try {
-          const latest = await verifyOrder(verifyingId);
+          const latest = verifyingId === readOnlyOrderId
+            ? await getOrder(verifyingId)
+            : await verifyOrder(verifyingId);
           if (stopped) return;
           setResult(latest);
           if (isSettled(latest.status)) {
@@ -206,7 +223,7 @@ export function OrderNew({ onRecord }: Props) {
     return () => {
       stopped = true;
     };
-  }, [verifyingId, onRecord]);
+  }, [verifyingId, onRecord, readOnlyOrderId]);
 
   const teamPendingId = result?.plan === "team" && ["paying", "requires_action", "unknown", "verifying"].includes(result.status) ? result.id : "";
   useEffect(() => {
@@ -228,16 +245,20 @@ export function OrderNew({ onRecord }: Props) {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (busy || protocolBusy || order?.plan === "plus") return;
+    if (busy || protocolBusy || order?.plan === "plus" || (order && order.id === readOnlyOrderId)) return;
     setError(null);
     setBusy(true);
     try {
       if (!order) {
-        if (!session.trim()) {
+        if (purchaseKind === "unavailable") {
+          setError("当前标签页无法读取购买标记，请先核对原单；未提交建单。");
+          return;
+        }
+        if (purchaseKind !== "order" && !session.trim()) {
           setError("请粘贴 ChatGPT session。");
           return;
         }
-        if (!country) {
+        if (purchaseKind !== "order" && !country) {
           setError("请先选择创建结账的地区。");
           return;
         }
@@ -245,7 +266,7 @@ export function OrderNew({ onRecord }: Props) {
           setError("Team 需要填写席位，最少 2 人。");
           return;
         }
-        const created = await createOrder({
+        const create = (key: string) => createOrder({
           plan,
           billing_country: country,
           exit_country: exitCountry || country,
@@ -255,7 +276,22 @@ export function OrderNew({ onRecord }: Props) {
           workspace_name: plan === "team" ? team.workspace.trim() : "",
           seat_quantity: plan === "team" ? team.seats : undefined,
           price_interval: plan === "team" ? team.interval : undefined,
-        });
+        }, key);
+        const created = plan === "team"
+          ? await create(crypto.randomUUID())
+          : await openNonTeamPurchase(window.sessionStorage, create, getOrder);
+        if (created.plan !== "team") {
+          setPlan(created.plan as Plan);
+          setCountry(created.billing_country);
+          if (created.status !== "awaiting_payment" || (created.payment_status && created.payment_status !== "unpaid")) {
+            // Restoring an attempted payment must not mount a card form or resume a 3DS submission.
+            setReadOnlyOrderId(created.id);
+            setOrder(created);
+            setSession("");
+            finish(created);
+            return;
+          }
+        }
         if (created.plan !== "plus" && !created.publishable_key && !isHostedOrder(created)) {
           throw new Error("结账已创建，但没有拿到 Stripe 公钥，无法加载安全输入框。");
         }
@@ -370,7 +406,7 @@ export function OrderNew({ onRecord }: Props) {
       <Button type="submit" size="md" loading={busy}
         disabled={Boolean(order && !linkOnly && !teamOrder && !card)} fullWidth={teamOrder}>
         {!order
-          ? plan === "team" ? `生成 Team 结账链接（${team.seats} 席）` : "创建结账"
+          ? plan === "team" ? `生成 Team 结账链接（${team.seats} 席）` : purchaseKind === "order" ? "查看原订单" : "创建结账"
           : linkOnly ? "我已支付，查询订阅" : "确认支付"}
       </Button>
     </Group>
@@ -385,12 +421,20 @@ export function OrderNew({ onRecord }: Props) {
             <Stepper.Step label="结果" description="成功或失败" />
           </Stepper>
 
-          {order?.plan !== "plus" && order?.checkout_url && step >= 1 && (
+          {order?.plan !== "plus" && order?.checkout_url && order.id !== readOnlyOrderId && step >= 1 && (
             <CheckoutLinkCard url={order.checkout_url} />
           )}
 
           {step === 0 && (
             <Stack gap={teamOrder ? "md" : "lg"}>
+              {purchaseKind && (
+                <Alert color="yellow" title={purchaseKind === "order" ? "本标签页已有关联订单" : "当前购买尚未结束"}>
+                  {purchaseKind === "order" ? "查看原订单无需再次填写 Session，不会重新建单或付款。"
+                    : purchaseKind === "pending" ? "请沿用原来的 Session 和选项重试，系统会核对原单，不会自动付款。"
+                    : "无法读取购买标记，建单已暂停。请先核对原单。"}
+                  <Button type="button" variant="subtle" size="xs" disabled={busy} onClick={reset}>开始另一笔购买</Button>
+                </Alert>
+              )}
               <SessionField value={session} onChange={setSession} team={plan === "team"} disabled={busy} />
               <PlanPicker
                 compact={teamOrder}
@@ -534,7 +578,7 @@ export function OrderNew({ onRecord }: Props) {
           {step === 2 && result && (
             <ResultPanel
               order={result}
-              protocolOnly={result.plan === "plus" && pmMode === "server"}
+              protocolOnly={result.id === readOnlyOrderId || (result.plan === "plus" && pmMode === "server")}
               onReset={reset}
               onVerify={recheckDelivery}
               verifying={busy}

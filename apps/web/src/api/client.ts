@@ -107,10 +107,11 @@ export async function createOrder(input: {
   workspace_name?: string;
   seat_quantity?: number;
   price_interval?: "month" | "year";
-}): Promise<Order> {
+}, idempotencyKey: string): Promise<Order> {
+  if (!idempotencyKey?.trim()) throw new Error("缺少购买幂等键，未提交建单。");
   const res = await fetch("/api/orders", {
     method: "POST",
-    headers: { ...jsonHeaders, "Idempotency-Key": crypto.randomUUID() },
+    headers: { ...jsonHeaders, "Idempotency-Key": idempotencyKey },
     body: JSON.stringify({
       plan: input.plan,
       billing_country: input.billing_country,
