@@ -49,7 +49,7 @@ def classify_upstream_failure(
         code = UpstreamFailureCode.UPSTREAM_TIMEOUT
     elif any(token in name.lower() for token in ("proxy", "sslerror", "connecterror")) or "connect 404" in text or "proxy" in text:
         code = UpstreamFailureCode.PROXY_AUTHENTICATION_FAILED if "407" in text else UpstreamFailureCode.PROXY_TUNNEL_FAILED
-    elif status == 400 and ("unusual activity" in text or "unusual_activity" in text or "异常流量" in text):
+    elif "unusual activity" in text or "unusual_activity" in text or "异常流量" in text:
         code = UpstreamFailureCode.UNUSUAL_ACTIVITY
     elif status == 403 and ("sentinel" in text or "challenge" in text or "安全验证" in text):
         code = UpstreamFailureCode.SENTINEL_CHALLENGE_FAILED

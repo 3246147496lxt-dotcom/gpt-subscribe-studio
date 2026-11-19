@@ -25,3 +25,8 @@ def test_timeout_and_proxy():
 def test_billing_country_and_unknown():
     assert classify_upstream_failure(status=409, body="billing_country mismatch").code is UpstreamFailureCode.BILLING_COUNTRY_MISMATCH
     assert classify_upstream_failure(status=500, body="oops").code is UpstreamFailureCode.UNKNOWN_UPSTREAM
+
+
+def test_unusual_activity_without_http_status():
+    result = classify_upstream_failure(status=None, body="ChatGPT 判定异常流量")
+    assert result.code is UpstreamFailureCode.UNUSUAL_ACTIVITY
