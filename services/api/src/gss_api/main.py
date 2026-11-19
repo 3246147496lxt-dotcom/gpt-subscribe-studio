@@ -72,7 +72,12 @@ def create_app() -> FastAPI:
     async def _private_order_input(request: Request, exc: RequestValidationError):
         # Malformed financial inputs may contain a whole address, card or session.
         path = request.url.path.rstrip("/")
-        if request.method == "POST" and (path == "/api/orders" or path.startswith("/api/orders/")):
+        private_create = (
+            path == "/api/orders"
+            or path.startswith("/api/orders/")
+            or path == "/api/payments/quick-pay"
+        )
+        if request.method == "POST" and private_create:
             order = store.get_order(request.path_params.get("order_id", ""))
             is_team = ((order is not None and order.plan.value == "team")
                        or (path == "/api/orders" and isinstance(exc.body, dict) and exc.body.get("plan") == "team"))
