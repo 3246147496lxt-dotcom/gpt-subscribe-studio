@@ -526,3 +526,17 @@ def test_existing_response_billing_conflict_stops_before_confirmation(monkeypatc
     assert exc.value.code is ErrorCode.BILLING_COUNTRY_MISMATCH
     assert not engine.confirmation_started
     assert not any("/confirm" in route for _method, route, _body in engine.app.calls)
+
+
+def test_reset_web_session_preserves_checkout_cookies():
+    from types import SimpleNamespace
+
+    from gss_core.plus_har_protocol import PlusHarProtocol
+
+    client = SimpleNamespace(extra_cookies={"oai-did": "DID"}, session_token="OLD")
+    engine = PlusHarProtocol(session="", client=client)
+    engine._web = SimpleNamespace(cookies={"__cf_bm": "cf", "oai-sc": "sc", "__Secure-next-auth.session-token": "NEW"})
+    engine._snapshot_web_cookies()
+    assert client.extra_cookies["__cf_bm"] == "cf"
+    assert client.extra_cookies["oai-sc"] == "sc"
+    assert client.session_token == "NEW"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -439,7 +440,20 @@ def _from_domain(exc: DomainError, *, session_reissued: bool = False, nonteam: b
     return _error(status_code, exc.code, read_text(message) if nonteam else message, session_reissued=session_reissued)
 
 
+def _env_on(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _release_create_failure(claim_dir, order_id: str, idempotency_key: str | None) -> None:
+    if idempotency_key:
+        store.forget_idempotency(idempotency_key)
+    if claim_dir is not None:
+        purchase_claims.release_checkout(claim_dir, order_id)
+
+
 async def _guard_refresh_egress(proxy: str | None, country: str) -> None:
+    if not _env_on("GSS_PROXY_PREFLIGHT"):
+        return
     if use_fake_adapters():
         # Fake adapters do not implement authentication. Never hit a real refresh
         # endpoint just because offline mode skipped the network checks.
@@ -666,7 +680,11 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     cross_country = bool(original_country and original_country != exit_country)
     access_token = bundle.access_token
     if bundle.session_token and (cross_country or not access_token):
-        await _guard_refresh_egress(exit_proxy, exit_country)
+        try:
+            await _guard_refresh_egress(exit_proxy, exit_country)
+        except HTTPException:
+            _release_create_failure(claim_dir, order.id, idempotency_key)
+            raise
         if cross_country:
             try:
                 client = await asyncio.to_thread(
@@ -689,13 +707,16 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             # Persist the refreshed credential before any further upstream call.
             raw_session = _session_json(client, exit_country)
             item = remember(raw_session, client.user_agent, client.device_id)
-            if cross_country:
-                # Human-like pause after the session refresh, then load the
-                # account shell endpoints before opening the checkout modal.
+            if cross_country and _env_on("GSS_WARM_ACCOUNT"):
+                # Optional lab warm-up. Default off keeps the proven 00331ce
+                # main path free of extra account-endpoint requests.
                 await asyncio.sleep(random.uniform(1.0, 1.5))
                 try:
                     await asyncio.to_thread(client.warm_account)
                 except DomainError as exc:
+                    store.update_status(order.id, OrderStatus.REJECTED)
+                    store.view(order.id).last_error = exc.message
+                    _release_create_failure(claim_dir, order.id, idempotency_key)
                     raise _from_domain(exc, session_reissued=True, nonteam=plan is not Plan.TEAM)
                 except Exception:
                     logger.warning("warm_account_failed_continue")

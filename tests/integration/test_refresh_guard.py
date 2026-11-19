@@ -60,6 +60,7 @@ def test_probe_uses_one_uncredentialed_attempt(monkeypatch, answer, expected_sta
 @pytest.mark.parametrize("status_code", [403, 429, 503])
 def test_preflight_failure_sends_no_credentials(monkeypatch, original_country, status_code):
     monkeypatch.setenv("GSS_USE_FAKE", "0")
+    monkeypatch.setenv("GSS_PROXY_PREFLIGHT", "1")
     guard = Mock(side_effect=ProxyPreflightError("fixture refusal", status_code))
     monkeypatch.setattr(orders, "verify_refresh_egress", guard)
     monkeypatch.setattr(orders, "checkout_proxy_for", lambda *a, **kw: "http://p.invalid:80")
@@ -82,6 +83,7 @@ def test_preflight_failure_sends_no_credentials(monkeypatch, original_country, s
 
 def test_fake_refresh_without_explicit_doubles_never_networks(monkeypatch):
     monkeypatch.setenv("GSS_USE_FAKE", "1")
+    monkeypatch.setenv("GSS_PROXY_PREFLIGHT", "1")
     stop = lambda *a, **kw: pytest.fail("network attempted in offline mode")
     monkeypatch.setattr(orders, "verify_refresh_egress", stop)
     monkeypatch.setattr(orders.ChatGPTClient, "from_raw_session", stop)

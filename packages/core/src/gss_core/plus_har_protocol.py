@@ -170,7 +170,7 @@ class PlusHarProtocol:
         billing: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
         currency: str = "USD",
-        timeout: float = 22.0,
+        timeout: float = 25.0,
         profile: Optional[Dict[str, Any]] = None,
         customer_session_client_secret: str = "",
         hcaptcha_token: str = "",
@@ -198,7 +198,13 @@ class PlusHarProtocol:
         self.billing = billing or {}
         self.proxy = proxy or None
         self.currency = (currency or "USD").upper()
-        self.timeout = float(timeout or 120.0)
+        configured_timeout = os.environ.get("GSS_CONFIRM_TIMEOUT", "").strip()
+        if configured_timeout:
+            try:
+                timeout = float(configured_timeout)
+            except ValueError:
+                pass
+        self.timeout = float(timeout or 25.0)
         self.plan = plan or "plus"
         # billing country drives tax/AVS; exit country drives device timezone/IP.
         self.country = (self.billing.get("country") or country or "US").upper()
@@ -837,12 +843,52 @@ class PlusHarProtocol:
         return token
 
     # ── 5. confirm ─────────────────────────────────────────────────
+    def _snapshot_web_cookies(self) -> None:
+        """Carry checkout/ctoken cookies into the next web connection.
+
+        Checkout responses set cookies (notably __cf_bm / oai-sc) only on the
+        HAR web session; ``_web_session`` rebuilds from client.extra_cookies.
+        """
+        web = self._web
+        if web is None:
+            return
+        cookies = getattr(web, "cookies", None)
+        gathered: Dict[str, str] = {}
+        if cookies is not None:
+            getter = getattr(cookies, "get_dict", None)
+            if callable(getter):
+                try:
+                    gathered.update({str(k): str(v) for k, v in (getter() or {}).items()})
+                except Exception:  # noqa: BLE001
+                    pass
+            if not gathered:
+                jar = getattr(cookies, "jar", None)
+                if jar is not None:
+                    try:
+                        for cookie in jar:
+                            if getattr(cookie, "name", ""):
+                                gathered[str(cookie.name)] = str(cookie.value)
+                    except Exception:  # noqa: BLE001
+                        pass
+            if not gathered and hasattr(cookies, "items"):
+                try:
+                    gathered.update({str(k): str(v) for k, v in cookies.items()})
+                except Exception:  # noqa: BLE001
+                    pass
+        for name, value in gathered.items():
+            if name and value is not None:
+                self.client.extra_cookies[name] = value
+        token = gathered.get("__Secure-next-auth.session-token")
+        if token:
+            self.client.session_token = token
+
     def _reset_web_session(self) -> None:
         """Drop a possibly half-dead checkout TCP/TLS tunnel before confirm.
 
         Proxy, cookies, device identity and fingerprint stay identical; only the
         connection is re-established so a stale keep-alive cannot hang confirm.
         """
+        self._snapshot_web_cookies()
         self._safe_close(self._web)
         self._web = None
 
@@ -1095,6 +1141,34 @@ class PlusHarProtocol:
             "plus_har_settle status=%s payment_status=%s intent_status=%s",
             status or "-", payment_status or "-", intent_status or "-",
         )
+
+        # PaymentIntent success is the authoritative financial fact. Page
+        # echoes are secondary; missing amount_received/id must not turn a
+        # successful charge into an unknown result.
+        if intent_status == "succeeded":
+            bound = self._bound_intent(intent_payload)
+            if bound:
+                self.receipt_evidence = cash_receipt(
+                    self.checkout_id, self.intent_id, intent_payload["amount_received"],
+                    intent_payload["currency"], self.receipt_expected_minor,
+                )
+            else:
+                logger.warning(
+                    "plus_har_intent_succeeded_unbound intent=%s expected=%s",
+                    self.intent_id[:14], self.receipt_expected_minor,
+                )
+            # A successful intent still gets the normal checkout acknowledgement
+            # when the page is already complete; never block on secondary fields.
+            if not self.read_only and status == "complete" and payment_status in {"paid", "no_payment_required"}:
+                self._ack_checkout()
+            if self._subscription_active():
+                out.state = "paid"
+                out.message = "Plus 订阅已生效"
+            else:
+                out.state = "pending"
+                out.message = "付款已确认，等待 Plus 订阅生效"
+            out.intent_status = "succeeded"
+            return out
         if status == "complete" and payment_status in {"paid", "no_payment_required"}:
             if not self._bound_page(page):
                 out.message = "回执与原结账或报价未匹配，不能确认扣款"

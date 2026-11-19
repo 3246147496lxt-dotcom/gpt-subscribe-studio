@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from urllib.parse import unquote, urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -11,7 +13,7 @@ from fastapi.responses import JSONResponse
 
 from gss_core import install_logging_filter
 from gss_core.config import load_settings, missing_upstreams, use_fake_adapters
-from gss_core.proxies import GatewayStore
+from gss_core.proxies import GatewayStore, configured_proxy
 
 from .store import store
 from .routers import events, orders, promo, proxies, saved_cards, protocol_cards
@@ -30,11 +32,35 @@ def _ensure_info_logging() -> None:
     gss.propagate = False
 
 
+def _env_on(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _check_pinned_proxy_sid() -> bool:
+    """Warn loudly when order traffic is not pinned to one proxy SID."""
+    sid = os.environ.get("GSS_PROXY_SID", "").strip()
+    if not sid:
+        logging.getLogger("gss").warning(
+            "GSS_PROXY_SID is not set; checkout_proxy_for may generate a random SID"
+        )
+        if _env_on("GSS_REQUIRE_PINNED_PROXY"):
+            raise RuntimeError("GSS_PROXY_SID is required for pinned order traffic")
+        return False
+    proxy = configured_proxy("checkout") or ""
+    username = unquote(urlsplit(proxy).username or "") if proxy else ""
+    if proxy and f"sid-{sid}" not in username:
+        logging.getLogger("gss").warning(
+            "GSS_PROXY_SID does not match the configured checkout proxy SID"
+        )
+    return True
+
+
 def create_app() -> FastAPI:
     install_logging_filter()
     _ensure_info_logging()
     install_logging_filter(logging.getLogger("gss"))
     settings = load_settings()
+    proxy_sid_pinned = _check_pinned_proxy_sid()
 
     app = FastAPI(
         title="gpt-subscribe-studio API",
@@ -71,6 +97,7 @@ def create_app() -> FastAPI:
             "promo_enabled": settings.enable_promo_mode,
             "fake_adapters": use_fake_adapters(),
             "missing_upstreams": missing_upstreams(settings),
+            "proxy_sid_pinned": proxy_sid_pinned,
         }
 
     # ── 出口代理连接失败 → 503（而不是裸 500）────────────────────

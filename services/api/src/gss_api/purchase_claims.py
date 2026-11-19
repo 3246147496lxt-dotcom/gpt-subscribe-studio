@@ -77,3 +77,20 @@ def record_observation(data_dir: Path, order_id: str, observed: str) -> None:
         raise ValueError("invalid financial observation")
     if not _transition(data_dir, order_id, "dispatching", observed):
         raise ClaimUnavailable()
+
+
+def release_checkout(data_dir: Path, order_id: str) -> None:
+    """Remove a checkout-only reservation after a pre-checkout failure.
+
+    Only ``checkout_only`` reservations are removable; a payment dispatch or
+    outcome must remain at-most-once.
+    """
+    db = data_dir / "purchase-claims.sqlite3"
+    try:
+        with closing(sqlite3.connect(db.resolve().as_uri() + "?mode=rw", uri=True, timeout=2)) as conn, conn:
+            conn.execute(
+                "DELETE FROM purchase_claim WHERE order_id = ? AND attempt_state = 'checkout_only'",
+                (order_id,),
+            )
+    except (OSError, sqlite3.Error):
+        return

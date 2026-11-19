@@ -59,6 +59,10 @@ class InMemoryStore:
         self.views: Dict[str, OrderView] = {}
         self._idempotency: Dict[str, str] = {}
 
+    def forget_idempotency(self, key: Optional[str]) -> None:
+        if key:
+            self._idempotency.pop(key, None)
+
     def find_by_idempotency(self, key: Optional[str]) -> Optional[Order]:
         if not key:
             return None
