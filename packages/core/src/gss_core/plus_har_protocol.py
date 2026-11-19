@@ -452,11 +452,20 @@ class PlusHarProtocol:
 
     def _sentinel(self, flow: str) -> None:
         self._require_credentials()
+        started = time.monotonic()
+        logger.info("plus_har_sentinel_start flow=%s", flow)
         try:
             self.client.mint_sentinel(flow=flow, page_url="https://chatgpt.com/")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("plus_har_sentinel_failed flow=%s err=%s", flow, str(exc)[:120])
-            return
+            logger.warning(
+                "plus_har_sentinel_failed flow=%s type=%s elapsed=%.2f",
+                flow, type(exc).__name__, time.monotonic() - started,
+            )
+            raise DomainError(
+                ErrorCode.SENTINEL_CHALLENGE_FAILED,
+                "Sentinel 风控令牌签发失败，已停止确认，未提交支付。",
+            ) from exc
+        logger.info("plus_har_sentinel_ok flow=%s elapsed=%.2f", flow, time.monotonic() - started)
         sentinel_ping(self._web_session(), self.device, timeout=min(self.timeout, 20.0))
 
     def _prelude(self) -> None:
@@ -947,7 +956,7 @@ class PlusHarProtocol:
         self.confirmed = payload
         if str(payload.get("status") or "") == "subscription_limit":
             raise DomainError(
-                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                ErrorCode.SUBSCRIPTION_LIMIT,
                 "该账号已达到订阅数量上限（subscription_limit），本次未扣款",
             )
         intent_id, secret, return_url = payment_intent_from_confirm(payload)
@@ -1096,6 +1105,13 @@ class PlusHarProtocol:
         out.raw = self.raw
         out.payment_method_id = str(self.raw.get("payment_method_id") or "")
         intent_payload = self.raw.get("intent") if isinstance(self.raw.get("intent"), dict) else {}
+        confirm_payload = self.raw.get("confirm") if isinstance(self.raw.get("confirm"), dict) else {}
+        if str(confirm_payload.get("status") or "") == "subscription_limit" and not str(
+                confirm_payload.get("payment_intent_id") or confirm_payload.get("payment_intent") or ""):
+            out.state = "rejected"
+            out.code = "subscription_limit"
+            out.message = "该账号已达到订阅数量上限（subscription_limit），本次未扣款"
+            return out
         intent_status = str(intent_payload.get("status") or "")
         out.intent_id = str(intent_payload.get("id") or self.intent_id or "")
         error = intent_payload.get("last_payment_error") if isinstance(intent_payload.get("last_payment_error"), dict) else {}
@@ -1544,9 +1560,15 @@ def run_har_context(
     except ObservedBillingConflict as exc:
         return outcome("integration_error", "checkout", exc.message, code=str(exc.code))
     except DomainError as exc:
-        declined = str(exc.code) == str(ErrorCode.PAYMENT_DECLINED)
-        payload = outcome("card_declined" if declined else "unknown", engine.stage,
-                          redact_sensitive(exc.message)[:240], code=str(exc.code))
+        code = str(exc.code)
+        if code == str(ErrorCode.SUBSCRIPTION_LIMIT):
+            out_state = "rejected"
+        elif code == str(ErrorCode.SENTINEL_CHALLENGE_FAILED):
+            out_state = "failed"
+        else:
+            out_state = "card_declined" if code == str(ErrorCode.PAYMENT_DECLINED) else "unknown"
+        payload = outcome(out_state, engine.stage,
+                          redact_sensitive(exc.message)[:240], code=code)
         payload["stage"] = engine.stage
         return payload
     finally:

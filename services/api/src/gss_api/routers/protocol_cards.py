@@ -195,6 +195,12 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
         elif state == "challenge_required":
             _set_payment_status(order.id, "processing", summary=result.get("message") or "支付需要继续验证")
             store.update_status(order.id, OrderStatus.REQUIRES_ACTION)
+        elif state == "rejected":
+            _set_payment_status(order.id, "failed", summary=result.get("message") or "上游业务拒绝")
+            store.update_status(order.id, OrderStatus.REJECTED)
+        elif state == "failed":
+            _set_payment_status(order.id, "failed", summary=result.get("message") or "支付前置校验失败")
+            store.update_status(order.id, OrderStatus.FAILED)
         elif state == "unknown":
             result["message"] = PAYMENT_UNCONFIRMED
             _set_payment_status(order.id, "processing", summary=PAYMENT_UNCONFIRMED)
@@ -202,6 +208,8 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
         elif context.get("app_confirmation_started"):
             _set_payment_status(order.id, "processing")
             store.update_status(order.id, OrderStatus.PAYING)
+    if result.get("code"):
+        view.failure_code = str(result["code"])
     result.update({
         "payment_status": view.payment_status,
         "delivery_status": view.delivery_status,

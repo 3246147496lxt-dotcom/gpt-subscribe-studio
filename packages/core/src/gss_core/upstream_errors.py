@@ -53,6 +53,8 @@ def classify_upstream_failure(
         code = UpstreamFailureCode.UNUSUAL_ACTIVITY
     elif status == 403 and ("sentinel" in text or "challenge" in text or "安全验证" in text):
         code = UpstreamFailureCode.SENTINEL_CHALLENGE_FAILED
+    elif "subscription_limit" in text or "subscription limit" in text:
+        code = UpstreamFailureCode.SUBSCRIPTION_LIMIT
     elif "billing_country" in text or "billing country" in text:
         code = UpstreamFailureCode.BILLING_COUNTRY_MISMATCH
     else:

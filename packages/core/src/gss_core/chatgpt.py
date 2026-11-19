@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -893,7 +894,7 @@ class ChatGPTClient:
             language=self.language,
             timezone=self.timezone,
             cookie_header=self._cookie_header(),
-            timeout_s=max(30.0, min(self.timeout, 90.0)),
+            timeout_s=max(5.0, min(self.timeout, float(os.environ.get("GSS_SENTINEL_TIMEOUT", "15") or 15), 90.0)),
             **self.sentinel_profile,
         )
         value = header_value(token)

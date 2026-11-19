@@ -540,3 +540,33 @@ def test_reset_web_session_preserves_checkout_cookies():
     assert client.extra_cookies["__cf_bm"] == "cf"
     assert client.extra_cookies["oai-sc"] == "sc"
     assert client.session_token == "NEW"
+
+
+def test_sentinel_failure_is_fail_closed():
+    from gss_contracts.errors import DomainError, ErrorCode
+    engine = PlusHarProtocol(session="", client=SimpleNamespace(
+        mint_sentinel=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("reqfail")),
+    ))
+    engine.credentials_current = lambda: True
+    with pytest.raises(DomainError) as caught:
+        engine._sentinel("checkout_session_approval")
+    assert caught.value.code is ErrorCode.SENTINEL_CHALLENGE_FAILED
+
+
+def test_subscription_limit_confirm_is_terminal_rejection():
+    from gss_contracts.errors import DomainError, ErrorCode
+    engine = PlusHarProtocol(session="", checkout_id=CHECKOUT_ID)
+    engine.ctoken = "ctoken"
+    engine._reset_web_session = lambda: None
+    engine._app = lambda *a, **k: FakeResponse({"status": "subscription_limit"})
+    with pytest.raises(DomainError) as caught:
+        engine._app_confirm()
+    assert caught.value.code is ErrorCode.SUBSCRIPTION_LIMIT
+
+
+def test_settle_marks_subscription_limit_rejected():
+    engine = PlusHarProtocol(session="", checkout_id=CHECKOUT_ID)
+    engine.raw = {"confirm": {"status": "subscription_limit"}, "intent": {}}
+    out = engine._settle()
+    assert out.state == "rejected"
+    assert out.code == "subscription_limit"

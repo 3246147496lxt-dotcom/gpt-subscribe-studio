@@ -26,6 +26,8 @@ class ErrorCode(StrEnum):
     CHECKOUT_UPSTREAM_ERROR = "checkout_upstream_error"
     PAYMENT_DECLINED = "payment_declined"
     PAYMENT_UNKNOWN_STATE = "payment_unknown_state"
+    SENTINEL_CHALLENGE_FAILED = "sentinel_challenge_failed"
+    SUBSCRIPTION_LIMIT = "subscription_limit"
     SUBSCRIPTION_NOT_ACTIVE = "subscription_not_active"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     COMPLIANCE_BLOCKED = "compliance_blocked"
