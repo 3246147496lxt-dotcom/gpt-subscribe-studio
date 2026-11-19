@@ -1508,10 +1508,17 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         store.update_status(order_id, OrderStatus.PAYING)
         response_state, message = "pending", outcome.message
     else:
-        # 未确认扣款：保持 processing，不把未知结果误报成失败。
-        _set_payment_status(order_id, "processing", summary="支付结果待核实，可点击重新核验")
-        store.update_status(order_id, OrderStatus.UNKNOWN)
-        response_state, message = "unknown", outcome.message
+        message = str(outcome.message or "")
+        if "subscription_limit" in message or "未扣款" in message:
+            # 上游明确返回 subscription_limit，没有 PaymentIntent，不能显示成支付处理中。
+            _set_payment_status(order_id, "failed", summary=message or "未扣款")
+            store.update_status(order_id, OrderStatus.FAILED)
+            response_state = "unknown"
+        else:
+            # 未确认扣款：保持 processing，不把未知结果误报成失败。
+            _set_payment_status(order_id, "processing", summary="支付结果待核实，可点击重新核验")
+            store.update_status(order_id, OrderStatus.UNKNOWN)
+            response_state = "unknown" 
     return _protocol_out(
         order_id,
         state=response_state,

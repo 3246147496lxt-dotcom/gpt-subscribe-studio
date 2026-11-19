@@ -172,8 +172,13 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
             _set_payment_status(order.id, "processing", summary=result.get("message") or "支付需要继续验证")
             store.update_status(order.id, OrderStatus.REQUIRES_ACTION)
         elif state == "unknown":
-            _set_payment_status(order.id, "processing", summary="支付结果待核实，可点击重新核验")
-            store.update_status(order.id, OrderStatus.UNKNOWN)
+            message = str(result.get("message") or "")
+            if "subscription_limit" in message or "未扣款" in message:
+                _set_payment_status(order.id, "failed", summary=message or "未扣款")
+                store.update_status(order.id, OrderStatus.FAILED)
+            else:
+                _set_payment_status(order.id, "processing", summary="支付结果待核实，可点击重新核验")
+                store.update_status(order.id, OrderStatus.UNKNOWN)
         elif context.get("app_confirmation_started"):
             _set_payment_status(order.id, "processing")
             store.update_status(order.id, OrderStatus.PAYING)
