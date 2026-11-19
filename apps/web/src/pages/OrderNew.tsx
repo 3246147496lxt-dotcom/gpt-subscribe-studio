@@ -26,6 +26,7 @@ import { PlanPicker, type TeamValues } from "../components/PlanPicker";
 import { REGIONS } from "../plans";
 import { ResultPanel } from "../components/ResultPanel";
 import { SessionField } from "../components/SessionField";
+import { verifiedPayerBilling } from "../components/FixedPayerBilling";
 import { ProtocolPayPanel } from "../components/ProtocolPayPanel";
 import { CheckoutLinkCard } from "../components/CheckoutLinkCard";
 import { emptyTeamCard, type TeamCardDraft } from "../card-payment/TeamCardForm";
@@ -50,7 +51,6 @@ export function OrderNew({ onRecord }: Props) {
   currentOrderId.current = order?.id || null;
   const [result, setResult] = useState<Order | null>(null);
   const [readOnlyOrderId, setReadOnlyOrderId] = useState<string | null>(null);
-  const [addr, setAddr] = useState<BillingInput | null>(null);
   const [card, setCard] = useState<StripeCardHandle | null>(null);
   const [teamCard, setTeamCard] = useState<TeamCardDraft>(emptyTeamCard);
   const [teamBilling, setTeamBilling] = useState<BillingInput>({
@@ -115,7 +115,6 @@ export function OrderNew({ onRecord }: Props) {
     setCard(null);
     setTeamCard(emptyTeamCard());
     setTeamBilling({ name: "", line1: "", city: "", state: "", postal_code: "", country: "US" });
-    setAddr(null);
     setSession("");
     setExitCountry("");
     setError(null);
@@ -162,7 +161,7 @@ export function OrderNew({ onRecord }: Props) {
   const handledSecret = useRef("");
   useEffect(() => {
     const secret = result?.next_action?.client_secret;
-    if (!result || result.id === readOnlyOrderId || (result.plan === "plus" && pmMode === "server") || result.status !== "requires_action" || !secret || !result.publishable_key) return;
+    if (!result || result.id === readOnlyOrderId || result.plan !== "team" || result.status !== "requires_action" || !secret || !result.publishable_key) return;
     if (handledSecret.current === secret) return;
     handledSecret.current = secret;
     const id = result.id;
@@ -258,7 +257,7 @@ export function OrderNew({ onRecord }: Props) {
           setError("请粘贴 ChatGPT session。");
           return;
         }
-        if (purchaseKind !== "order" && !country) {
+        if (purchaseKind !== "order" && plan === "team" && !country) {
           setError("请先选择创建结账的地区。");
           return;
         }
@@ -267,9 +266,9 @@ export function OrderNew({ onRecord }: Props) {
           return;
         }
         const create = (key: string) => createOrder({
-          plan,
-          billing_country: country,
-          exit_country: exitCountry || country,
+          ...(plan === "team"
+            ? { plan, billing_country: country, exit_country: exitCountry || country }
+            : { plan, exit_country: exitCountry || undefined }),
           session,
           promo_code: plan === "team" ? team.promoCode.trim() : "",
           promo_campaign_id: plan === "plus" ? promoCampaignId : "",
@@ -296,16 +295,6 @@ export function OrderNew({ onRecord }: Props) {
           throw new Error("结账已创建，但没有拿到 Stripe 公钥，无法加载安全输入框。");
         }
         setOrder(created);
-        if (plan !== "team") {
-          setAddr({
-            name: created.billing?.name ?? "",
-            line1: created.billing?.line1 ?? "",
-            city: created.billing?.city ?? "",
-            state: created.billing?.state ?? "",
-            postal_code: created.billing?.postal_code ?? "",
-            country: created.billing?.country ?? created.billing_country,
-          });
-        }
         setSession("");
         if (plan === "team") {
           try {
@@ -328,11 +317,11 @@ export function OrderNew({ onRecord }: Props) {
         }
         return;
       }
-      if (!teamOrder && !card) {
-        setError("Stripe 安全输入框还没准备好，请稍等几秒再试。");
+      if (!teamOrder) {
+        setError("浏览器支付标识不能核验其账单归属，付款未提交。");
         return;
       }
-      const billing = teamOrder ? teamBilling : addr;
+      const billing = teamBilling;
       if (!billing || !billing.name.trim() || !billing.line1.trim() || !billing.city.trim() || !billing.postal_code.trim()) {
         setError("请填写完整账单地址（姓名、街道、城市、邮编）。");
         return;
@@ -421,7 +410,7 @@ export function OrderNew({ onRecord }: Props) {
             <Stepper.Step label="结果" description="成功或失败" />
           </Stepper>
 
-          {order?.plan !== "plus" && order?.checkout_url && order.id !== readOnlyOrderId && step >= 1 && (
+          {order?.plan === "team" && order.checkout_url && order.id !== readOnlyOrderId && step >= 1 && (
             <CheckoutLinkCard url={order.checkout_url} />
           )}
 
@@ -457,8 +446,10 @@ export function OrderNew({ onRecord }: Props) {
               />
               <Select
                 label="出口国家（代理 / Session 重签发）"
-                description="默认跟随上面的地区。低价区示例：地区 US、出口 PH，代理与重签发走 PH，账单/税务走 US。"
-                placeholder="默认跟随地区"
+                description={plan === "team"
+                  ? "默认跟随上面的地区。低价区示例：地区 US、出口 PH，代理与重签发走 PH，账单/税务走 US。"
+                  : "可不选，由服务端按已核验账单确定出口。选择出口不会更改账单；当前渠道不支持不一致的地区。"}
+                placeholder={plan === "team" ? "默认跟随地区" : "默认由服务端确定"}
                 searchable
                 data={REGIONS.map((item) => ({ value: item.code, label: `${item.label} (${item.code})` }))}
                 value={exitCountry || null}
@@ -474,12 +465,11 @@ export function OrderNew({ onRecord }: Props) {
                   disabled={busy || Boolean(order)}
                   data={[
                     { value: "server", label: "协议提交（服务端提交卡号）" },
-                    { value: "stripe", label: "Stripe 输入框（浏览器换 pm_）" },
+                    { value: "stripe", label: teamOrder ? "Stripe 输入框（浏览器换 pm_）" : "输入框模式不可用", disabled: !teamOrder },
                   ]}
                 />
                 <Text size="xs" c="dimmed" mt={6}>
-                  {plan === "plus"
-                    ? "Plus 协议模式按 2026-10-29 HAR 逐请求复刻：随机设备指纹 + Stripe 遥测，核算税费后创建 confirmation_tokens，完成 ChatGPT confirm 与 PaymentIntent confirm；输入框模式保留浏览器 Stripe 安全输入与付款。"
+                  {!teamOrder ? "浏览器支付标识不能核验其账单归属，不接受此方式付款。"
                     : "协议提交由服务端向 Stripe 换 pm_；Stripe 输入框让卡号只进 Stripe iframe。"}
                 </Text>
               </div>
@@ -540,13 +530,13 @@ export function OrderNew({ onRecord }: Props) {
               )}
               <Text size="xs" c="dimmed">
                 {plan === "plus"
-                  ? pmMode === "server" ? "协议模式：沿用当前订单 checkout，每次随机生成一套设备（UA/UA-CH/屏幕/时区/guid-muid-sid），先发 m.stripe.com/6 指纹与 r.stripe.com/b 事件流，再核算税费、创建 confirmation_tokens、完成 ChatGPT confirm 与 PaymentIntent confirm，最后 GET checkout 核对 complete / paid 并查询订阅。" : "输入框模式：卡号只进入 Stripe 安全输入框，浏览器取得支付方式后由服务端确认付款。"
+                  ? pmMode === "server" ? "协议模式：沿用当前订单 checkout，每次随机生成一套设备（UA/UA-CH/屏幕/时区/guid-muid-sid），先发 m.stripe.com/6 指纹与 r.stripe.com/b 事件流，再核算税费、创建 confirmation_tokens、完成 ChatGPT confirm 与 PaymentIntent confirm，最后 GET checkout 核对 complete / paid 并查询订阅。" : "此方式不能核验付款方账单归属，无法提交。"
                   : "结账地区由上面选的地区决定。session 只在内存中使用，不写数据库。"}
               </Text>
             </Stack>
           )}
 
-          {step === 1 && order && linkOnly && (
+          {step === 1 && order && linkOnly && teamOrder && (
             <Stack gap="md">
               <Alert color="green" variant="light" icon={<IconCheck size={18} />} title="结账已创建">
                 官方付款链接已生成（见上方卡片）。金额、折扣和税费以官方结账页为准，
@@ -598,8 +588,10 @@ export function OrderNew({ onRecord }: Props) {
                 bindBeforePay={order.plan === "plus" && pmMode === "server"}
                 browserPayment={order.plan === "plus" && pmMode === "stripe"}
                 submissionDisabled={order.status !== "awaiting_payment"}
-                sessionEmail={order.session_email}
-                billing={order.billing ? {
+                teamOrder={teamOrder}
+                billingVerified={order.billing_verified}
+                sessionEmail={teamOrder ? order.session_email : null}
+                billing={!teamOrder ? verifiedPayerBilling(order.billing_verified, order.billing) : order.billing ? {
                   name: order.billing.name ?? "",
                   email: order.session_email ?? "",
                   line1: order.billing.line1 ?? "",
@@ -620,7 +612,7 @@ export function OrderNew({ onRecord }: Props) {
                 checkoutUrl={order.checkout_url}
                 disabled={busy || (order.plan !== "plus" && order.status !== "awaiting_payment")}
                 onBusyChange={setProtocolBusy}
-                onRefreshQuote={order.plan === "plus" ? undefined : async () => {
+                onRefreshQuote={!teamOrder ? undefined : async () => {
                   if (!order) return;
                   setBusy(true);
                   setError(null);
@@ -653,7 +645,7 @@ export function OrderNew({ onRecord }: Props) {
         )}
 
         <div className="order-side">
-          <OrderSummary plan={plan} country={country} order={order} seats={team.seats} />
+          <OrderSummary plan={plan} country={plan === "team" ? country : "由已核验账单确定"} order={order} seats={team.seats} />
           {teamOrder && order && step < 2 && order.status === "awaiting_payment" && (
             <Button variant="light" fullWidth mt="xs" loading={busy} type="button" onClick={async () => {
               setBusy(true); setError(null);

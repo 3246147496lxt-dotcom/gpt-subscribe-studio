@@ -13,6 +13,7 @@ from gss_contracts.adapter import PaymentReceiptEvidence
 from gss_core.money import _ZERO_DECIMAL
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
+from gss_core.verified_payer import checkout_address
 from gss_core.hosted import TeamHostedClient
 from gss_core.chatgpt import (
     APP_BASE,
@@ -94,6 +95,8 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
         # The exit follows the session issuer (statsigContext.country); billing country
         # is only a fallback. A cross-border exit looks inconsistent to Stripe and
         # forces an extra verification step.
+        pinned_billing = (None if str(req.plan or "").lower() == "team" else
+                          checkout_address(req.exit_country or req.country, req.country, req.billing))
         billing_country = str((req.billing or {}).get("country") or "").upper()
         target_country = billing_country if str(req.plan or "").lower() == "team" and billing_country else req.country
         pinned_proxy = req.checkout_proxy or req.approve_proxy
@@ -129,7 +132,7 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                 "缺少 Stripe 公钥。若是 Team 长链订单，请打开长链手动支付后查询订阅。",
             )
 
-        billing = dict(req.billing or address_for(req.country))
+        billing = dict(pinned_billing if pinned_billing is not None else req.billing or address_for(req.country))
         checkout_id = public_checkout_id(checkout_id)
         stripe_custom = checkout_id.startswith("cs_")
         confirm_token = _confirmation_token(client, publishable_key=pk, token=req.payment_method_token or "")

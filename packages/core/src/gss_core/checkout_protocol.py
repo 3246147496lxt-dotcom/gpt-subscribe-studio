@@ -11,6 +11,7 @@ from urllib.parse import urlencode, urlsplit
 
 from gss_contracts.errors import DomainError, ErrorCode
 from .chatgpt import APP_BASE, STRIPE_BASE, STRIPE_API_VERSION, ChatGPTClient, payment_intent_from_confirm, redact_sensitive
+from .verified_payer import check_observed_billing
 from .saved_cards import restore_account
 from .saved_card_protocol import _factor, _id, _minor, _setup_rejection, _stripe_error, outcome
 from .plus_har_protocol import active_plus_entitlement, cash_receipt, har_engine_enabled, run_har_context
@@ -92,6 +93,7 @@ def _sync_quote(client: ChatGPTClient, context: dict, billing: dict) -> None:
     payload = _json(response)
     if int(response.status_code) >= 400:
         client._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "读取账单税费")
+    check_observed_billing(payload, billing)
     session = payload.get("checkout_session")
     if not isinstance(session, dict) or session.get("checkout_session_id") != context["checkout_id"]:
         raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "税费响应缺少匹配的结账会话")
@@ -390,6 +392,7 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
         if read_only:
             return outcome("pending", "checkout", "原结账尚未提交付款，状态查询不会准备卡片或确认支付")
         billing = billing or context.get("protocol_billing") or {}
+        check_observed_billing(original, billing)
         _sync_quote(client, context, billing)
         if _minor(context["amount"], context["currency"]) != _minor(spec["expected_amount"], spec["expected_currency"]) or context["currency"] != str(spec["expected_currency"]).upper():
             return outcome("pending", "checkout", "账单税费已更新，请确认当前应付金额后再提交付款")
@@ -403,6 +406,8 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
         stopped = _app_confirm(client, context)
         return stopped or _intent(client, context, read_only=False)
     except DomainError as exc:
+        if exc.code is ErrorCode.BILLING_COUNTRY_MISMATCH and stage == "checkout":
+            return outcome("integration_error", stage, exc.message, code=str(exc.code))
         return outcome("unknown", stage, redact_sensitive(exc.message)[:240], code=str(exc.code))
     except Exception:
         return outcome("unknown", stage, "上游连接中断，请查询原订单；本次未自动重试金融确认")

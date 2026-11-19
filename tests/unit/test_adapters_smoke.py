@@ -43,19 +43,20 @@ def test_adapters_are_self_contained() -> None:
     assert "this repository" in UpstreamPaymentAdapter().capabilities().license
 
 
-def test_fake_checkout_standard_is_priced() -> None:
+def test_fake_checkout_standard_is_priced(verified_us_payer) -> None:
     fake = FakeCheckoutAdapter()
     req = CheckoutRequest(
         session="fake",
         plan=Plan.PLUS,
-        billing_country="US",
+        billing_country="US", verified_billing=verified_us_payer,
         billing_mode=BillingMode.STANDARD,
     )
     res = asyncio.run(fake.create_checkout(req))
     assert res.currency == "USD"
     assert str(res.amount) == "20.00"
     assert res.checkout_url.endswith("/fake/1")
-    assert res.billing and res.billing["country"] == "US"
+    assert res.billing == verified_us_payer
+    assert res.billing["country"] == "US"
     assert res.billing["postal_code"]
 
 
@@ -80,15 +81,17 @@ def test_fake_checkout_team_uses_seats_and_hosted_url() -> None:
     assert fake.calls[0].promo_code == "TEAM50"
 
 
-def test_fake_checkout_promo_is_zero() -> None:
+def test_fake_checkout_promo_is_zero(verified_payer) -> None:
+    fixed = verified_payer("PH")
     fake = FakeCheckoutAdapter()
     req = CheckoutRequest(
         session="fake",
         plan=Plan.PLUS,
-        billing_country="PH",
+        billing_country="PH", verified_billing=fixed,
         billing_mode=BillingMode.PROMO,
     )
     res = asyncio.run(fake.create_checkout(req))
+    assert res.billing == fixed
     assert res.currency == "PHP"
     assert str(res.amount) == "0.00"
 

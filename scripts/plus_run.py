@@ -3,6 +3,11 @@
 只用标准模式（billing_mode=standard），不碰 promo。
 目标：拿到明确结果（拒卡 / 成功 / 需 3DS）。
 """
+
+# Standalone checkout/probing has no verified payer binding from the order service.
+if __name__ == "__main__":
+    raise SystemExit("非 Team 独立写入入口已关闭：请使用绑定了已核验账单的原订单。")
+
 import json
 import re
 import secrets
@@ -100,7 +105,3 @@ def main() -> None:
     print("message      :", (out.message or "")[:200])
     print("intent_status:", out.intent_status)
     print("payment_meth :", (out.payment_method_id or "")[:16])
-
-
-if __name__ == "__main__":
-    main()

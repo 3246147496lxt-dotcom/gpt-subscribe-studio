@@ -4,12 +4,14 @@ import * as purchase from "../src/api/purchaseIntent";
 import { createOrder, type Order } from "../src/api/client";
 
 test("建单客户端原样传递调用方购买键，不为第二次点击换键", async () => {
-  const body = { plan: "plus" as const, billing_country: "US", session: "synthetic-only" };
+  const body = { plan: "plus" as const, session: "synthetic-only" };
   const seen: string[] = [];
   const old = globalThis.fetch;
   try {
     globalThis.fetch = async (_, init) => {
       seen.push(new Headers(init?.headers).get("Idempotency-Key")!);
+      const wire = JSON.parse(String(init?.body));
+      assert.ok(!("billing_country" in wire) && !("exit_country" in wire));
       return Response.json({ id: "fixture" } as Order);
     };
     const key = crypto.randomUUID();
@@ -107,4 +109,25 @@ test("上一笔迟到的响应不覆盖显式新开的购买", async () => {
   release(makeOrder());
   await assert.rejects(old, /标记已更改/);
   assert.equal(purchase.readPurchaseIntent(storage)?.id, next.id);
+});
+
+test("非 Team 仅能提交出口；即使旧客户端传入账单国也不悄悄替换", async () => {
+  const old = globalThis.fetch;
+  const requests: Record<string, unknown>[] = [];
+  try {
+    globalThis.fetch = async (_, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return Response.json({ id: "fixture" } as Order);
+    };
+    const input = { plan: "go" as const, session: "synthetic-only", exit_country: "DE" };
+    await createOrder(input, "fixed-order-go");
+    assert.ok(!("billing_country" in requests[0]));
+    assert.equal(requests[0].exit_country, "DE");
+    // Simulate a stale/untyped caller; a typed non-Team caller cannot pass billing_country at all.
+    await assert.rejects(createOrder(JSON.parse(JSON.stringify({ ...input, billing_country: "GB" })), "stale"), /不能指定/);
+    await createOrder({ ...input, plan: "team", billing_country: "EG" }, "existing-team");
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].billing_country, "EG");
+    assert.equal(requests[1].exit_country, "DE");
+  } finally { globalThis.fetch = old; }
 });

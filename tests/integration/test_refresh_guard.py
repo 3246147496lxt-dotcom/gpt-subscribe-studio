@@ -5,12 +5,15 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
+
 from fastapi.testclient import TestClient
 
 from gss_api.main import create_app
 from gss_api.routers import orders
 from gss_core.proxies import ProxyPreflightError, verify_refresh_egress
 
+
+pytestmark = pytest.mark.usefixtures("verified_us_payer")
 
 @pytest.mark.parametrize("answer,expected_status", [
     (204, None), (302, 503), (403, 403), (429, 429), (503, 503),

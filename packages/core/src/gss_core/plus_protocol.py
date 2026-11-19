@@ -46,6 +46,7 @@ from gss_core.chatgpt import (
     submission_state,
     profile_from_session_ua,
 )
+from gss_core.verified_payer import ObservedBillingConflict, check_observed_billing
 from gss_core.stripe_protocol import (
     RUNTIME_HASH,
     STRIPE_API,
@@ -85,6 +86,7 @@ class PlusProtocol:
         self.card = card or {}
         self.billing = billing or {}
         self.proxy = proxy or None
+        self.verified_quote_billing = None  # Authenticated by the non-Team order boundary only.
         self.pin_proxy = pin_proxy
         self.credentials_current = lambda: True
         # 指纹必须与建单、求解器完全一致
@@ -374,14 +376,18 @@ class PlusProtocol:
                 "currency": (self.currency or "USD").lower(),
                 "checkout_email": str(b.get("email") or ""),
             }
-            self.client.http.post(
+            response = self.client.http.post(
                 "https://chatgpt.com/backend-api/payments/checkout/taxes",
                 json=payload,
                 headers=self.client._route_headers(
                     "/backend-api/payments/checkout/taxes",
                     page_url=self.checkout_url),
                 timeout=self.timeout)
+            if self.verified_quote_billing is not None and 200 <= response.status_code < 300:
+                check_observed_billing(response.json(), self.verified_quote_billing)
             log("   暖场 checkout/taxes")
+        except ObservedBillingConflict:
+            raise
         except Exception as exc:  # noqa: BLE001
             log(f"   暖场 taxes 失败: {str(exc)[:70]}")
 
@@ -484,6 +490,8 @@ class PlusProtocol:
         # ①b 暖场：让 Radar 看到真实会话该有的请求序列
         try:
             self._warmup()
+        except ObservedBillingConflict:
+            raise
         except Exception as exc:  # noqa: BLE001
             log(f"   暖场整体失败，继续：{str(exc)[:70]}")
 

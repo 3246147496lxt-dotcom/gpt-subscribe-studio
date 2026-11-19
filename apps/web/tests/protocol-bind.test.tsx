@@ -25,10 +25,10 @@ const input: BindAndPayProtocolInput = {
   expected_amount: "20", expected_currency: "usd",
 };
 
-function renderPanel() {
+function renderPanel(verified = true, billing: typeof input.billing | null = input.billing) {
   return renderToStaticMarkup(<MantineProvider><form><ProtocolPayPanel orderId={order.id}
-    bindBeforePay country="DE" sessionEmail="fixture@example.invalid" amount="20" currency="usd"
-    publishableKey="pk_test_fixture" checkoutUrl={order.checkout_url} pmMode="stripe" /></form></MantineProvider>);
+    bindBeforePay country="FR" sessionEmail="different-account@example.invalid" billingVerified={verified} billing={billing} amount="20" currency="usd"
+    publishableKey="pk_test_fixture" checkoutUrl={order.checkout_url} pmMode="server" /></form></MantineProvider>);
 }
 
 test("Plus bindBeforePay renders server card inputs and never renders Stripe or saved-card components", () => {
@@ -46,8 +46,7 @@ test("Plus bindBeforePay renders server card inputs and never renders Stripe or 
   for (const marker of ["协议绑卡并支付", "绑卡验证", "先绑卡", "重新提链", "再次提链", "完成绑卡", "保存卡片成功"]) {
     assert.ok(!html.includes(marker), marker);
   }
-  assert.ok(html.includes("随机生成地址"));
-  assert.ok(html.includes('data-testid="random-billing-address"'));
+  assert.ok(!html.includes('data-testid="random-billing-address"'));
   for (const marker of ["plus-saved-card-panel", "stripe-setup-element", "stripe-payment-element", "Stripe 输入框", "指定代理", "指纹注册", "solver"]) {
     assert.ok(!html.includes(marker), marker);
   }
@@ -58,21 +57,43 @@ test("Plus bindBeforePay renders server card inputs and never renders Stripe or 
   assert.ok(!html.includes('type="submit"'));
 });
 
-test("Plus starts with empty card and real-address fields while prefiling only account email and country", () => {
+function assertReadOnlyBill(html: string) {
+  const panel = /<dl[^>]*data-testid="verified-payer-billing"[^>]*>([\s\S]*?)<\/dl>/.exec(html)?.[1];
+  assert.ok(panel, "verified payer must be shown by field, not in an editable form");
+  for (const [label, value] of [
+    ["付款方姓名", input.billing.name], ["账单邮箱", input.billing.email], ["街道地址", input.billing.line1],
+    ["城市", input.billing.city], ["州 / 省", input.billing.state], ["邮编", input.billing.postal_code], ["账单国家", input.billing.country],
+  ]) assert.ok(panel.includes(`<dt>${label}</dt><dd>${value}</dd>`), label);
+  assert.doesNotMatch(panel, /<(input|select|button|textarea)\b/);
+  assert.doesNotMatch(html, /data-testid="random-billing-address"|different-account@example.invalid/);
+}
+
+test("Plus uses only the server-verified payer details, read-only, not the account email or order country", () => {
   const html = renderPanel();
-  assert.ok(html.includes('value="fixture@example.invalid"'));
-  assert.ok(html.includes('value="DE"'));
-  assert.ok((html.match(/value=""/g) || []).length >= 9);
-  assert.ok(!html.includes("Fixture Holder"));
-  assert.ok(!html.includes("1 Fixture Street"));
+  assertReadOnlyBill(html);
   assert.ok(!html.includes("4242424242424242")); // release-check: ignore
 });
 
-test("new Plus order configuration retains both protocol and Stripe input modes", () => {
+test("unverified or incomplete non-Team billing exposes no card entry, provider link or payment submit", () => {
+  for (const [flag, billing] of [
+    [false, input.billing], [true, null], [true, { ...input.billing, email: "" }], [true, { ...input.billing, line1: "" }],
+  ] as const) {
+    for (const mode of ["plus", "stripe", "other"] as const) {
+      const html = renderToStaticMarkup(<MantineProvider><ProtocolPayPanel orderId={order.id}
+        bindBeforePay={mode === "plus"} browserPayment={mode === "stripe"} pmMode={mode === "stripe" ? "stripe" : "server"}
+        country="DE" billingVerified={flag} billing={billing} checkoutUrl={order.checkout_url} publishableKey="pk_test_fixture" /></MantineProvider>);
+      assert.ok(html.includes("未取得完整的已核验付款方账单"));
+      assert.doesNotMatch(html, /<input\b|stripe-payment-element|random-billing-address|确认支付|打开长链/);
+      assert.ok(!html.includes(String(order.checkout_url)));
+    }
+  }
+});
+
+test("new Plus order configuration does not offer opaque browser-created payment tokens", () => {
   const html = renderToStaticMarkup(<MantineProvider><OrderNew onRecord={() => {}} /></MantineProvider>);
   assert.ok(html.includes("协议提交（服务端提交卡号）"));
-  assert.ok(html.includes("Stripe 输入框（浏览器换 pm_）"));
-  assert.ok(html.includes("Plus 协议模式沿用当前订单结账，按账单地址核算税费后确认付款"));
+  assert.ok(html.includes("输入框模式不可用"));
+  assert.ok(!html.includes("Stripe 输入框（浏览器换 pm_）"));
   assert.ok(html.includes("confirmation_tokens"));
   assert.ok(html.includes("ChatGPT confirm"));
   assert.ok(html.includes("PaymentIntent confirm"));
@@ -81,6 +102,14 @@ test("new Plus order configuration retains both protocol and Stripe input modes"
     assert.ok(!html.includes(marker), marker);
   }
   assert.ok(!html.includes("plus-saved-card-panel"));
+});
+
+test("创建非 Team 订单之前账单国家只读，出口可不选", () => {
+  const html = renderToStaticMarkup(<MantineProvider><OrderNew onRecord={() => {}} /></MantineProvider>);
+  assert.match(html, /data-testid="fixed-order-billing-country"[^>]*>[^<]*不可编辑/);
+  assert.ok(html.includes("默认由服务端确定"));
+  assert.ok(html.includes("选择出口不会更改账单"));
+  assert.doesNotMatch(html, /用于创建结账并对齐出口代理|低价区示例|请选择创建结账的地区/);
 });
 
 test("Plus result pages retain actual action state without offering a browser checkout link", () => {
@@ -229,30 +258,36 @@ test("card validation rejects invalid months and partial years before an API cal
 });
 
 
-test("Stripe input mode remains available without the server raw-card form", () => {
+test("a legacy browser mode selection cannot mount a payment element or silently switch to a server card form", () => {
   const html = renderToStaticMarkup(<MantineProvider><form><ProtocolPayPanel orderId={order.id}
-    browserPayment country="DE" sessionEmail="fixture@example.invalid" amount="20" currency="usd"
+    browserPayment country="FR" billingVerified billing={input.billing} sessionEmail="different-account@example.invalid" amount="20" currency="usd"
     publishableKey="pk_test_fixture" checkoutUrl={order.checkout_url} pmMode="stripe" /></form></MantineProvider>);
-  assert.ok(html.includes("输入框模式"));
+  assert.ok(html.includes("浏览器支付标识不能核验其账单归属"));
+  assert.ok(!html.includes("stripe-payment-element"));
   assert.ok(!html.includes("plus-protocol-pay-panel"));
   assert.ok(!html.includes('data-testid="protocol-card-number"'));
   assert.ok(!html.includes("协议支付"));
   assert.ok(!html.includes("指定代理"));
   assert.ok(!html.includes("默认从五个免税州"));
-  assert.ok(html.includes('value="DE"'));
-  assert.ok(html.includes("随机生成地址"));
-  assert.ok(html.includes('data-testid="random-billing-address"'));
-  assert.ok(html.includes("账单国家独立于订单地区"));
-  assert.ok(!html.includes("readonly"));
-  assert.ok(html.includes("确认支付"));
+  assertReadOnlyBill(html);
+  assert.ok(!html.includes("确认支付"));
 });
 
-test("Stripe input result retains the normal verification link", () => {
-  const html = renderToStaticMarkup(<MantineProvider><ResultPanel order={{ ...order, status: "requires_action",
-    next_action: { url: "https://verify.example.invalid/fixture", type: "use_stripe_sdk" } }} onReset={() => {}} /></MantineProvider>);
-  assert.ok(html.includes("https://verify.example.invalid/fixture"));
+test("a verified Stripe input result may retain its bank verification link, not an editable checkout URL", () => {
+  const html = renderToStaticMarkup(<MantineProvider><ResultPanel order={{ ...order, billing_verified: true, billing: input.billing, status: "requires_action",
+    next_action: { url: "https://hooks.stripe.com/redirect/authenticate/src_example", type: "3ds_redirect" } }} onReset={() => {}} /></MantineProvider>);
+  assert.ok(html.includes("https://hooks.stripe.com/redirect/authenticate/src_example"));
   assert.ok(html.includes("打开支付验证页面"));
   assert.ok(!html.includes("开通成功"));
+  for (const bill of [false, true]) {
+    const checkout = renderToStaticMarkup(<MantineProvider><ResultPanel order={{ ...order, billing_verified: bill, billing: input.billing,
+      status: "requires_action", next_action: { checkout_url: order.checkout_url } }} onReset={() => {}} /></MantineProvider>);
+    assert.ok(!checkout.includes(String(order.checkout_url)));
+    const sameUrl = "https://checkout.example.invalid/legacy-edit";
+    const dual = renderToStaticMarkup(<MantineProvider><ResultPanel order={{ ...order, billing_verified: bill, billing: input.billing,
+      status: "requires_action", next_action: { url: sameUrl, checkout_url: sameUrl } }} onReset={() => {}} /></MantineProvider>);
+    assert.ok(!dual.includes(sameUrl));
+  }
 });
 
 

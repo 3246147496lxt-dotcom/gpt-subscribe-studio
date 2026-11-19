@@ -72,7 +72,7 @@ def _stub_factory(monkeypatch: pytest.MonkeyPatch, client: _StubChatGPTClient) -
     monkeypatch.setattr("gss_payment.adapter.ChatGPTClient", _Factory)
 
 
-def _pay(plan: str = "team"):
+def _pay(plan: str = "team", *, billing=None):
     return asyncio.run(
         UpstreamPaymentAdapter().pay(
             PaymentRequest(
@@ -82,32 +82,34 @@ def _pay(plan: str = "team"):
                 session="sess",
                 checkout_session_id="cs_live_1",
                 publishable_key="pk_live_test",
-                plan=plan,
+                plan=plan, billing=billing,
             )
         )
     )
 
 
-def test_custom_cs_approve_rejected_still_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_custom_cs_approve_rejected_still_raises(monkeypatch: pytest.MonkeyPatch, verified_us_payer) -> None:
     """非托管（plus custom）会话的 approve 失败必须原样抛错，不能吞掉。"""
 
     client = _StubChatGPTClient()
     _stub_factory(monkeypatch, client)
 
-    with pytest.raises(DomainError):
-        _pay(plan="plus")
+    with pytest.raises(DomainError) as error:
+        _pay(plan="plus", billing=verified_us_payer)
+    assert error.value.code is ErrorCode.PAYMENT_UNKNOWN_STATE
+    assert client.calls.count("confirm") == client.calls.count("finalize") == 1
 
 
 # Dedicated Hosted pipeline and missing context tests are in test_hosted_protocol.py.
 
 
-def test_application_block_does_not_prove_the_card_was_declined(monkeypatch):
+def test_application_block_does_not_prove_the_card_was_declined(monkeypatch, verified_us_payer):
     client = _StubChatGPTClient()
     _stub_factory(monkeypatch, client)
     blocked = {"status": "blocked", "message": "本次扣款尚未确认"}
     monkeypatch.setattr(client, "confirm_checkout", lambda **_: blocked)
     monkeypatch.setattr(client, "finalize_stripe_custom_checkout", lambda **_: blocked)
-    assert _pay(plan="plus").status is PaymentStatus.ERROR
+    assert _pay(plan="plus", billing=verified_us_payer).status is PaymentStatus.ERROR
 
 
 @pytest.mark.parametrize("error, expected", [
@@ -129,7 +131,7 @@ def test_expired_checkout_without_payment_evidence_is_inconclusive(field):
 
 
 
-def test_internal_approval_error_does_not_repeat_confirmation(monkeypatch) -> None:
+def test_internal_approval_error_does_not_repeat_confirmation(monkeypatch, verified_us_payer) -> None:
     from unittest.mock import Mock
 
     client = _StubChatGPTClient()
@@ -141,7 +143,7 @@ def test_internal_approval_error_does_not_repeat_confirmation(monkeypatch) -> No
     monkeypatch.setattr(client, "finalize_stripe_custom_checkout", finalize)
     try:
         with pytest.raises(DomainError) as error:
-            _pay(plan="plus")
+            _pay(plan="plus", billing=verified_us_payer)
     finally:
         # A missing intent in a truncated response is not proof that no money moved.
         confirm.assert_called_once()
@@ -167,7 +169,7 @@ def test_hosted_success_requires_payment_evidence(payload, expected) -> None:
     {"status": "complete", "submission_attempt": {"state": "succeeded"}},
     {"status": "success", "payment_intent": {"id": "pi_1", "client_secret": "pi_1_secret_x"}},
 ])
-def test_custom_confirmation_without_payment_evidence_is_not_resubmitted(monkeypatch, payload) -> None:
+def test_custom_confirmation_without_payment_evidence_is_not_resubmitted(monkeypatch, payload, verified_us_payer) -> None:
     from unittest.mock import Mock
 
     client = _StubChatGPTClient()
@@ -176,7 +178,7 @@ def test_custom_confirmation_without_payment_evidence_is_not_resubmitted(monkeyp
     monkeypatch.setattr(client, "finalize_stripe_custom_checkout", lambda **_: payload)
     repeat = Mock(return_value={"status": "succeeded"})
     monkeypatch.setattr(client, "confirm_stripe_intent", repeat, raising=False)
-    result = _pay(plan="plus")
+    result = _pay(plan="plus", billing=verified_us_payer)
     repeat.assert_not_called()
     assert result.status in {PaymentStatus.PROCESSING, PaymentStatus.ERROR}
 
@@ -196,7 +198,7 @@ def test_only_explicit_unattempted_bound_checkout_is_open(change, expected):
 @pytest.mark.parametrize("change, has_evidence", [
     ({}, True), ({"session_id": "cs_foreign"}, False), ({"currency": "eur"}, False),
 ])
-def test_custom_plus_preserves_only_observed_settlement(monkeypatch, change, has_evidence):
+def test_custom_plus_preserves_only_observed_settlement(monkeypatch, change, has_evidence, verified_us_payer):
     from gss_contracts.adapter import receipt_matches_order
     client = _StubChatGPTClient()
     _stub_factory(monkeypatch, client)
@@ -205,7 +207,7 @@ def test_custom_plus_preserves_only_observed_settlement(monkeypatch, change, has
                               "currency": "usd", "amount_received": 2000}, **change}
     monkeypatch.setattr(client, "confirm_checkout", lambda **_: raw)
     monkeypatch.setattr(client, "finalize_stripe_custom_checkout", lambda **_: raw)
-    record = _pay(plan="plus").receipt_evidence
+    record = _pay(plan="plus", billing=verified_us_payer).receipt_evidence
     assert receipt_matches_order(record, checkout_id="cs_live_1", payment_id="pi_test",
                                  amount="20", currency="USD") is has_evidence
     assert not receipt_matches_order(record, checkout_id="cs_live_1", payment_id="pi_other",
@@ -214,7 +216,7 @@ def test_custom_plus_preserves_only_observed_settlement(monkeypatch, change, has
 
 @pytest.mark.parametrize("plan", ["team", "plus"])
 @pytest.mark.parametrize("settled", [False, True])
-def test_expired_lease_keeps_confirm_reply_without_new_poll_or_finalize(monkeypatch, plan, settled):
+def test_expired_lease_keeps_confirm_reply_without_new_poll_or_finalize(monkeypatch, plan, settled, verified_payer):
     from types import SimpleNamespace
     current = True
     reads = []
@@ -240,7 +242,7 @@ def test_expired_lease_keeps_confirm_reply_without_new_poll_or_finalize(monkeypa
         checkout_url="https://example.invalid/fixture", country="US", plan=plan, session="fixture",
         checkout_session_id="cs_live_1", publishable_key="pk_fixture", payment_method_token="ctoken_fixture",
         team_context={"session_id": "cs_live_1", "publishable_key": "pk_fixture"},
-        credentials_current=lambda: current,
+        credentials_current=lambda: current, billing=verified_payer("US") if plan == "plus" else None,
     )))
     assert reads == []
     if settled:

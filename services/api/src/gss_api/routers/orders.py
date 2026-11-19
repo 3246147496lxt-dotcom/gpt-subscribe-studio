@@ -27,6 +27,8 @@ from gss_contracts import (
 )
 from gss_contracts.adapter import receipt_matches_order, team_entitlement_matches, verification_lease
 from gss_contracts.errors import DomainError, ErrorCode
+from gss_account import FakeAccountAdapter
+from gss_checkout import FakeCheckoutAdapter
 from gss_core.billing import address_for
 from gss_core.config import ORDER_HTTP_TIMEOUT_S, load_settings, use_fake_adapters
 from gss_core.countries import is_supported, normalize_country
@@ -48,13 +50,17 @@ from gss_core.session_token import (
     parse_session_bundle,
 )
 from gss_core.vault import OrderSecrets, vault
+from gss_core.verified_payer import ObservedBillingConflict
 from gss_core.saved_card_protocol import _minor
 from gss_core.saved_cards import verification_session
 from gss_orchestrator.pipeline import apply_payment_result, assert_deliverable
-from gss_payment.adapter import hosted_payment_result
+from gss_payment.adapter import FakePaymentAdapter, hosted_payment_result
 
 from ..runtime import build_pipeline
+from ..verified_billing import require_verified_billing
+from ..public_payment import issuer_action, read_text, receipt_view
 from ..schemas import (
+    AddressedRequest,
     BillingIn,
     CardIn,
     ErrorOut,
@@ -116,6 +122,52 @@ def _aligned_billing(
     if current.get("name"):
         template["name"] = str(current["name"])
     return template
+
+
+def _billing_claim(payload):
+    payload.reject_unknown_fields()
+    if isinstance(payload.billing, BillingIn):
+        return payload.billing.model_dump(exclude_unset=True)
+    if payload.billing is None and "billing" in payload.model_fields_set:
+        raise HTTPException(409, "提交的账单不完整，未提交。")
+    return payload.billing
+
+
+_OFFLINE_TEST_INSTRUMENT = "offline-verified-instrument"
+
+
+def _unverified_instrument():
+    return HTTPException(409, "无法核验此外部付款工具的账单与本单属于同一付款主体，未提交。")
+
+
+def _require_offline_instrument(pipeline, token):
+    # No provider-issued opaque method carries a trusted payer/address binding
+    # at these endpoints. Only the explicit local simulator instrument can pay,
+    # and only on an entirely simulated pipeline (never trust an environment flag).
+    if (token != _OFFLINE_TEST_INSTRUMENT
+            or type(pipeline.deps.payment) is not FakePaymentAdapter
+            or type(pipeline.deps.checkout) is not FakeCheckoutAdapter
+            or type(pipeline.deps.account) is not FakeAccountAdapter):
+        raise _unverified_instrument()
+
+
+def _verified_order_billing(order, secrets: OrderSecrets, *claims):
+    view = store.view(order.id)
+    if (not view.billing_verified or not view.billing_verification_id
+            or not view.billing or not secrets.billing):
+        raise HTTPException(409, "原订单没有有效的账单核验记录，不能继续付款。")
+    supplied = []
+    for claim in claims:
+        if isinstance(claim, BillingIn):
+            claim.reject_unknown_fields()
+            claim = claim.model_dump(exclude_unset=True)
+        if claim is not None:
+            supplied.append(claim)
+    verified = require_verified_billing(*supplied, secrets.billing, order_billing=view.billing,
+                                        verification_id=view.billing_verification_id)
+    if any(code != verified["country"] for code in (order.billing_country, view.exit_country, secrets.exit_country)):
+        raise HTTPException(409, "订单账单国家与核验记录不一致，未提交。")
+    return verified
 
 
 def _assert_saved_card_resolved(secrets: OrderSecrets) -> None:
@@ -290,6 +342,16 @@ async def _verify_after_payment(order: Order, view) -> bool:
 
 def _to_out(order: Order) -> OrderOut:
     view = store.view(order.id)
+    team = order.plan is Plan.TEAM
+    public_billing = view.billing if team else None
+    if not team and view.billing_verified and view.billing_verification_id and view.billing:
+        try:
+            public_billing = require_verified_billing(
+                order_billing=view.billing, verification_id=view.billing_verification_id
+            )
+        except HTTPException:
+            # Revocation/rotation hides the old payer's address, not the receipt.
+            pass
     subscription = None
     if view.subscription is not None:
         subscription = SubscriptionOut(
@@ -297,10 +359,10 @@ def _to_out(order: Order) -> OrderOut:
             expires_at=view.subscription.expires_at.isoformat() if view.subscription.expires_at else None,
             channel=view.subscription.channel,
         )
-    # 账户邮箱：从 vault 里的 accessToken 现解一次，失败留空由前端兜底
+    # The Team workflow uses its session email. Non-Team only shows verified payer details.
     session_email = ""
     try:
-        _sec = vault.get(order.id)
+        _sec = vault.get(order.id) if team else None
         if _sec and _sec.session:
             session_email = email_from_access_token(parse_session(_sec.session))
     except Exception:
@@ -317,15 +379,18 @@ def _to_out(order: Order) -> OrderOut:
             billing_mode=str(order.mode.billing_mode),
             risk_acknowledged=order.mode.risk_acknowledged,
         ),
-        checkout_url=view.checkout_url,
+        checkout_url=view.checkout_url if team else None,
         publishable_key=view.publishable_key,
-        customer_session_client_secret=view.customer_session_client_secret,
+        customer_session_client_secret=view.customer_session_client_secret if team else None,
         amount=view.amount if view.amount is not None else (str(order.amount) if order.amount is not None else None),
         currency=view.currency,
-        billing=view.billing,
-        last_error=view.last_error,
-        quote_error=view.quote_error,
-        next_action=view.next_action,
+        billing=public_billing,
+        billing_verified=not team and public_billing is not None,
+        last_error=view.last_error if team else read_text(view.last_error),
+        quote_error=view.quote_error if team else read_text(view.quote_error),
+        next_action=view.next_action if team else issuer_action(
+            view.next_action, allow_redirect=public_billing is not None and order.status is OrderStatus.REQUIRES_ACTION,
+            checkout_url=view.checkout_url),
         subscription=subscription,
         checkout_kind=view.checkout_kind,
         seat_quantity=view.seat_quantity,
@@ -333,7 +398,7 @@ def _to_out(order: Order) -> OrderOut:
         promo_code=view.promo_code,
         promo_campaign_id=view.promo_campaign_id,
         price_interval=view.price_interval,
-        confirm_return_url=view.confirm_return_url,
+        confirm_return_url=view.confirm_return_url if team else None,
         session_email=session_email or None,
         session_reissued_for_country=bool(getattr(view, "session_reissued_for_country", False)),
         exit_country=getattr(view, "exit_country", None),
@@ -344,9 +409,9 @@ def _to_out(order: Order) -> OrderOut:
         paid_currency=view.paid_currency,
         tax_delta=view.tax_delta,
         plan_type=view.plan_type or str(order.plan),
-        status_summary=view.status_summary
+        status_summary=(view.status_summary if team else read_text(view.status_summary))
         or _default_status_summary(view.payment_status, view.delivery_status),
-        receipt=view.receipt or None,
+        receipt=(view.receipt or None) if team else receipt_view(view.receipt),
     )
 
 
@@ -361,13 +426,13 @@ def _error(status_code: int, code: ErrorCode, message: str, *, session_reissued:
     )
 
 
-def _from_domain(exc: DomainError, *, session_reissued: bool = False) -> HTTPException:
+def _from_domain(exc: DomainError, *, session_reissued: bool = False, nonteam: bool = False) -> HTTPException:
     status_code = status.HTTP_400_BAD_REQUEST
     if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED}:
         status_code = status.HTTP_401_UNAUTHORIZED
     # 只报告已发生的重签发；不代表凭证已持久化，或仍可恢复。
     message = "会话已重新签发，本次操作未完成。" if session_reissued else exc.message
-    return _error(status_code, exc.code, message, session_reissued=session_reissued)
+    return _error(status_code, exc.code, read_text(message) if nonteam else message, session_reissued=session_reissued)
 
 
 async def _guard_refresh_egress(proxy: str | None, country: str) -> None:
@@ -426,7 +491,14 @@ async def create_order(
 
 
 async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None) -> OrderOut:
-    tag = (purchase_claims.request_tag(idempotency_key, payload.model_dump_json())
+    # Preserve signatures for callers that did not previously send a billing claim.
+    non_team = payload.plan != str(Plan.TEAM)
+    if non_team and any(field in payload.model_fields_set and not (getattr(payload, field) or "").strip()
+                        for field in ("billing_country", "exit_country")):
+        raise HTTPException(409, "地区声明为空，未提交；由服务端确定时请省略该字段。")
+    claim = _billing_claim(payload) if non_team else None
+    omit = {"billing"} if not non_team or "billing" not in payload.model_fields_set else set()
+    tag = (purchase_claims.request_tag(idempotency_key, payload.model_dump_json(exclude=omit))
            if idempotency_key else None)
     existing = store.find_by_idempotency(idempotency_key)
     if existing is not None:
@@ -467,31 +539,45 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     except ValueError as exc:
         raise _error(status.HTTP_401_UNAUTHORIZED, ErrorCode.INVALID_SESSION, str(exc))
     
-    billing_country = normalize_country(payload.billing_country)
-    if not is_supported(billing_country):
+    if payload.billing_country is not None and not is_supported(payload.billing_country):
         raise _error(
-            status.HTTP_400_BAD_REQUEST,
-            ErrorCode.COMPLIANCE_BLOCKED,
-            f"不支持的地区: {payload.billing_country}",
+            status.HTTP_400_BAD_REQUEST, ErrorCode.COMPLIANCE_BLOCKED,
+            f"不支持的地区: {payload.billing_country}" if not non_team else "不支持的地区，未创建订单。",
         )
-    country = billing_country
-    requested_exit = normalize_country(payload.exit_country or billing_country)
-    if not is_supported(requested_exit):
+    if payload.exit_country and not is_supported(payload.exit_country):
         raise _error(
-            status.HTTP_400_BAD_REQUEST,
-            ErrorCode.COMPLIANCE_BLOCKED,
-            f"不支持的出口地区: {requested_exit}",
+            status.HTTP_400_BAD_REQUEST, ErrorCode.COMPLIANCE_BLOCKED,
+            f"不支持的出口地区: {normalize_country(payload.exit_country)}" if not non_team else "不支持的出口地区，未创建订单。",
         )
-    exit_country = requested_exit
+    verified = require_verified_billing(*([claim] if claim is not None else [])) if non_team else None
+    # Never derive the payer's country from a route, browser locale, or session.
+    # The Team schema still requires its original explicit country.
+    country = verified["country"] if verified is not None else normalize_country(payload.billing_country)
+    if verified is not None and payload.billing_country is not None and normalize_country(payload.billing_country) != country:
+        raise HTTPException(409, "结账账单国家与已核验账单不一致，未创建订单。")
+    exit_country = normalize_country(payload.exit_country or country)
+    # This channel also uses the exit in its checkout billing details; do not silently substitute.
+    if verified is not None and exit_country != country:
+        raise HTTPException(409, "所选出口与本渠道的固定账单不兼容，未创建订单。")
+    pipeline = None
+    if non_team:
+        if payload.payment_method_token:
+            pipeline = build_pipeline()
+            _require_offline_instrument(pipeline, payload.payment_method_token)
+            # The simulator adapters do not replace the router's Session client.
+            # Do not let a simulated instrument trigger a real refresh/preflight.
+            session_country = normalize_country(bundle.country)
+            if bundle.session_token and (not bundle.access_token
+                    or (session_country and session_country != exit_country)):
+                raise HTTPException(409, "离线付款工具不能触发上游会话刷新，未提交。")
     original_country = normalize_country(bundle.country)
     session_reissued = False
 
-    # exit_country 决定代理出口与重签发地；billing_country 决定币种/地址/税务。
-    # 两者允许不同，例如 PH 出口 + US 免税州账单。
+    # 出口选择不授权更改已核验账单。
     logger.info(
         "checkout_country exit_country=%s billing_country=%s session_country=%s",
         exit_country,
-        billing_country,
+        country,
         original_country or "-",
     )
     exit_proxy = checkout_proxy_for(
@@ -584,7 +670,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                     proxy=exit_proxy, country=exit_country,
                 )
             except DomainError as exc:
-                raise _from_domain(exc)
+                raise _from_domain(exc, nonteam=plan is not Plan.TEAM)
             except Exception:
                 raise _error(503, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "会话请求中断，已停止。") from None
         else:
@@ -607,11 +693,17 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
 
     store.add_job(Job(order_id=order.id, stage="checkout"))
     item.profile = profile_from_session_ua(item.user_agent) or _pick_profile(item.device_id)
-    item.billing = address_for(country)
-    item.billing["email"] = email_from_access_token(access_token) or ""
+    if verified is not None:
+        item.billing = dict(verified)
+    else:
+        item.billing = address_for(country)
+        item.billing["email"] = email_from_access_token(access_token) or ""
 
-    pipeline = build_pipeline()
+    if pipeline is None:
+        pipeline = build_pipeline()
     try:
+        if verified is not None:
+            require_verified_billing(order_billing=verified, verification_id=verified.verification_id)
         checkout = await _create_checkout_once(
             pipeline,
             proxy=exit_proxy or "",
@@ -626,10 +718,14 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             workspace_name=workspace,
             seat_quantity=seats,
             price_interval=interval,
+            **({"verified_billing": verified} if verified is not None else {}),
         )
+    except HTTPException:
+        store.update_status(order.id, OrderStatus.REJECTED)
+        raise
     except DomainError as exc:
         store.update_status(order.id, OrderStatus.REJECTED)
-        error = _from_domain(exc, session_reissued=session_reissued)
+        error = _from_domain(exc, session_reissued=session_reissued, nonteam=plan is not Plan.TEAM)
         store.view(order.id).last_error = error.detail["message"]
         logger.info(
             "checkout_failed id=%s plan=%s country=%s code=%s",
@@ -640,12 +736,25 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         )
         raise error
 
+    if verified is not None:
+        # Adapters must return the exact billing they used. A missing/mismatched
+        # response or revoked payer profile is never turned into an accepted order.
+        try:
+            if not getattr(checkout, "billing", None):
+                raise HTTPException(409, "未取得结账账单核对结果，已停止付款。")
+            require_verified_billing(checkout.billing, order_billing=verified,
+                                     verification_id=verified.verification_id)
+        except HTTPException:
+            store.update_status(order.id, OrderStatus.REJECTED)
+            raise
     view = store.view(order.id)
+    view.billing_verified = verified is not None
+    view.billing_verification_id = verified.verification_id if verified is not None else None
     view.checkout_url = checkout.checkout_url
     view.checkout_session_id = checkout.checkout_session_id
     view.publishable_key = checkout.publishable_key
     view.customer_session_client_secret = checkout.customer_session_client_secret
-    view.billing = dict(checkout.billing or {})
+    view.billing = dict(verified if verified is not None else (checkout.billing or {}))
     view.amount = str(checkout.amount) if checkout.amount is not None else None
     view.currency = checkout.currency
     view.payment_status = "unpaid"
@@ -666,7 +775,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     if secrets is not None:
         secrets.checkout_session_id = checkout.checkout_session_id or ""
         secrets.publishable_key = checkout.publishable_key or ""
-        secrets.billing = dict(checkout.billing or {})
+        secrets.billing = dict(view.billing)
         effective_proxy = getattr(checkout, "effective_proxy", None)
         if effective_proxy is not None:
             secrets.proxy = effective_proxy
@@ -970,6 +1079,12 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     if secrets is None:
         raise _error(status.HTTP_401_UNAUTHORIZED, ErrorCode.SESSION_EXPIRED, "session 已过期，请重新提交")
     _assert_saved_card_resolved(secrets)
+    verified = None
+    pipeline = None
+    if order.plan is not Plan.TEAM:
+        verified = _verified_order_billing(order, secrets, _billing_claim(payload))
+        pipeline = build_pipeline()
+        _require_offline_instrument(pipeline, payload.payment_method_token)
 
     if order.plan is Plan.TEAM and not use_fake_adapters():
         context = secrets.team_context
@@ -1017,7 +1132,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
                 client.close()
             payload = payload.model_copy(update={"payment_method_token": pm_id})
 
-    if payload.billing is not None:
+    if order.plan is Plan.TEAM and payload.billing is not None:
         custom = {k: v.strip() for k, v in payload.billing.model_dump().items()}
         custom = _aligned_billing(custom, normalize_country(order.billing_country), getattr(secrets, "billing", None))
         custom["country"] = custom["country"].upper()
@@ -1034,11 +1149,12 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         vault.put(order_id, secrets)
 
     view = store.view(order_id)
-    if payload.billing is not None:
+    if order.plan is Plan.TEAM and payload.billing is not None:
         view.billing = dict(secrets.billing)
     if vault.get(order_id) is not secrets:
         raise _error(401, ErrorCode.SESSION_EXPIRED, "付款尚未提交，订单凭证已过期")
-    pipeline = build_pipeline()
+    if pipeline is None:
+        pipeline = build_pipeline()
     store.update_status(order_id, OrderStatus.PAYING)
     _set_payment_status(order_id, "processing")
     try:
@@ -1053,7 +1169,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
             publishable_key=view.publishable_key or secrets.publishable_key,
             checkout_proxy=secrets.proxy or None,
             approve_proxy=secrets.proxy or None,
-            billing=secrets.billing or None,
+            billing=verified if verified is not None else (secrets.billing or None),
             plan=str(order.plan), team_context=secrets.team_context,
             passive_captcha_token=payload.passive_captcha_token, rv_timestamp=payload.rv_timestamp,
             session_reissued=getattr(secrets, "session_reissued", False),
@@ -1068,7 +1184,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
             await _mark_payment_unknown(order)
             return _to_out(order)
         store.update_status(order_id, OrderStatus.FAILED)
-        error = _from_domain(exc, session_reissued=view.session_reissued_for_country)
+        error = _from_domain(exc, session_reissued=view.session_reissued_for_country, nonteam=order.plan is not Plan.TEAM)
         message = error.detail["message"]
         _set_payment_status(order_id, "failed", summary=f"支付失败：{message[:120]}")
         view.last_error = message
@@ -1165,7 +1281,7 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
             secrets.session = refreshed_session
         except DomainError as exc:
             if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED, ErrorCode.CHECKOUT_UPSTREAM_ERROR}:
-                raise _from_domain(exc)
+                raise _from_domain(exc, nonteam=order.plan is not Plan.TEAM)
             view.last_error = "订阅状态暂未读到，请稍后重新查询"
             return _to_out(order)
         # Activity on the account alone cannot attest payment for this checkout.
@@ -1191,7 +1307,7 @@ async def get_order(order_id: str) -> OrderOut:
     return _to_out(order)
 
 # ── 纯协议支付（不依赖浏览器） ────────────────────────────────
-class ProtocolStepsIn(BaseModel):
+class ProtocolStepsIn(AddressedRequest):
     """协议链路的可选环节。全部默认关闭 = 与 scripts/run_cards.py 一致的批量模式。"""
 
     fingerprint: bool = False   # m.stripe.com/6 × 4 指纹注册 + fetch_allowed_origins
@@ -1200,7 +1316,7 @@ class ProtocolStepsIn(BaseModel):
     tax_region: bool = False    # 提交 tax_region[country]
 
 
-class ProtocolPayRequest(BaseModel):
+class ProtocolPayRequest(AddressedRequest):
     """协议支付的入参。
 
     两种取 pm_ 的方式，二选一：
@@ -1255,6 +1371,12 @@ def _protocol_out(order_id: str, *, state: str, message: Optional[str] = None, *
     order = store.get_order(order_id)
     view = store.view(order_id)
     summary = view.status_summary or _default_status_summary(view.payment_status, view.delivery_status)
+    receipt = _receipt_for(order, view) if order else None
+    if order and order.plan is not Plan.TEAM:
+        receipt = receipt_view(receipt)
+        extra.pop("payment_method_id", None)
+        extra = {k: read_text(v) for k, v in extra.items()}
+        message, summary = read_text(message), read_text(summary)
     return ProtocolPayOut(
         state=state,
         message=redact_sensitive(message) if message is not None else summary,
@@ -1266,7 +1388,7 @@ def _protocol_out(order_id: str, *, state: str, message: Optional[str] = None, *
         tax_delta=view.tax_delta,
         plan_type=view.plan_type or (str(order.plan) if order else None),
         status_summary=summary,
-        receipt=_receipt_for(order, view) if order else None,
+        receipt=receipt,
         **extra,
     )
 
@@ -1309,6 +1431,12 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     if secrets is None:
         raise _error(401, ErrorCode.SESSION_EXPIRED, "订单凭证已过期，请重新创建结账")
     _assert_saved_card_resolved(secrets)
+    verified = None
+    if order.plan is not Plan.TEAM:
+        verified = _verified_order_billing(order, secrets, _billing_claim(payload))
+        if payload.payment_method_id:
+            # This route constructs a protocol client directly, even in fake mode.
+            raise _unverified_instrument()
     session_raw = secrets.session or ""
     billing_country = normalize_country(order.billing_country)
     exit_country = normalize_country(
@@ -1336,9 +1464,12 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
 
     pm_id = resolve_protocol_payment_method(payload)
     card = payload.card.model_dump() if payload.card else {}
-    billing = {k: (v or "").strip() for k, v in payload.billing.model_dump().items()}
-    billing = _aligned_billing(billing, normalize_country(order.billing_country), getattr(secrets, "billing", None))
-    billing["country"] = (billing.get("country") or "US").upper()
+    if verified is not None:
+        billing = dict(verified)
+    else:
+        billing = {k: (v or "").strip() for k, v in payload.billing.model_dump().items()}
+        billing = _aligned_billing(billing, normalize_country(order.billing_country), getattr(secrets, "billing", None))
+        billing["country"] = (billing.get("country") or "US").upper()
 
     # custom checkout 的会话 id 有两种：oaics_（ChatGPT 内部）与 cs_live_（Stripe 自定义）。
     # 单看 URL 前缀会漏掉后者，所以以订单的 checkout_kind 为准。
@@ -1389,6 +1520,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 user_agent=getattr(secrets, "user_agent", "") or "",
                 pin_proxy=True,
             )
+            if verified is not None:
+                pp.verified_quote_billing = verified
             pp.credentials_current = credentials_current
             pp.external_pm = pm_id
             try:
@@ -1428,6 +1561,10 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     _set_payment_status(order_id, "processing", summary="支付处理中，请勿重复提交")
     try:
         outcome = await asyncio.to_thread(_run)
+    except ObservedBillingConflict as exc:
+        store.update_status(order_id, OrderStatus.REJECTED)
+        _set_payment_status(order_id, "unpaid", summary=exc.message)
+        raise HTTPException(409, exc.message) from None
     except asyncio.CancelledError:
         # Cancellation cannot retract a confirmation already sent to the provider.
         await _mark_payment_unknown(order)
@@ -1436,7 +1573,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         if exc.code is ErrorCode.PAYMENT_DECLINED:
             store.update_status(order_id, OrderStatus.FAILED)
             _set_payment_status(order_id, "failed")
-            raise _from_domain(exc, session_reissued=view.session_reissued_for_country)
+            raise _from_domain(exc, session_reissued=view.session_reissued_for_country, nonteam=order.plan is not Plan.TEAM)
         await _mark_payment_unknown(order)
         return _protocol_out(order_id, state="unknown", message=PAYMENT_UNCONFIRMED)
     except Exception as exc:

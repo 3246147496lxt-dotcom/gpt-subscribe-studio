@@ -36,7 +36,8 @@ def _configure_proxy(tmp_path, monkeypatch):
     monkeypatch.setenv("GSS_USE_FAKE", "1")
 
 
-def test_create_order_pins_exit_to_target_billing_country(tmp_path, monkeypatch):
+def test_create_order_pins_exit_to_target_billing_country(tmp_path, monkeypatch, verified_payer):
+    verified_payer(country="PH")
     _configure_proxy(tmp_path, monkeypatch)
     store.clear()
     api = TestClient(create_app())

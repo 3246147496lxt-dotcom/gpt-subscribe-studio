@@ -32,7 +32,7 @@ def _legacy_engine(monkeypatch):
 
 
 @pytest.fixture
-def flow(monkeypatch):
+def flow(monkeypatch, verified_payer):
     state = {"calls": [], "violations": [], "account": "account_fixture", "minor": 1363,
              "page_status": "open", "payment_status": "unpaid", "pi_status": "requires_confirmation",
              "after_confirm": "succeeded", "active": True, "closed": 0, "created": 0}
@@ -40,6 +40,7 @@ def flow(monkeypatch):
             "billing": {"name": "Fixture Holder", "email": "fixture@example.test", "line1": "Fixture Street",
                         "city": "Portland", "state": "OR", "postal_code": "97211", "country": "JP"},
             "expected_amount": "1363", "expected_currency": "JPY"}
+    verified_payer(billing=body["billing"])
     checkout_id = "oaics_direct_fixture"
     def record(name, **details):
         state["calls"].append({"name": name, **details})
@@ -76,7 +77,7 @@ def flow(monkeypatch):
         def get(self, url, **kwargs):
             if self.service == "app" and url == APP_BASE + "/backend-api/payments/checkout/openai_llc/" + checkout_id:
                 record("context_get")
-                return response(page())
+                return response({**page(), **state.get("page_echo", {})})
             if self.service == "stripe" and url == STRIPE_BASE + "/v1/elements/sessions":
                 record("elements_get", params=kwargs["params"])
                 assert kwargs["params"]["customer_session_client_secret"] == "cuss_fixture"
@@ -100,7 +101,7 @@ def flow(monkeypatch):
                 assert kwargs["json"]["currency"].lower() == "jpy"
                 value = page()
                 if state.get("missing_total"): value["checkout_state"]["total"].pop("total")
-                return response({"checkout_session": value}, state.get("tax_http", 200))
+                return response({"checkout_session": {**value, **state.get("tax_echo", {})}}, state.get("tax_http", 200))
             if self.service == "app" and url == APP_BASE + "/backend-api/payments/checkout/update_tax_id":
                 record("update_tax_id")
                 assert kwargs["json"] == {"checkout_session_id": checkout_id, "tax_id_info": None}
@@ -445,7 +446,8 @@ def test_final_checkout_total_precedes_subtotal_and_preserves_zero(minor):
 
 @pytest.mark.parametrize("paid", [False, True])
 def test_already_completed_checkout_never_creates_a_second_financial_attempt(flow, paid):
-    flow.state.update(page_status="complete", payment_status="paid" if paid else "unpaid")
+    flow.state.update(page_status="complete", payment_status="paid" if paid else "unpaid",
+                      page_echo={"billing_details": {"name": "different-after-settlement"}})
     result = post(flow)
     assert result["state"] == ("paid" if paid else "unknown")
     assert "token_create" not in names(flow)
@@ -467,3 +469,81 @@ def test_conflicting_currency_fields_never_become_a_valid_quote(minor):
     payload = {"billing_details":{"currency":"USD"},"checkout_state":{"currency":"JPY","total":{"total":{"minorUnitsAmount":minor}}}}
     with pytest.raises(DomainError):
         _checkout_quote(payload, "JPY")
+
+
+@pytest.mark.parametrize("field", ["name", "email", "country", "state", "city", "line1", "postal_code", "line2"])
+def test_bind_rejects_unverified_field_before_initializing_payment(flow, field):
+    # One changed field must not become a new stored snapshot or start a checkout mutation.
+    original = dict(store.view(flow.oid).billing)
+    altered = copy.deepcopy(flow.body)
+    altered["billing"][field] = {"country": "GB", "email": "other@example.invalid"}.get(field, "other-fixture")
+    rejected = flow.api.post(flow.root, json=altered)
+    assert rejected.status_code == 409, rejected.text
+    assert "other-fixture" not in rejected.text and "other@example.invalid" not in rejected.text
+    assert store.view(flow.oid).billing == vault.get(flow.oid).billing == original
+    assert vault.get(flow.oid).saved_card_context is None
+    assert flow.state["created"] == 0 and not names(flow)
+
+
+@pytest.mark.parametrize("source", ["marker", "vault", "reference", "unknown_request_field", "nested_card_claim"])
+def test_bind_fails_closed_on_stale_order_or_unverifiable_claim(flow, source):
+    secrets = vault.get(flow.oid)
+    submitted = copy.deepcopy(flow.body)
+    if source == "marker":
+        store.view(flow.oid).billing_verified = False
+    elif source == "reference":
+        store.view(flow.oid).billing_verification_id = "other-payer-reference"
+    elif source == "vault":
+        secrets.billing = dict(secrets.billing, city="Other City")
+    elif source == "nested_card_claim":
+        submitted["card"]["billing_details"] = {"line1": "shadow address"}
+    else:
+        submitted["billing_address"] = {"line1": "shadow address"}
+    rejected = flow.api.post(flow.root, json=submitted)
+    assert rejected.status_code == 409, rejected.text
+    assert secrets.saved_card_context is None
+    assert flow.state["created"] == 0 and not names(flow)
+    assert get(flow)["state"] == "not_started"
+
+
+def test_local_receipt_after_profile_revocation_requires_no_new_authorization(flow, monkeypatch):
+    paid = post(flow)
+    assert paid["state"] == "paid"
+    before = names(flow)
+    monkeypatch.delenv("GSS_VERIFIED_BILLING_FILE", raising=True)
+    assert get(flow)["receipt"] == paid["receipt"]
+    assert post(flow)["receipt"] == paid["receipt"]
+    assert names(flow) == before
+
+
+@pytest.mark.parametrize("prior_address", [None, {}, {"city": "different"}])
+def test_prepared_payment_without_matching_prior_address_cannot_resume(flow, prior_address):
+    secrets = vault.get(flow.oid)
+    # A historical prepared token was not necessarily created for the payer in the new request.
+    context = {"protocol_flow": True, "protocol_kind": "checkout_v2", "confirmation_token": "ctoken_fixture"}
+    if prior_address is not None:
+        context["protocol_billing"] = prior_address
+    secrets.saved_card_context = context
+    original = dict(context)
+    response = flow.api.post(flow.root, json=flow.body)
+    assert response.status_code == 409
+    assert context == original and secrets.billing == store.view(flow.oid).billing
+    assert not names(flow)
+
+@pytest.mark.parametrize("boundary", ["page_echo", "tax_echo"])
+def test_new_payment_rejects_explicit_conflicting_provider_echo_before_confirmation(flow, boundary):
+    flow.state[boundary] = {"billing_address": {"postal_code": "other-private-code"}}
+    reply = post(flow)
+    assert reply["state"] == "integration_error"
+    assert "other-private-code" not in str(reply)
+    assert reply["order"]["payment_status"] == "unpaid"
+    assert names(flow) == (["context_get"] if boundary == "page_echo" else ["context_get", "taxes"])
+
+
+def test_provider_echo_on_new_open_checkout_does_not_revoke_existing_cash_receipt(flow):
+    paid = post(flow)
+    assert paid["state"] == "paid"
+    flow.state["page_echo"] = {"billing_details": {"name": "changed-after-payment"}}
+    before = names(flow)
+    assert get(flow)["receipt"] == paid["receipt"]
+    assert names(flow) == before

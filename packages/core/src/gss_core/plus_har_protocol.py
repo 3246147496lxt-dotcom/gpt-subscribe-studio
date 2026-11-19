@@ -50,6 +50,7 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 
 from gss_contracts.adapter import PaymentReceiptEvidence
+from .verified_payer import ObservedBillingConflict, check_observed_billing
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.chatgpt import (
     APP_BASE,
@@ -474,6 +475,7 @@ class PlusHarProtocol:
         if status >= 400:
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                               f"创建结账失败 HTTP {status}")
+        check_observed_billing(payload, self.billing)
         self.checkout_id = public_checkout_id(str(payload.get("checkout_session_id") or ""))
         self.publishable_key = str(payload.get("publishable_key") or self.publishable_key)
         self.processor = str(payload.get("processor_entity") or self.processor)
@@ -643,6 +645,7 @@ class PlusHarProtocol:
         payload = _json(response)
         if int(getattr(response, "status_code", 0) or 0) >= 400:
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "读取账单税费失败")
+        check_observed_billing(payload, self.billing)
         session = payload.get("checkout_session") if isinstance(payload.get("checkout_session"), dict) else {}
         if session.get("publishable_key"):
             self.publishable_key = str(session["publishable_key"])
@@ -1113,6 +1116,7 @@ class PlusHarProtocol:
                 out.state = "pending"
                 out.message = "原结账已完成，正在核对订阅"
             return out
+        check_observed_billing(payload, self.billing)
         self.amount_minor = self._total_minor(payload)
         logger.info("plus_har_checkout id=%s status=%s total=%s %s",
                     self.checkout_id, payload.get("status"), self.amount_minor, self.currency)
@@ -1381,6 +1385,8 @@ def run_har_context(
         engine.expected_amount_minor = engine.amount_minor
     try:
         result = engine.pay()
+    except ObservedBillingConflict as exc:
+        return outcome("integration_error", "checkout", exc.message, code=str(exc.code))
     except DomainError as exc:
         declined = str(exc.code) == str(ErrorCode.PAYMENT_DECLINED)
         payload = outcome("card_declined" if declined else "unknown", engine.stage,

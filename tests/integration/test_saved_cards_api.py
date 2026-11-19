@@ -1,10 +1,8 @@
-"""Saved-card setup and checkout refresh contracts; all upstream calls are fake."""
+"""Legacy saved-card writes fail closed. Historical status/receipts remain queryable offline."""
 import asyncio
 import json
-import threading
 
 import httpx
-from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +15,8 @@ from gss_core.vault import vault
 
 
 @pytest.fixture
-def flow(monkeypatch):
+def flow(monkeypatch, verified_payer):
+    verified_payer()
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     store.clear()
     api = TestClient(create_app())
@@ -49,17 +48,8 @@ def flow(monkeypatch):
             return False
         def hydrate(self):
             pass
-        def _publishable_key(self):
-            state["calls"].append("bootstrap")
-            return "pk_test_saved"
         def prepare_setup_intent(self):
-            state["calls"].append("prepare")
-            if state.get("prepare_timeout"):
-                raise TimeoutError("fixture timeout")
-            setup_id = state.get("next_setup_id", "seti_fixture")
-            state["expected_setup_id"] = setup_id
-            state["intent_id"] = setup_id
-            return setup_id, setup_id + "_secret_fixture"
+            pytest.fail("disabled saved-card route called financial provider")
         def retrieve_stripe_intent(self, **kwargs):
             state["calls"].append("retrieve")
             assert kwargs["intent_id"] == state.get("expected_setup_id", "seti_fixture")
@@ -74,16 +64,7 @@ def flow(monkeypatch):
             return SimpleNamespace(status_code=200, json=lambda: {"data": methods})
         def create_checkout(self, **kwargs):
             state["calls"].append(("checkout", kwargs))
-            if state.get("refresh_timeout"):
-                raise TimeoutError("fixture timeout")
-            if state.get("refresh_entered"):
-                state["refresh_entered"].set()
-                assert state["refresh_release"].wait(2), "fixture refresh was not released"
-            return SimpleNamespace(
-                account_id=self.account_id, publishable_key=state["key"], checkout_session_id="oaics_refreshed",
-                checkout_url="https://chatgpt.com/checkout/openai_llc/oaics_refreshed", currency="USD",
-                customer_session_client_secret="cuss_fixture", amount=state.get("new_amount", Decimal("20.00")), checkout_kind="custom", confirm_return_url="",
-            )
+            pytest.fail("disabled saved-card route created a checkout")
         def subscription_payload(self):
             assert self.access_token == "refreshed-fixture-token"
             assert self.account_id == "account_fixture"
@@ -121,16 +102,28 @@ def flow(monkeypatch):
     store.clear()
 
 
-def prepare(flow):
-    api, _, root, _ = flow
-    response = api.post(root + "/prepare")
-    assert response.status_code == 200, response.text
-    return response.json()
+def historical_setup(flow):
+    """In-process records created before the single-payer policy took effect."""
+    secrets = vault.get(flow[1])
+    secrets.saved_card_context = {
+        "account_id": "account_fixture", "publishable_key": "pk_test_saved",
+        "setup_intent_id": "seti_fixture", "client_secret": "seti_fixture_secret_fixture",
+        "prepare_started": True, "state": "requires_payment_method",
+    }
+    return secrets.saved_card_context
 
 
 def saved(flow):
-    prepare(flow)
+    historical_setup(flow)
     flow[3]["setup_status"] = "succeeded"
+
+
+def historical_ready(flow):
+    saved(flow)
+    vault.get(flow[1]).saved_card_context.update(
+        state="checkout_ready", payment_method_id="pm_fixture", card={"brand": "visa", "last4": "4242"},
+        refreshed_checkout_id=store.view(flow[1]).checkout_session_id, customer_id="cus_fixture",
+    )
 
 
 def test_initial_status_does_not_create_setup(flow):
@@ -139,18 +132,22 @@ def test_initial_status_does_not_create_setup(flow):
     assert state["calls"] == []
 
 
-def test_prepare_is_idempotent_and_uses_account_key(flow):
-    first = prepare(flow)
-    second = prepare(flow)
-    assert first == second
-    assert first["publishable_key"] == "pk_test_saved"
-    assert flow[3]["calls"].count("prepare") == 1
-    assert flow[3]["closed"] == 1
+@pytest.mark.parametrize("cached", [False, True])
+def test_prepare_never_issues_or_releases_unscoped_secret(flow, cached):
+    api, oid, root, state = flow
+    if cached:
+        historical_setup(flow)
+    for _ in range(2):
+        response = api.post(root + "/prepare")
+        assert response.status_code == 409
+        assert "seti_fixture_secret" not in response.text
+    assert not state["calls"]
+    assert bool(vault.get(oid).saved_card_context) == cached
 
 
 @pytest.mark.parametrize("status", ["requires_payment_method", "requires_action", "requires_confirmation", "processing", "canceled"])
 def test_incomplete_setup_never_refreshes_checkout(flow, status):
-    prepare(flow)
+    historical_setup(flow)
     api, oid, root, state = flow
     old_url = store.view(oid).checkout_url
     state["setup_status"] = status
@@ -162,7 +159,7 @@ def test_incomplete_setup_never_refreshes_checkout(flow, status):
 
 
 def test_browser_success_flag_cannot_override_server_state(flow):
-    prepare(flow)
+    historical_setup(flow)
     api, _, root, _ = flow
     result = api.post(root + "/refresh-checkout", json={"paid": True, "setup_status": "succeeded", "payment_method_id": "pm_other"})
     assert result.status_code == 409
@@ -188,58 +185,55 @@ def test_mismatched_context_never_counts_as_saved(flow, field, value):
     api, _, root, state = flow
     state[field] = value
     assert api.get(root).status_code == 400
-    assert api.post(root + "/refresh-checkout").status_code == 400
+    assert api.post(root + "/refresh-checkout").status_code == 409
     assert not any(isinstance(call, tuple) for call in state["calls"])
 
 
-def test_refresh_retains_order_and_is_idempotent_without_payment(flow):
-    saved(flow)
+def test_reading_completed_refresh_returns_original_order_without_writes(flow):
+    historical_ready(flow)
     api, oid, root, state = flow
     first = api.post(root + "/refresh-checkout")
     assert first.status_code == 200, first.text
     assert first.json()["order"]["id"] == oid
-    assert first.json()["order"]["checkout_url"].endswith("oaics_refreshed")
+    assert store.view(oid).checkout_url and first.json()["order"]["checkout_url"] is None
     assert first.json()["order"]["status"] == "awaiting_payment"
-    assert first.json()["payment_method_id"] == "pm_fixture"
+    assert "payment_method_id" not in first.json() and first.json()["card"] == {"brand": "visa", "last4": "4242"}
     assert api.post(root + "/refresh-checkout").json() == first.json()
+    assert not state["calls"]
     assert api.get(root).json()["state"] == "checkout_ready"
-    assert len([call for call in state["calls"] if isinstance(call, tuple)]) == 1
     assert vault.get(oid).session == "fixture-session"
 
 
-def test_merchant_key_mismatch_keeps_original_checkout(flow):
+@pytest.mark.parametrize("partial_cache", [False, True])
+def test_new_saved_refresh_cannot_use_opaque_method_or_replace_order(flow, partial_cache):
     saved(flow)
     api, oid, root, state = flow
-    old_url = store.view(oid).checkout_url
-    state["key"] = "pk_test_other_merchant"
-    assert api.post(root + "/refresh-checkout").status_code == 400
-    assert store.view(oid).checkout_url == old_url
-    assert vault.get(oid).saved_card_context["state"] == "saved"
+    assert api.get(root).json()["state"] == "saved"  # same account != verified billing
+    context = vault.get(oid).saved_card_context
+    if partial_cache:
+        context["refreshed_checkout_id"] = "different_checkout"
+    old_url, old_amount = store.view(oid).checkout_url, store.view(oid).amount
+    before = list(state["calls"])
+    for _ in range(2):
+        response = api.post(root + "/refresh-checkout", json={"billing": store.view(oid).billing})
+        assert response.status_code == 409
+    assert store.view(oid).checkout_url == old_url and store.view(oid).amount == old_amount
+    assert context["state"] == "saved"
+    assert state["calls"] == before
 
 
-def test_failed_refresh_preserves_bound_card_and_old_link(flow):
-    saved(flow)
+def test_historical_prepare_unknown_is_not_replayed(flow):
     api, oid, root, state = flow
-    old_url = store.view(oid).checkout_url
-    state["refresh_timeout"] = True
-    assert api.post(root + "/refresh-checkout").status_code == 502
-    assert store.view(oid).checkout_url == old_url
-    assert api.get(root).json()["state"] == "saved"
-
-
-def test_prepare_timeout_is_not_replayed(flow):
-    api, _, root, state = flow
-    state["prepare_timeout"] = True
-    assert api.post(root + "/prepare").status_code == 502
+    vault.get(oid).saved_card_context = {"prepare_started": True}
     assert api.post(root + "/prepare").status_code == 409
     assert api.get(root).json()["state"] == "prepare_unknown"
-    assert state["calls"].count("prepare") == 1
+    assert not state["calls"]
 
 
 def test_payment_submission_waits_for_setup_resolution(flow):
-    prepare(flow)
+    historical_setup(flow)
     api, oid, _, _ = flow
-    body = {"payment_method_id": "pm_fixture", "billing": {"name": "Fixture", "line1": "Fixture Street", "city": "Fixture City", "postal_code": "00000", "country": "US"}}
+    body = {"payment_method_id": "pm_fixture", "billing": dict(store.view(oid).billing)}
     assert api.post(f"/api/orders/{oid}/pay-protocol", json=body).status_code == 409
     assert api.post(f"/api/orders/{oid}/pay", json={"payment_method_token": "pm_fixture"}).status_code == 409
 
@@ -256,55 +250,34 @@ def test_non_card_method_is_not_exposed_as_saved_card(flow):
     api, _, root, state = flow
     state["method_type"] = "us_bank_account"
     assert api.get(root).status_code == 400
-    assert api.post(root + "/refresh-checkout").status_code == 400
+    assert api.post(root + "/refresh-checkout").status_code == 409
 
 
-def test_canceled_setup_can_be_explicitly_prepared_again_after_server_check(flow):
-    original = prepare(flow)
+def test_canceled_setup_cannot_open_a_new_unscoped_setup(flow):
+    historical_setup(flow)
     api, _, root, state = flow
     state["setup_status"] = "canceled"
-    # The browser alone cannot authorize a new setup.
-    assert api.post(root + "/prepare").json()["setup_intent_id"] == original["setup_intent_id"]
     assert api.get(root).json()["state"] == "canceled"
-    state["next_setup_id"] = "seti_second_fixture"
-    state["setup_status"] = "requires_payment_method"
-    new = api.post(root + "/prepare")
-    assert new.status_code == 200
-    assert new.json()["setup_intent_id"] != original["setup_intent_id"]
-    assert state["calls"].count("prepare") == 2
+    before = list(state["calls"])
+    assert api.post(root + "/prepare").status_code == 409
+    assert state["calls"] == before
 
 
-def test_missing_new_quote_does_not_replace_old_checkout_or_cache_failure(flow):
+def test_setup_status_still_rechecks_account_on_session_renewal(flow, monkeypatch):
     saved(flow)
-    api, oid, root, state = flow
-    old_url, old_amount = store.view(oid).checkout_url, store.view(oid).amount
-    state["new_amount"] = None
-    response = api.post(root + "/refresh-checkout")
-    assert response.status_code == 400
-    assert store.view(oid).checkout_url == old_url
-    assert store.view(oid).amount == old_amount
-    assert not vault.get(oid).saved_card_context.get("refreshed_checkout_id")
-    state["new_amount"] = Decimal("0.00")
-    retried = api.post(root + "/refresh-checkout")
-    assert retried.status_code == 200
-    assert retried.json()["order"]["amount"] == "0.00"
-
-
-def test_session_renewal_rechecks_account_for_setup_status_and_refresh(flow, monkeypatch):
     api, _, root, state = flow
     state["account"] = "expired_account_snapshot"
     state["renew_session"] = True
     monkeypatch.setattr("gss_core.saved_cards.jwt_account_id", lambda token: "account_fixture")
-    prepare(flow)
-    state["setup_status"] = "succeeded"
     assert api.get(root).json()["state"] == "saved"
-    assert api.post(root + "/refresh-checkout").status_code == 200
-    assert state["calls"].index("refresh_session") < state["calls"].index("bootstrap")
-    assert state["calls"].count("refresh_session") >= 3
+    assert state["calls"].index("refresh_session") < state["calls"].index("retrieve")
+    before = list(state["calls"])
+    assert api.post(root + "/refresh-checkout").status_code == 409
+    assert state["calls"] == before
 
 
 def test_verify_during_setup_preserves_awaiting_payment(flow):
-    prepare(flow)
+    historical_setup(flow)
     api, oid, root, state = flow
     state["setup_status"] = "requires_action"
     assert api.get(root).json()["state"] == "requires_action"
@@ -316,7 +289,7 @@ def test_verify_during_setup_preserves_awaiting_payment(flow):
 
 @pytest.mark.parametrize("paid", [False, True])
 def test_verify_before_official_payment_never_closes_refreshed_checkout(flow, paid):
-    saved(flow)
+    historical_ready(flow)
     api, oid, root, _ = flow
     assert api.post(root + "/refresh-checkout").status_code == 200
     response = api.post(f"/api/orders/{oid}/verify?paid={str(paid).lower()}")
@@ -328,7 +301,7 @@ def test_verify_before_official_payment_never_closes_refreshed_checkout(flow, pa
 
 
 def test_account_activation_alone_does_not_deliver_saved_checkout(flow):
-    saved(flow)
+    historical_ready(flow)
     api, oid, root, state = flow
     assert api.post(root + "/refresh-checkout").status_code == 200
     state["verify_active"] = True
@@ -342,29 +315,29 @@ def test_account_activation_alone_does_not_deliver_saved_checkout(flow):
     assert state["calls"].count("verify_subscription") == 1
 
 
-def test_refresh_and_verify_share_the_same_order_lock(flow):
-    saved(flow)
+def test_historical_refresh_and_verify_serialize_and_never_create_checkout(flow):
+    from gss_api.routers.orders import _team_locks
+    historical_ready(flow)
     api, oid, root, state = flow
-    state["refresh_entered"] = threading.Event()
-    state["refresh_release"] = threading.Event()
     async def run():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://testserver") as client:
-            refresh = asyncio.create_task(client.post(root + "/refresh-checkout"))
-            assert await asyncio.to_thread(state["refresh_entered"].wait, 2)
-            verify = asyncio.create_task(client.post(f"/api/orders/{oid}/verify"))
-            await asyncio.sleep(0)
-            assert not verify.done()
-            state["refresh_release"].set()
+            lock = _team_locks.setdefault(oid, asyncio.Lock())
+            async with lock:
+                refresh = asyncio.create_task(client.post(root + "/refresh-checkout"))
+                verify = asyncio.create_task(client.post(f"/api/orders/{oid}/verify"))
+                await asyncio.sleep(0)
+                assert not verify.done() and not refresh.done()
             refreshed, checked = await asyncio.gather(refresh, verify)
             assert refreshed.status_code == checked.status_code == 200
             assert checked.json()["status"] == "awaiting_payment"
     asyncio.run(run())
     assert store.get_order(oid).status is OrderStatus.AWAITING_PAYMENT
     assert vault.get(oid).saved_card_context["state"] == "checkout_ready"
+    assert not any(isinstance(call, tuple) for call in state["calls"])
 
 
 def test_final_verify_uses_renewed_session_and_preserves_account_context(flow, monkeypatch):
-    saved(flow)
+    historical_ready(flow)
     api, oid, root, state = flow
     assert api.post(root + "/refresh-checkout").status_code == 200
     state["account"] = "expired_account_snapshot"
@@ -380,7 +353,7 @@ def test_final_verify_uses_renewed_session_and_preserves_account_context(flow, m
 
 
 def test_final_verify_rejects_changed_account_before_subscription_lookup(flow):
-    saved(flow)
+    historical_ready(flow)
     api, oid, root, state = flow
     assert api.post(root + "/refresh-checkout").status_code == 200
     state["account"] = "other_account"
@@ -392,7 +365,7 @@ def test_final_verify_rejects_changed_account_before_subscription_lookup(flow):
 
 def test_final_verify_real_account_adapter_receives_refreshed_credentials(flow, monkeypatch):
     from gss_account.adapter import UpstreamAccountAdapter
-    saved(flow)
+    historical_ready(flow)
     api, oid, root, state = flow
     assert api.post(root + "/refresh-checkout").status_code == 200
     state["account"] = "expired_account_snapshot"

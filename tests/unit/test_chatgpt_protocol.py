@@ -344,7 +344,8 @@ class _PromoHttp(_FakeHttp):
         ("text/html", {}, "html", "unknown"),
     ],
 )
-def test_checkout_401_records_safe_diagnostics(monkeypatch, caplog, content_type, payload, expected_kind, expected_code):
+def test_checkout_401_records_safe_diagnostics(monkeypatch, caplog, content_type, payload, expected_kind, expected_code, verified_payer):
+    verified_payer("PH")
     http = _FakeHttp("")
     response = _FakeResponse(status_code=401, text="private-diagnostic-marker", payload=payload)
     response.headers = {"Content-Type": content_type}
@@ -418,6 +419,7 @@ def test_promo_eligibility_uses_versioned_endpoint() -> None:
     assert request["headers"]["x-openai-target-path"] == ACCOUNTS_CHECK_PATH
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_create_checkout_sends_selected_personal_campaign(monkeypatch: pytest.MonkeyPatch) -> None:
     _mint_stub(monkeypatch)
     client = ChatGPTClient.from_raw_session(_jwt("acct-campaign"))
@@ -493,6 +495,7 @@ class _StripeHttp:
         return _FakeResponse(payload={})
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_create_checkout_sends_sentinel(monkeypatch: pytest.MonkeyPatch) -> None:
     flows: list[str] = []
 
@@ -528,6 +531,7 @@ def test_create_checkout_sends_sentinel(monkeypatch: pytest.MonkeyPatch) -> None
     assert "plan_type=plus" in created.confirm_return_url
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_create_checkout_maps_pro_max_to_chatgptpromax(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "gss_core.chatgpt.mint",
@@ -548,7 +552,8 @@ def test_create_checkout_maps_pro_max_to_chatgptpromax(monkeypatch: pytest.Monke
     assert "plan_type=promax" in created.confirm_return_url
 
 
-def test_create_checkout_jp_uses_openai_llc(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_checkout_jp_uses_openai_llc(monkeypatch: pytest.MonkeyPatch, verified_payer) -> None:
+    verified_payer("JP")
     monkeypatch.setattr(
         "gss_core.chatgpt.mint",
         lambda **kwargs: {
@@ -681,6 +686,7 @@ def test_create_checkout_team_survives_missing_publishable_key(monkeypatch: pyte
     assert "pay.openai.com/c/pay/" in created.checkout_url
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_create_checkout_custom_without_publishable_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _mint_stub(monkeypatch)
     client = ChatGPTClient.from_raw_session(_jwt("acct-nopk"))
@@ -698,6 +704,7 @@ def test_stripe_verify_url_matches_har_return_url() -> None:
     assert "plan_type=prolite" in url
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_create_checkout_maps_go_to_chatgptgoplan(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "gss_core.chatgpt.mint",
@@ -717,7 +724,8 @@ def test_create_checkout_maps_go_to_chatgptgoplan(monkeypatch: pytest.MonkeyPatc
     assert "plan_type=go" in created.confirm_return_url
 
 
-def test_create_checkout_maps_go_lite_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_checkout_maps_go_lite_plan(monkeypatch: pytest.MonkeyPatch, verified_payer) -> None:
+    verified_payer("JP")
     monkeypatch.setattr(
         "gss_core.chatgpt.mint",
         lambda **kwargs: {
@@ -736,6 +744,7 @@ def test_create_checkout_maps_go_lite_plan(monkeypatch: pytest.MonkeyPatch) -> N
     assert client._http.posts[0]["json"]["billing_details"]["currency"] == "JPY"
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_create_checkout_fails_closed_without_sentinel(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("gss_core.chatgpt.mint", lambda **kwargs: {})
     client = ChatGPTClient.from_raw_session(_jwt("acct-sentinel"))
@@ -758,6 +767,7 @@ def _allow_sentinel(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_create_checkout_prefers_oaics_when_cs_live_is_also_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1100,58 +1110,52 @@ def test_quote_parses_nested_checkout_session_tax_response() -> None:
     assert amount == Decimal("982.14")
 
 
-def test_create_checkout_recalculates_ph_price_with_us_billing(monkeypatch, caplog) -> None:
-    from types import SimpleNamespace
+def test_conflicting_checkout_country_stops_before_any_request(monkeypatch, verified_us_payer) -> None:
+    from unittest.mock import Mock
 
-    checkout_payload = {
-        "checkout_session_id": "oaics_fixture",
-        "url": "https://chatgpt.com/checkout/openai_llc/oaics_fixture",
-        "publishable_key": "pk_test_fixture",
-        "currency": "php",
-        "checkout_state": {
-            "currency": "php",
-            "total": {"total": {"minorUnitsAmount": 110000}},
-        },
-    }
-    tax_payload = {
-        "using_automatic_tax": True,
-        "checkout_session": {
-            "checkout_state": {
-                "currency": "php",
-                "total": {"total": {"minorUnitsAmount": 98214}},
-            }
-        },
-    }
+    http = Mock()
+    client = ChatGPTClient("fixture-token", account_id="fixture-account", _http=http)
+    prepare = Mock()
+    monkeypatch.setattr(client, "prepare_risk", prepare)
+    with pytest.raises(DomainError) as exc:
+        client.create_checkout(plan="plus", country="PH", billing_country="US", verified_billing=verified_us_payer)
+    assert exc.value.code is ErrorCode.BILLING_COUNTRY_MISMATCH
+    prepare.assert_not_called()
+    assert not http.mock_calls
 
-    def response(status, payload):
-        return SimpleNamespace(
-            status_code=status,
-            text=json.dumps(payload),
-            url="https://chatgpt.com/fixture",
-            json=lambda: payload,
-        )
 
-    class FakeHttp:
-        def __init__(self):
-            self.headers = {}
+def test_checkout_tax_quote_submits_exact_verified_address(monkeypatch, verified_us_payer) -> None:
+    http = _FakeHttp("")
+    client = ChatGPTClient("fixture-token", account_id="fixture-account", _http=http)
+    monkeypatch.setattr(client, "prepare_risk", lambda **kwargs: None)
+    client.create_checkout(plan="plus", country="US", billing_country="US", verified_billing=verified_us_payer)
+    body, = [post["json"] for post in http.posts if post["url"].endswith("/checkout/taxes")]
+    assert body["billing_name"] == verified_us_payer["name"]
+    assert body["billing_country"] == verified_us_payer["country"]
+    assert body["billing_address"] == {key: verified_us_payer[key] for key in (
+        "line1", "city", "state", "postal_code", "country",
+    )}
 
+
+@pytest.mark.parametrize("boundary", ["create", "quote", "taxes"])
+def test_provider_billing_echo_vetoes_checkout_without_another_request(monkeypatch, verified_us_payer, boundary):
+    calls = []
+    echo = {"checkout_session": {"billing_details": {"address": {"line1": "foreign-private-address"}}}}
+
+    class Http(_FakeHttp):
         def get(self, url, **kwargs):
-            return response(404, {})
+            calls.append("quote")
+            return _FakeResponse(payload=echo if boundary == "quote" else {})
 
         def post(self, url, **kwargs):
-            if url.endswith("/backend-api/payments/checkout"):
-                return response(200, checkout_payload)
-            if url.endswith("/backend-api/payments/checkout/taxes"):
-                return response(200, tax_payload)
-            return response(404, {})
+            stage = "taxes" if url.endswith("/taxes") else "create"
+            calls.append(stage)
+            return _FakeResponse(payload={**self.payload, **(echo if stage == boundary else {})})
 
-    client = ChatGPTClient("tok", account_id="acct", _http=FakeHttp())
+    client = ChatGPTClient("fixture-token", account_id="fixture-account", _http=Http(""))
     monkeypatch.setattr(client, "prepare_risk", lambda **kwargs: None)
-    with caplog.at_level("INFO"):
-        checkout = client.create_checkout(
-            plan="plus", country="PH", billing_country="US"
-        )
-    assert checkout.currency == "PHP"
-    assert checkout.amount == Decimal("982.14")
-    assert "checkout_tax_recalc exit_country=PH billing_country=US" in caplog.text
-    assert "before=1100.00 after=982.14" in caplog.text
+    with pytest.raises(DomainError) as exc:
+        client.create_checkout(plan="plus", country="US", verified_billing=verified_us_payer)
+    assert exc.value.code is ErrorCode.BILLING_COUNTRY_MISMATCH
+    assert "foreign-private-address" not in str(exc.value)
+    assert calls[-1] == boundary and calls.count(boundary) == 1

@@ -20,6 +20,8 @@ class OrderView:
     publishable_key: Optional[str] = None
     customer_session_client_secret: Optional[str] = None
     billing: Optional[Dict[str, str]] = None
+    billing_verified: bool = False
+    billing_verification_id: Optional[str] = field(default=None, repr=False)
     amount: Optional[str] = None
     currency: Optional[str] = None
     last_error: Optional[str] = None

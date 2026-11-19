@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from gss_contracts.errors import DomainError, ErrorCode
-from gss_core.billing import address_for
+from gss_core.verified_payer import checkout_address, check_observed_billing
 from gss_core.config import ORDER_HTTP_TIMEOUT_S
 from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.money import quote_from_payload
@@ -1008,11 +1008,13 @@ class ChatGPTClient:
         workspace_name: str = "",
         seat_quantity: int = 5,
         price_interval: str = "month",
+        verified_billing: Optional[Dict[str, str]] = None,
     ) -> CheckoutSession:
         country = country.upper()
         tax_country = (billing_country or country).upper()
         currency = currency_for(country)
         hosted = str(plan) == "team"
+        billing = None if hosted else checkout_address(country, tax_country, verified_billing)
         campaign_id = str(promo_campaign_id or "").strip()[:120]
         page_url = (
             f"{APP_BASE}/?promo_campaign={quote(campaign_id or 'plus-1-month-free', safe='')}"
@@ -1050,6 +1052,8 @@ class ChatGPTClient:
         if response_status >= 400:
             self._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "创建结账")
         payload = _json(response)
+        if billing is not None:
+            check_observed_billing(payload, billing)
         raw_url = str(payload.get("url") or payload.get("checkout_url") or "").strip()
         checkout_id = public_checkout_id(
             payload.get("checkout_session_id") or payload.get("session_id") or payload.get("id") or ""
@@ -1097,11 +1101,10 @@ class ChatGPTClient:
         tax_delta: Optional[Decimal] = None
         if not hosted:
             refreshed, refreshed_currency = self._quote_from_context(
-                processor=processor, checkout_id=session_id, page_url=page, currency=quote_currency or currency
+                processor=processor, checkout_id=session_id, page_url=page, currency=quote_currency or currency, billing=billing
             )
             if refreshed is not None:
                 amount, quote_currency = refreshed, refreshed_currency
-            billing = address_for(tax_country)
             before_tax = amount
             taxed, taxed_currency = self._quote_from_taxes(
                 checkout_id=session_id,
@@ -1162,7 +1165,7 @@ class ChatGPTClient:
         return key
 
     def _quote_from_context(
-        self, *, processor: str, checkout_id: str, page_url: str, currency: str
+        self, *, processor: str, checkout_id: str, page_url: str, currency: str, billing: dict
     ) -> tuple[Optional[Decimal], str]:
         entities: list[str] = []
         for entity in (processor, "openai_llc", "openai_ie"):
@@ -1182,7 +1185,9 @@ class ChatGPTClient:
             if int(getattr(response, "status_code", 0) or 0) >= 400:
                 _log_upstream_failure(route, response, level=logging.INFO)
                 continue
-            amount, found = quote_from_payload(_json(response), currency)
+            payload = _json(response)
+            check_observed_billing(payload, billing)
+            amount, found = quote_from_payload(payload, currency)
             if amount is not None:
                 return amount, found or currency
         return None, currency
@@ -1213,7 +1218,10 @@ class ChatGPTClient:
         if int(getattr(response, "status_code", 0) or 0) >= 400:
             _log_upstream_failure("/backend-api/payments/checkout/taxes", response, level=logging.INFO)
             return None, currency
-        return quote_from_payload(_json(response), currency)
+        payload = _json(response)
+        if billing is not None:
+            check_observed_billing(payload, billing)
+        return quote_from_payload(payload, currency)
 
     def prepare_setup_intent(self) -> tuple[str, str]:
         if not self.account_id:

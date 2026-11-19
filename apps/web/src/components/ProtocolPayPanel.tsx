@@ -18,6 +18,7 @@ import {
 import { IconAlertCircle, IconCheck, IconClock, IconX } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 
+import { FixedPayerBilling, verifiedPayerBilling } from "./FixedPayerBilling";
 import { CheckoutLinkCard } from "./CheckoutLinkCard";
 import { PlusProtocolPayPanel } from "./PlusProtocolPayPanel";
 import { StripeCardFields, type StripeCardHandle } from "../card-payment/CardFields";
@@ -27,6 +28,8 @@ import { FIXED_TAX_FREE_BILLING, randomBillingExample } from "../card-payment/bi
 
 interface Props {
   orderId: string;
+  teamOrder?: boolean;
+  billingVerified?: boolean;
   bindBeforePay?: boolean;
   browserPayment?: boolean;
   submissionDisabled?: boolean;
@@ -43,7 +46,7 @@ interface Props {
   checkoutUrl?: string | null;
   /** 从 accessToken 解析出的账户邮箱，用于预填账单邮箱 */
   sessionEmail?: string | null;
-  /** 建单时后端生成的免税州账单地址；有它就不再要求用户手填 */
+  /** Non-Team consumers must also require the server-provided billingVerified flag. */
   billing?: BillingInput | null;
   /** 订单是否带优惠活动：带的话浏览器 pm_ 要声明 allow_redisplay */
   requireSaveChoice?: boolean;
@@ -132,12 +135,13 @@ const STEPS = [
 function LegacyProtocolPayPanel({
   orderId, country, amount, currency, quotationError, exitLabel, sessionEmail, billing: billingDefaults,
   publishableKey, pmMode, onPmMode, requireSaveChoice = false,
-  checkoutUrl, disabled, submissionDisabled, browserPayment = false, onBusyChange, onDone, onRefreshQuote,
-}: Props) {
+  checkoutUrl, disabled, submissionDisabled, browserPayment = false, onBusyChange, onDone, onRefreshQuote, fixedBilling,
+}: Props & { fixedBilling?: BillingInput }) {
   const [card, setCard] = useState<CardDraft>(EMPTY_CARD);
   // 账单地址在五个免税州里随机生成（避免每次同一地址）；
   // 邮箱优先用 accessToken 里解析出的账户邮箱。
-  const [billing, setBilling] = useState<BillingInput>(() => {
+  const [teamBilling, setBilling] = useState<BillingInput>(() => {
+    if (fixedBilling) return fixedBilling;
     const source = billingDefaults ?? FIXED_TAX_FREE_BILLING;
     const base: BillingInput = {
       email: (sessionEmail ?? "").trim(),
@@ -150,6 +154,7 @@ function LegacyProtocolPayPanel({
     };
     return base;
   });
+  const billing = fixedBilling ?? teamBilling;
   // 取 pm_ 的方式由上层持有（提链前就能选），这里只保留输入框句柄
   const [stripeCard, setStripeCard] = useState<StripeCardHandle | null>(null);
   const [proxy, setProxy] = useState("");
@@ -204,7 +209,7 @@ function LegacyProtocolPayPanel({
       if (!billing.state.trim()) return setError(`${billing.country} 账单地址必须填州/省。`);
     }
 
-    const payloadBilling = { ...billing, country: (billing.country || "US").toUpperCase() };
+    const payloadBilling = fixedBilling ?? { ...billing, country: (billing.country || "US").toUpperCase() };
     const shared = { billing: payloadBilling, proxy: proxy.trim() || undefined, steps };
 
     // ── 方式一：浏览器 Stripe 输入框换 pm_ ──────────────
@@ -313,9 +318,9 @@ function LegacyProtocolPayPanel({
         )}
       </Paper>
 
-      {!browserPayment && <CheckoutLinkCard url={checkoutUrl} />}
+      {!browserPayment && !fixedBilling && <CheckoutLinkCard url={checkoutUrl} />}
 
-      {browserPayment ? <Alert color="blue">输入框模式：卡号只进入 Stripe 安全输入框，浏览器取得支付方式后由服务端确认付款。</Alert> : <><Alert color="blue" variant="light" icon={<IconAlertCircle size={18} />} title="两种提交方式">
+      {fixedBilling ? null : browserPayment ? <Alert color="blue">输入框模式：卡号只进入 Stripe 安全输入框，浏览器取得支付方式后由服务端确认付款。</Alert> : <><Alert color="blue" variant="light" icon={<IconAlertCircle size={18} />} title="两种提交方式">
         <Text size="xs">
           <b>协议提交</b>：卡号发到本服务，服务端直接向 Stripe 换 pm_。可批量、无人值守，
           卡号不落库、不打日志。
@@ -379,7 +384,7 @@ function LegacyProtocolPayPanel({
         </Paper>
       )}
 
-      <Paper withBorder p="md" radius="md">
+      {fixedBilling ? <FixedPayerBilling billing={fixedBilling} /> : <Paper withBorder p="md" radius="md">
         <Stack gap="sm">
           <Group justify="space-between">
             <Text fw={600}>账单地址</Text>
@@ -422,7 +427,7 @@ function LegacyProtocolPayPanel({
               maxLength={2} disabled={busy || disabled || (browserPayment && paymentSubmitted)} />
           </SimpleGrid>
         </Stack>
-      </Paper>
+      </Paper>}
 
       {!browserPayment && <><Paper withBorder p="md" radius="md">
         <Stack gap="xs">
@@ -502,9 +507,9 @@ function LegacyProtocolPayPanel({
         <Alert color={view.color} variant="light" icon={view.icon} title={view.title} role="status">
           <Stack gap={6}>
             <Text size="sm">{view.hint}</Text>
-            <Code block style={{ fontSize: 12 }}>
+            {!fixedBilling && <Code block style={{ fontSize: 12 }}>
               {JSON.stringify(result, null, 2)}
-            </Code>
+            </Code>}
           </Stack>
         </Alert>
       )}
@@ -514,5 +519,13 @@ function LegacyProtocolPayPanel({
 }
 
 export function ProtocolPayPanel(props: Props) {
-  return props.bindBeforePay ? <PlusProtocolPayPanel {...props} /> : <LegacyProtocolPayPanel {...props} />;
+  if (props.teamOrder) return <LegacyProtocolPayPanel {...props} />;
+  const billing = verifiedPayerBilling(props.billingVerified, props.billing);
+  if (!billing) return <Alert color="orange" role="alert">未取得完整的已核验付款方账单。不能提交付款，请先核对原订单。</Alert>;
+  if (props.browserPayment || props.pmMode === "stripe") {
+    return <Stack><FixedPayerBilling billing={billing} /><Alert color="orange" role="alert">
+      浏览器支付标识不能核验其账单归属，此方式不可用。
+    </Alert></Stack>;
+  }
+  return props.bindBeforePay ? <PlusProtocolPayPanel {...props} billing={billing} /> : <LegacyProtocolPayPanel {...props} fixedBilling={billing} />;
 }

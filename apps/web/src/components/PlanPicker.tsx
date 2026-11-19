@@ -84,19 +84,23 @@ export function PlanPicker({ plan, onPlan, country, onCountry, team, onTeam, dis
         </div>
       )}
 
-      <Select
-        label={family === "team" ? "创建结账地区" : "地区"}
-        description={family === "team"
-          ? "决定结账币种；可选择埃及（EG / EGP），支付账单国家单独填写。"
-          : "用于创建结账并对齐出口代理。"}
-        placeholder="请选择"
-        searchable
-        withAsterisk
-        data={REGIONS.map((item) => ({ value: item.code, label: `${item.label} (${item.code})` }))}
-        value={country || null}
-        onChange={(value) => onCountry(value ?? "")}
-        disabled={disabled}
-      />
+      {family === "team" ? (
+        <Select
+          label="创建结账地区"
+          description="决定结账币种；可选择埃及（EG / EGP），支付账单国家单独填写。"
+          placeholder="请选择"
+          searchable
+          withAsterisk
+          data={REGIONS.map((item) => ({ value: item.code, label: `${item.label} (${item.code})` }))}
+          value={country || null}
+          onChange={(value) => onCountry(value ?? "")}
+          disabled={disabled}
+        />
+      ) : (
+        <Text size="sm" role="note" data-testid="fixed-order-billing-country">
+          账单国家由服务端使用付款方已核验的固定账单确定，不可编辑。
+        </Text>
+      )}
 
       {family === "team" && (
         <Paper withBorder p={compact ? "sm" : "md"} radius="md">

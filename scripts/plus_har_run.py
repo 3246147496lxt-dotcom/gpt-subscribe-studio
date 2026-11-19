@@ -23,6 +23,11 @@ Example:
 """
 from __future__ import annotations
 
+# Standalone checkout/probing has no verified payer binding from the order service.
+if __name__ == "__main__":
+    raise SystemExit("非 Team 独立写入入口已关闭：请使用绑定了已核验账单的原订单。")
+
+
 import json
 import logging
 import os
@@ -103,7 +108,3 @@ def main() -> None:
         "message": outcome.message,
         "payment_method_id": outcome.payment_method_id,
     }, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()

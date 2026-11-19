@@ -500,3 +500,29 @@ def test_outcome_from_payment_carries_intent_id():
     )
     assert payload["payment_intent_id"] == "pi_test_123"
     assert payload["intent_status"] == "succeeded"
+
+
+@pytest.mark.parametrize("boundary", ["create", "read", "taxes"])
+def test_existing_response_billing_conflict_stops_before_confirmation(monkeypatch, boundary):
+    from gss_contracts.errors import DomainError, ErrorCode
+
+    engine = build_harness()
+    if boundary == "create":
+        engine.checkout_id = ""
+    original = engine._app
+
+    def app(method, route, **kwargs):
+        reply = original(method, route, **kwargs)
+        at = ("create" if method == "POST" and route.endswith("/checkout") else
+              "taxes" if route.endswith("/taxes") else
+              "read" if method == "GET" and "/checkout/" in route else None)
+        if at == boundary:
+            reply = FakeResponse({**reply.json(), "billing_details": {"country": "FR"}})
+        return reply
+
+    monkeypatch.setattr(engine, "_app", app)
+    with pytest.raises(DomainError) as exc:
+        engine.pay()
+    assert exc.value.code is ErrorCode.BILLING_COUNTRY_MISMATCH
+    assert not engine.confirmation_started
+    assert not any("/confirm" in route for _method, route, _body in engine.app.calls)

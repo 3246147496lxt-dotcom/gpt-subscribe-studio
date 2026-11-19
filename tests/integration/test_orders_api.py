@@ -17,6 +17,7 @@ from gss_api.store import store
 from gss_core.vault import vault
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_session_and_card_token_deliver() -> None:
     store.clear()
     vault.drop("unused")
@@ -44,7 +45,7 @@ def test_session_and_card_token_deliver() -> None:
     assert body["amount"] == "20.00"
     order_id = body["id"]
 
-    paid = client.post(f"/api/orders/{order_id}/pay", json={"payment_method_token": "pm_fake"})
+    paid = client.post(f"/api/orders/{order_id}/pay", json={"payment_method_token": "offline-verified-instrument"})
     assert paid.status_code == 200, paid.text
     assert paid.json()["status"] == "delivered"
     assert paid.json()["subscription"]["active"] is True
@@ -64,6 +65,7 @@ def test_promo_eligibility_is_read_only_and_returns_campaign() -> None:
     assert store.orders == {}
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_plus_campaign_id_is_carried_into_promo_checkout(monkeypatch) -> None:
     store.clear()
     monkeypatch.setenv("GSS_ENABLE_PROMO", "1")
@@ -212,7 +214,8 @@ def _create_us_order(client: TestClient) -> str:
     return created.json()["id"]
 
 
-def test_pay_uses_manual_billing_address() -> None:
+def test_pay_rejects_different_address_in_same_country(verified_payer) -> None:
+    profile = verified_payer()
     store.clear()
     client = TestClient(create_app())
     order_id = _create_us_order(client)
@@ -230,12 +233,13 @@ def test_pay_uses_manual_billing_address() -> None:
         json={"payment_method_token": "pm_fake", "billing": manual},
     )
 
-    assert paid.status_code == 200, paid.text
-    assert paid.json()["billing"]["line1"] == "1 Main St"
-    assert paid.json()["billing"]["country"] == "US"
+    assert paid.status_code == 409, paid.text
+    assert vault.get(order_id).billing == profile
+    assert store.view(order_id).payment_status == "unpaid"
 
 
-def test_pay_aligns_billing_to_order_country() -> None:
+def test_pay_rejects_different_country_without_replacement(verified_payer) -> None:
+    profile = verified_payer()
     store.clear()
     client = TestClient(create_app())
     order_id = _create_us_order(client)
@@ -255,11 +259,11 @@ def test_pay_aligns_billing_to_order_country() -> None:
         },
     )
 
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "delivered"
-    assert resp.json()["billing"]["country"] == "US"
-    assert resp.json()["billing_country"] == "US"
-    assert resp.json()["currency"] == "USD"
+    assert resp.status_code == 409, resp.text
+    snapshot = client.get(f"/api/orders/{order_id}").json()
+    assert snapshot["status"] == "awaiting_payment"
+    assert snapshot["billing"] == profile
+    assert snapshot["currency"] == "USD"
 
 
 _JWE = (
@@ -283,6 +287,7 @@ def _order_with_session(client: TestClient, session: str):
     )
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_session_token_only_is_exchanged_before_checkout(monkeypatch) -> None:
     from gss_core.chatgpt import ChatGPTClient
 
@@ -303,6 +308,7 @@ def test_session_token_only_is_exchanged_before_checkout(monkeypatch) -> None:
     assert '"accessToken": "exchanged-at"' in vault.get(created.json()["id"]).session
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_expired_session_token_is_rejected(monkeypatch) -> None:
     from gss_core.chatgpt import ChatGPTClient
 
@@ -346,7 +352,8 @@ def test_checkout_effective_proxy_is_kept_only_in_memory(monkeypatch):
 
 
 @pytest.mark.parametrize("checkout_country,billing_country,currency", [("EG", "US", "EGP"), ("US", "JP", "USD")])
-def test_plus_input_payment_aligns_billing_to_checkout_country(monkeypatch, checkout_country, billing_country, currency):
+def test_plus_payment_rejects_conflicting_country(monkeypatch, checkout_country, billing_country, currency, verified_payer):
+    profile = verified_payer(country=checkout_country)
     from gss_api.runtime import build_pipeline
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     pipeline = build_pipeline()
@@ -356,25 +363,26 @@ def test_plus_input_payment_aligns_billing_to_checkout_country(monkeypatch, chec
     created = client.post("/api/orders", json={"plan": "plus", "billing_country": checkout_country, "session": "fixture-session"})
     assert created.status_code == 201, created.text
     body = created.json()
-    address = {"name": "Fixture User", "line1": "Fixture Street", "city": "Fixture City", "state": "OR", "postal_code": "97005", "country": billing_country}
+    address = {**profile, "country": billing_country}
     response = client.post(f"/api/orders/{body['id']}/pay", json={"payment_method_token": "pm_fixture", "billing": address})
-    assert response.status_code == 200, response.text
-    result = response.json()
-    assert result["status"] == "delivered"
+    assert response.status_code == 409, response.text
+    assert not pipeline.deps.payment.calls
+    result = client.get(f"/api/orders/{body['id']}").json()
+    assert result["status"] == "awaiting_payment"
     assert result["billing_country"] == checkout_country
     assert result["currency"] == currency
-    assert result["billing"]["country"] == checkout_country
-    request = pipeline.deps.payment.calls[0]
-    assert request.country == checkout_country
-    assert request.billing["country"] == checkout_country
+    assert result["billing"] == profile
 
 
 @pytest.mark.parametrize("plan", ["plus", "team"])
 @pytest.mark.parametrize("failure", ["domain", "transport", "unclassified"])
-def test_unknown_payment_is_not_a_failure_and_cannot_be_resubmitted(monkeypatch, plan, failure):
+def test_unknown_payment_is_not_a_failure_and_cannot_be_resubmitted(monkeypatch, plan, failure, verified_payer):
     """A lost confirmation reply proves neither failure nor a safe second charge."""
     from gss_api.routers import orders
     from gss_contracts.errors import DomainError, ErrorCode
+
+    if plan != "team":
+        verified_payer()
 
     store.clear()
     monkeypatch.setenv("GSS_USE_FAKE", "1")
@@ -401,7 +409,7 @@ def test_unknown_payment_is_not_a_failure_and_cannot_be_resubmitted(monkeypatch,
         monkeypatch.setattr(pipeline, "pay", pay)
         monkeypatch.setattr(orders, "build_pipeline", lambda: pipeline)
         monkeypatch.setattr(orders, "notify_order_update", notify)
-        request = {"payment_method_token": "pm_fake"}
+        request = {"payment_method_token": "pm_fake" if plan == "team" else "offline-verified-instrument"}
         response = client.post(f"{path}/pay", json=request)
         repeated = client.post(f"{path}/pay", json=request)
         pay.assert_awaited_once()
@@ -428,6 +436,7 @@ def test_unknown_payment_is_not_a_failure_and_cannot_be_resubmitted(monkeypatch,
         store.clear()
 
 @pytest.mark.parametrize("outcome", ["timeout", "ambiguous"])
+@pytest.mark.usefixtures("verified_us_payer")
 def test_protocol_payment_unknown_blocks_all_further_confirmation(monkeypatch, outcome):
     """The second payment endpoint shares the same no-replay rule as /pay."""
     from gss_api.routers import orders
@@ -448,9 +457,12 @@ def test_protocol_payment_unknown_blocks_all_further_confirmation(monkeypatch, o
             protocol.pay_from_url.side_effect = TimeoutError("private transport detail")
         else:
             protocol.pay_from_url.return_value = PaymentOutcome(state="unknown", message="未扣款")
-        monkeypatch.setattr(orders, "PlusProtocol", lambda **kwargs: protocol)
+        monkeypatch.setattr(orders, "PlusHarProtocol", lambda **kwargs: protocol)
         store.view(oid).checkout_kind = "custom"
-        body = {"payment_method_id": "pm_fixture", "billing": created.json()["billing"]}
+        body = {
+            "card": {"number": "0"*16, "cvc": "000", "exp_month": "12", "exp_year": "33"},
+            "billing": created.json()["billing"],
+        }
         resp = client.post(f"{path}/pay-protocol", json=body)
         assert resp.status_code == 200, resp.text
         assert resp.json()["state"] == "unknown"

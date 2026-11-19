@@ -9,9 +9,9 @@ from gss_contracts import CheckoutRequest, BillingMode, Plan
 from gss_contracts.errors import DomainError, ErrorCode
 
 
-def request(plan=Plan.TEAM):
+def request(plan=Plan.TEAM, billing=None):
     return CheckoutRequest(session="fixture", plan=plan, billing_country="EG", billing_mode=BillingMode.STANDARD,
-                           proxy="http://fixture.invalid:3010", seat_quantity=2)
+                           proxy="http://fixture.invalid:3010", seat_quantity=2, verified_billing=billing)
 
 
 def created():
@@ -33,7 +33,7 @@ def test_healthy_team_proxy_is_preserved_without_rotation(monkeypatch):
 
 
 @pytest.mark.parametrize("plan", [Plan.PLUS, Plan.TEAM])
-def test_unusual_activity_is_terminal(monkeypatch, plan):
+def test_unusual_activity_is_terminal(monkeypatch, plan, verified_payer):
     monkeypatch.setattr("gss_checkout.adapter._probe_stripe_proxy", lambda *a, **kw: True)
     attempted = []
 
@@ -44,7 +44,7 @@ def test_unusual_activity_is_terminal(monkeypatch, plan):
     adapter = UpstreamCheckoutAdapter()
     monkeypatch.setattr(adapter, "_create", refused)
     with pytest.raises(DomainError, match="异常流量"):
-        asyncio.run(adapter.create_checkout(request(plan)))
+        asyncio.run(adapter.create_checkout(request(plan, verified_payer("EG") if plan is Plan.PLUS else None)))
     assert attempted == [request().proxy]
 
 
@@ -58,10 +58,12 @@ def test_failed_proxy_aborts_without_checkout_or_fallback(monkeypatch):
     assert seen == [request().proxy]
 
 
-def test_plus_path_does_not_add_team_preflight(monkeypatch):
+def test_plus_path_does_not_add_team_preflight(monkeypatch, verified_payer):
     monkeypatch.setattr("gss_checkout.adapter._probe_stripe_proxy", lambda *a, **kw: pytest.fail("Plus preflight changed"))
     adapter = UpstreamCheckoutAdapter(); monkeypatch.setattr(adapter, "_create", lambda *a: created())
-    result = asyncio.run(adapter.create_checkout(request(Plan.PLUS)))
+    fixed = verified_payer("EG")
+    result = asyncio.run(adapter.create_checkout(request(Plan.PLUS, fixed)))
+    assert result.billing == fixed
     assert result.effective_proxy == "http://fixture.invalid:3010"
 
 
@@ -80,7 +82,7 @@ def test_preflight_uses_proxy_and_accepts_unauthenticated_stripe_response(monkey
     assert calls[-1] == "closed"
 
 
-def test_checkout_proxy_follows_target_billing_country(tmp_path, monkeypatch):
+def test_checkout_proxy_follows_target_billing_country(tmp_path, monkeypatch, verified_payer):
     """建单链路以订单 billing_country 为准，不被旧 statsig 国家改走。"""
     import json
 
@@ -107,8 +109,9 @@ def test_checkout_proxy_follows_target_billing_country(tmp_path, monkeypatch):
             "statsigContext": {"deviceId": "did_fixture", "country": "JP"},
         }
     )
+    fixed = verified_payer("PH")
     req = CheckoutRequest(
-        session=session,
+        session=session, verified_billing=fixed,
         plan=Plan.PLUS,
         billing_country="PH",
         billing_mode=BillingMode.STANDARD,
@@ -119,5 +122,6 @@ def test_checkout_proxy_follows_target_billing_country(tmp_path, monkeypatch):
     monkeypatch.setattr(
         adapter, "_create", lambda request, proxy: seen.append(proxy) or created()
     )
-    asyncio.run(adapter.create_checkout(req))
+    result = asyncio.run(adapter.create_checkout(req))
+    assert result.billing == fixed
     assert seen and proxy_exit_region(seen[0]) == "PH"

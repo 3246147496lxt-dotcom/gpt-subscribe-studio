@@ -136,22 +136,22 @@ test("return parsing strips secrets and redirect status without trusting a succe
   assert.equal(readSavedCardReturn("https://studio.example.invalid/app?redirect_status=succeeded"), null);
 });
 
-test("saved-card API calls use only the three order routes and send no card payload", async () => {
+test("legacy saved-card endpoints only return a historical record; new setup is denied", async () => {
   const originalFetch = globalThis.fetch;
   const calls: { url: string; method: string; body: unknown }[] = [];
   const responses = [
-    { state: "requires_payment_method", setup_intent_id: "seti_fixture", client_secret: "fixture_secret", publishable_key: "pk_test_fixture" },
+    { detail: { message: "fixture setup disabled" } },
     saved,
-    { order, payment_method_id: "pm_fixture", card: saved.card },
+    { order: { ...order, checkout_url: null }, card: saved.card },
   ];
   globalThis.fetch = async (url, init) => {
     calls.push({ url: String(url), method: init?.method || "GET", body: init?.body });
-    return new Response(JSON.stringify(responses[calls.length - 1]), { status: 200 });
+    return new Response(JSON.stringify(responses[calls.length - 1]), { status: calls.length === 1 ? 409 : 200 });
   };
   try {
-    assert.equal((await preparePlusSavedCard("fixture")).setup_intent_id, "seti_fixture");
+    await assert.rejects(preparePlusSavedCard("fixture"), /fixture setup disabled/);
     assert.equal((await getPlusSavedCard("fixture")).state, "saved");
-    assert.equal((await refreshPlusSavedCardCheckout("fixture")).order.checkout_url, order.checkout_url);
+    assert.equal((await refreshPlusSavedCardCheckout("fixture")).order.checkout_url, null);
     assert.deepEqual(calls, [
       { url: "/api/orders/fixture/saved-card/prepare", method: "POST", body: undefined },
       { url: "/api/orders/fixture/saved-card", method: "GET", body: undefined },
@@ -185,11 +185,13 @@ test("manual subscription verification never asserts that saving a card paid an 
 });
 
 test("the panel is independent of the enclosing form and renders explicit non-submit controls", () => {
-  const html = renderToStaticMarkup(<MantineProvider><form><PlusSavedCardPanel order={order} onOrder={() => {}} /></form></MantineProvider>);
+  const html = renderToStaticMarkup(<MantineProvider><form><PlusSavedCardPanel order={order} /></form></MantineProvider>);
   assert.equal((html.match(/<form\b/g) || []).length, 1);
   assert.ok(html.includes('data-testid="plus-saved-card-panel"'));
   assert.ok(html.includes("已保存，不代表已付款"));
-  assert.ok(html.includes("重新提链"));
+  assert.ok(html.includes("查询保存状态"));
+  assert.ok(!html.includes("重新提链"));
+  assert.ok(!html.includes(String(order.checkout_url)));
   assert.equal((html.match(/<button\b/g) || []).length, (html.match(/<button\b[^>]*type="button"/g) || []).length);
   assert.ok(!html.includes('data-testid="stripe-setup-element"'));
   assert.ok(!html.includes('type="submit"'));

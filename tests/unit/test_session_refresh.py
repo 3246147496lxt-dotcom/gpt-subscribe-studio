@@ -160,7 +160,7 @@ class _StubCheckoutClient:
         self.calls.append("close")
 
 
-def test_checkout_adapter_never_rotates_session(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_checkout_adapter_never_rotates_session(monkeypatch: pytest.MonkeyPatch, verified_us_payer) -> None:
     stub = _StubCheckoutClient()
 
     class _Factory:
@@ -176,6 +176,7 @@ def test_checkout_adapter_never_rotates_session(monkeypatch: pytest.MonkeyPatch)
                 session="sess",
                 plan=Plan.PLUS,
                 billing_country="US",
+                verified_billing=verified_us_payer,
                 billing_mode=BillingMode.STANDARD,
             )
         )
@@ -202,7 +203,7 @@ class _StubPaymentClient:
         raise DomainError(ErrorCode.PAYMENT_DECLINED, "declined on purpose")
 
 
-def test_payment_adapter_never_rotates_session(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_payment_adapter_never_rotates_session(monkeypatch: pytest.MonkeyPatch, verified_us_payer) -> None:
     stub = _StubPaymentClient()
 
     class _Factory:
@@ -218,6 +219,7 @@ def test_payment_adapter_never_rotates_session(monkeypatch: pytest.MonkeyPatch) 
                 PaymentRequest(
                     checkout_url="https://chatgpt.com/checkout/openai_llc/cs_test_1",
                     country="US",
+                    billing=verified_us_payer,
                     payment_method_token="ctoken_1",
                     session="sess",
                     checkout_session_id="cs_test_1",

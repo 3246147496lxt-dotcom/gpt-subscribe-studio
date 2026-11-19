@@ -84,7 +84,7 @@ Plus / Go / Pro 家族走的是 custom checkout，链路不同，见「支持的
 
 | 项目 | Plus 家族 | Team |
 |---|---|---|
-| 账单国家 | `billing_country` 决定地址/税务；`exit_country` 决定出口与建单定价（默认同 billing） | 同左 |
+| 账单国家 | 由本部署已核验的固定付款主体决定，不接受其他地址 | 沿用 Team 原规则 |
 | 席位数量 | 不涉及 | 2 席起，可配 |
 | 月付 / 年付 | 固定 | 可选 |
 | 工作空间名 | 不涉及 | 可填 |
@@ -250,13 +250,7 @@ API 层通过二选一的字段区分：
 
 ### 代理出口的两个坑
 
-- **出口与账单可以分离**：`exit_country` 决定代理出口和建单定价（默认等于
-  `billing_country`）。例如 `exit_country=PH` + `billing_country=US`：
-  在 PH 住宅 IP 上重签发并锁定 PHP 定价，再用 US 免税州地址调用
-  `/backend-api/payments/checkout/taxes` 退掉 PH VAT（PHP 1100 → 982.14）。
-  如果 Session 的 `statsigContext.country` 与 `exit_country` 不一致，会丢弃旧
-  accessToken，只保留 sessionToken 重签发（响应里
-  `session_reissued_for_country=true`），随后全链路复用同一出口和 UA。
+- **非 Team**：当前渠道会把所选地区写入结账账单。与已核验账单国家冲突时直接拒绝；不会修改账单、改选地区或承诺任何免税结果。
 - **SID 固定 = 坏出口会一直坏**：代理抽到坏 IP 时表现为
   `SSL: UNEXPECTED_EOF_WHILE_READING` 或 `TLS connect error`。
   `PlusProtocol.pay_from_url()` 遇到这类错误会轮换 SID 重试，最多 3 次。
@@ -366,13 +360,7 @@ pnpm --dir apps/web dev
 
 ### 账单地址与邮箱
 
-- **地址**：从美国五个全州无销售税的州随机生成（AK / DE / MT / NH / OR），
-  街道、城市、州、邮编都可在界面修改。
-- **邮箱**：从 ChatGPT accessToken 的 JWT 载荷 `https://api.openai.com/profile.email`
-  解析后自动填入，用户可直接改。界面上会标明当前值来自解析还是手改。
-
-不固定地址是为了避免每次同一地址；落在免税州是为了让应付金额恒定 ——
-`confirm` 的 `expected_amount` 必须等于会话当前总额，地址一变动金额就变。
+非 Team 建单和付款只使用本部署**同一付款主体已核验**的固定账单。管理员需在系统外核验并配置私有记录（`GSS_VERIFIED_BILLING_FILE`）；前端只读。缺少记录、资料不完整或地址冲突时，不提交新的结账或付款。不会随机补地址，也不会使用登录邮箱代替账单邮箱。详见[固定账单配置与失败行为](specs/003-verified-billing/spec.md)。
 
 ---
 
@@ -498,8 +486,7 @@ printf '卡号|月/年|CVC||||US\n' | /opt/gss/app/.venv/bin/python /opt/gss/scr
 只能丢弃重试。已排除的变量清单与实测过程见「hCaptcha 探索记录」，
 还没弄清的部分见「未解决的问题」。
 
-**金额可能随税额变化。** 勾选 `tax_region` 后 Stripe 会按账单国家重算总额，
-后端会同步刷新 `expected_amount`。落在免税州时不会发生。
+**金额以本单渠道报价和回执为准。** 固定账单不保证免税或应付金额不变。
 
 **Node 是运行期依赖。** 见「快速开始」。
 
@@ -605,12 +592,9 @@ confirm 请求里带一个 `rv_timestamp`：**212 字符**，字符集 43 个符
 缺：真实通过样本。所有纯协议样本都在 confirm 阶段终止，
 所以 `verify_challenge` → `poll` → 订阅生效这一段只有代码路径，没有端到端实证。
 
-**5. 免税州地址与非 US 出口的组合未验证**
+**5. 非 Team 没有已核验的固定账单时不能结账**
 
-已知：账单地址由 `billing_country` 模板生成（US 默认 OR/DE 免税州），出口与币种跟随 `exit_country`，
-Session 没有 `statsigContext.country` 时才回退到账单国。
-缺：如果业务上需要跑其他国家（JP/GB 等），地址该用什么、税额如何稳定，
-没有实测数据。目前的做法是在界面上给出提示。
+不支持使用地区模板、公用地址或从登录会话推断的邮箱作为付款主体证明。
 
 **6. 金额随税额变化时，前后端展示可能不一致**
 

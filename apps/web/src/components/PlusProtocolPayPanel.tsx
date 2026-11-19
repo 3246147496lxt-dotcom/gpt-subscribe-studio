@@ -12,13 +12,11 @@ import {
   type TeamCardPayload,
 } from "../api/client";
 import { PROTOCOL_STAGE_LABELS, protocolBillingError, protocolCardError, protocolIsPaid, protocolPostReady, protocolStateLabel } from "../card-payment/protocolBind";
-import { FIXED_TAX_FREE_BILLING, randomBillingExample } from "../card-payment/billingExamples";
+import { FixedPayerBilling } from "./FixedPayerBilling";
 
 interface Props {
   orderId: string;
-  country: string;
-  sessionEmail?: string | null;
-  billing?: BillingInput | null;
+  billing: BillingInput;
   amount?: string | null;
   currency?: string | null;
   quotationError?: string | null;
@@ -29,22 +27,10 @@ interface Props {
 }
 
 export function PlusProtocolPayPanel({
-  orderId, country, sessionEmail, billing: billingDefaults, amount, currency, quotationError, disabled = false,
+  orderId, billing, amount, currency, quotationError, disabled = false,
   submissionDisabled = false, onBusyChange, onDone,
 }: Props) {
   const [card, setCard] = useState<TeamCardPayload>({ number: "", cvc: "", exp_month: "", exp_year: "" });
-  const [billing, setBilling] = useState<BillingInput>(() => {
-    const source = billingDefaults ?? FIXED_TAX_FREE_BILLING;
-    return {
-      name: source.name ?? "Card Holder",
-      email: sessionEmail || "",
-      line1: source.line1 ?? "",
-      city: source.city ?? "",
-      state: source.state ?? "",
-      postal_code: source.postal_code ?? "",
-      country: source.country ?? (country || "US"),
-    };
-  });
   const [result, setResult] = useState<BindAndPayProtocolResult | null>(null);
   const [work, setWork] = useState<"submit" | "query" | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -107,12 +93,7 @@ export function PlusProtocolPayPanel({
     if (!canSubmit) return;
     const details = submittedDetails.current || {
       card: { ...card, number: card.number.replace(/[\s-]/g, "") },
-      billing: {
-        ...billing,
-        name: billing.name.trim(), email: (billing.email || "").trim(), line1: billing.line1.trim(),
-        city: billing.city.trim(), state: billing.state.trim(), postal_code: billing.postal_code.trim(),
-        country: billing.country.trim().toUpperCase(),
-      },
+      billing: { ...billing },
     };
     const invalid = protocolCardError(details.card) || protocolBillingError(details.billing);
     if (invalid) { setError(invalid); return; }
@@ -138,11 +119,6 @@ export function PlusProtocolPayPanel({
     const value = event.currentTarget.value;
     setCard((previous) => ({ ...previous, [field]: value }));
   };
-  const changeBilling = (field: keyof BillingInput) => (event: React.ChangeEvent<HTMLInputElement>) => {
-    const value = event.currentTarget.value;
-    setBilling((previous) => ({ ...previous, [field]: field === "country" ? value.toUpperCase() : value }));
-  };
-
   return (
     <Stack gap="md" maw={720} mx="auto" data-testid="plus-protocol-pay-panel"
       onKeyDownCapture={(event) => {
@@ -162,8 +138,8 @@ export function PlusProtocolPayPanel({
         </Group>
         {quotationError && <Alert color="red" mt="sm">{quotationError}</Alert>}
       </Paper>
-      <Text size="sm">填写持卡人的卡片和真实账单，确认金额后提交。服务端沿用当前订单 checkout，依次核算税费、创建 confirmation_tokens、完成 ChatGPT confirm 与 PaymentIntent confirm，再通过 GET checkout 核对 complete / paid 并查询订阅。</Text>
-      <Text size="xs" c="dimmed">每个订单沿用首次提交的同一份卡片和账单，修改资料请重新开始。付款确认后仍需等待订阅生效；结果待核实时仅查询状态，不重放付款请求。</Text>
+      <Text size="sm">核对已验证的付款方账单和应付金额后提交。服务端沿用当前订单 checkout，依次核算税费、创建 confirmation_tokens、完成 ChatGPT confirm 与 PaymentIntent confirm，再通过 GET checkout 核对 complete / paid 并查询订阅。</Text>
+      <Text size="xs" c="dimmed">本单固定使用同一付款方的已核验账单，不能修改。付款确认后仍需等待订阅生效；结果待核实时仅查询状态，不重放付款请求。</Text>
       <Paper withBorder p="md" radius="md">
         <Stack gap="sm">
           <TextInput label="卡号" value={card.number} onChange={changeCard("number")} inputMode="numeric" autoComplete="cc-number" disabled={fieldsDisabled} data-testid="protocol-card-number" />
@@ -174,28 +150,7 @@ export function PlusProtocolPayPanel({
           </SimpleGrid>
         </Stack>
       </Paper>
-      <Paper withBorder p="md" radius="md">
-        <Stack gap="sm">
-          <Group justify="space-between">
-            <Text fw={600}>账单地址</Text>
-            <Button type="button" size="xs" variant="light" disabled={fieldsDisabled}
-              data-testid="random-billing-address"
-              onClick={() => setBilling((current) => randomBillingExample(current))}>随机生成地址</Button>
-          </Group>
-          <Text size="xs" c="dimmed">随机生成美国地址，保留姓名和邮箱；账单国家可单独修改，不改变订单地区与币种。</Text>
-          <SimpleGrid cols={{ base: 1, xs: 2 }}>
-            <TextInput label="持卡人姓名" value={billing.name} onChange={changeBilling("name")} autoComplete="cc-name" disabled={fieldsDisabled} />
-            <TextInput label="账单邮箱" type="email" value={billing.email || ""} onChange={changeBilling("email")} autoComplete="email" disabled={fieldsDisabled} />
-          </SimpleGrid>
-          <TextInput label="街道地址" value={billing.line1} onChange={changeBilling("line1")} autoComplete="address-line1" disabled={fieldsDisabled} />
-          <SimpleGrid cols={{ base: 1, xs: 2 }}>
-            <TextInput label="城市" value={billing.city} onChange={changeBilling("city")} autoComplete="address-level2" disabled={fieldsDisabled} />
-            <TextInput label="州 / 省" value={billing.state} onChange={changeBilling("state")} autoComplete="address-level1" disabled={fieldsDisabled} />
-            <TextInput label="邮编" value={billing.postal_code} onChange={changeBilling("postal_code")} autoComplete="postal-code" disabled={fieldsDisabled} />
-            <TextInput label="账单国家（两位代码）" value={billing.country} onChange={changeBilling("country")} maxLength={2} autoComplete="country" disabled={fieldsDisabled} />
-          </SimpleGrid>
-        </Stack>
-      </Paper>
+      <FixedPayerBilling billing={billing} />
       {quoteChanged && (
         <Alert color="blue" title="请确认当前应付金额">
           <Text size="sm">当前金额为 {price}。核对后再次显式提交。</Text>

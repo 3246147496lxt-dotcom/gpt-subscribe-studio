@@ -4,19 +4,49 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field
+from fastapi import HTTPException
+from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, field_validator, model_serializer, model_validator
 
 
-class ModeIn(BaseModel):
+class AddressedRequest(BaseModel):
+    """Preserve unknown-field presence, not the values ignored by Pydantic.
+
+    Older Team clients retain their existing schema behavior. Non-Team writes
+    explicitly reject unmodelled input (including line2/nested address aliases)
+    rather than silently dropping part of the submitted billing address.
+    """
+    _unknown_fields: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _inspect_keys(cls, value, handler):
+        instance = handler(value)
+        if isinstance(value, dict):
+            instance._unknown_fields = any(key not in cls.model_fields for key in value)
+        return instance
+
+    def reject_unknown_fields(self) -> None:
+        if self._unknown_fields:
+            raise HTTPException(409, "账单请求包含无法核验的字段，未提交。")
+        for name in type(self).model_fields:
+            child = getattr(self, name)
+            if isinstance(child, AddressedRequest):
+                child.reject_unknown_fields()
+
+
+class ModeIn(AddressedRequest):
     account_source: str = Field(default="customer_session")
     card_source: str = Field(default="customer")
     billing_mode: str = Field(default="standard")
     risk_acknowledged: bool = False
 
 
-class OrderCreateRequest(BaseModel):
+class OrderCreateRequest(AddressedRequest):
+    # Only checked for non-Team. Do not echo malformed optional claims in a
+    # validation error; the policy validates the full address with redacted errors.
+    billing: Optional[Any] = Field(default=None, repr=False)
     plan: str
-    billing_country: str
+    billing_country: Optional[str] = Field(default=None, validate_default=True)
     # 代理出口 / Session 重签发国家；默认等于 billing_country。
     exit_country: Optional[str] = None
     mode: ModeIn = Field(default_factory=ModeIn)
@@ -28,8 +58,16 @@ class OrderCreateRequest(BaseModel):
     seat_quantity: Optional[int] = None
     price_interval: str = "month"
 
+    @field_validator("billing_country")
+    @classmethod
+    def _team_requires_region(cls, value: Optional[str], info: ValidationInfo) -> Optional[str]:
+        # Only non-Team may omit this field. Team retains its required country.
+        if info.data.get("plan") == "team" and value is None:
+            raise ValueError("Team 需要创建结账地区")
+        return value
 
-class BillingIn(BaseModel):
+
+class BillingIn(AddressedRequest):
     email: str = Field(default="", max_length=254)
     name: str = Field(min_length=1, max_length=100)
     line1: str = Field(min_length=1, max_length=200)
@@ -39,7 +77,7 @@ class BillingIn(BaseModel):
     country: str = Field(min_length=2, max_length=2)
 
 
-class CardIn(BaseModel):
+class CardIn(AddressedRequest):
     """Server-side card submission. Never persisted or logged."""
     number: str = Field(min_length=12, max_length=23)
     cvc: str = Field(min_length=3, max_length=4)
@@ -47,7 +85,7 @@ class CardIn(BaseModel):
     exp_year: str = Field(min_length=2, max_length=4)
 
 
-class OrderPayRequest(BaseModel):
+class OrderPayRequest(AddressedRequest):
     payment_method_token: str = ""
     billing: Optional[BillingIn] = None
     team_context_id: Optional[str] = Field(default=None, max_length=80)
@@ -86,6 +124,7 @@ class OrderOut(BaseModel):
     amount: Optional[str] = None
     currency: Optional[str] = None
     billing: Optional[Dict[str, str]] = None
+    billing_verified: bool = False
     last_error: Optional[str] = None
     quote_error: Optional[str] = None
     next_action: Optional[Dict[str, Any]] = None
@@ -111,6 +150,13 @@ class OrderOut(BaseModel):
     plan_type: Optional[str] = None
     status_summary: Optional[str] = None
     receipt: Optional[Dict[str, Any]] = None
+
+    @model_serializer(mode="wrap")
+    def _preserve_team_contract(self, serialize):
+        result = serialize(self)
+        if self.plan == "team":
+            result.pop("billing_verified", None)
+        return result
 
 
 class ErrorOut(BaseModel):

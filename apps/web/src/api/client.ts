@@ -11,8 +11,10 @@ export interface Order {
   customer_session_client_secret?: string | null;
   amount?: string | null;
   currency?: string | null;
+  billing_verified?: boolean;
   billing?: {
     name?: string;
+    email?: string;
     line1?: string;
     city?: string;
     state?: string;
@@ -86,7 +88,6 @@ export interface SavedCardPreparation {
 
 export interface SavedCardCheckout {
   order: Order;
-  payment_method_id: string;
   card?: SavedCardSummary | null;
 }
 
@@ -97,9 +98,11 @@ async function readError(res: Response): Promise<string> {
   return detail?.detail?.message ?? detail?.detail ?? `请求失败（${res.status}）`;
 }
 
-export async function createOrder(input: {
-  plan: Plan;
-  billing_country: string;
+type CreateRegion =
+  | { plan: "team"; billing_country: string }
+  | { plan: Exclude<Plan, "team">; billing_country?: never };
+
+export async function createOrder(input: CreateRegion & {
   exit_country?: string;
   session: string;
   promo_code?: string;
@@ -109,13 +112,16 @@ export async function createOrder(input: {
   price_interval?: "month" | "year";
 }, idempotencyKey: string): Promise<Order> {
   if (!idempotencyKey?.trim()) throw new Error("缺少购买幂等键，未提交建单。");
+  if (input.plan !== "team" && "billing_country" in input) {
+    throw new Error("非 Team 账单国家由服务端核验，浏览器不能指定。");
+  }
   const res = await fetch("/api/orders", {
     method: "POST",
     headers: { ...jsonHeaders, "Idempotency-Key": idempotencyKey },
     body: JSON.stringify({
       plan: input.plan,
-      billing_country: input.billing_country,
-      exit_country: input.exit_country || undefined,
+      ...(input.plan === "team" ? { billing_country: input.billing_country } : {}),
+      exit_country: input.exit_country,
       session: input.session,
       promo_code: input.promo_code || "",
       promo_campaign_id: input.promo_campaign_id || "",

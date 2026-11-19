@@ -12,7 +12,7 @@ from threading import Lock
 from weakref import ref
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from gss_contracts import BillingMode, OrderStatus, Plan, SubscriptionInfo
 from gss_contracts.adapter import PaymentReceiptEvidence
@@ -23,20 +23,21 @@ from gss_core.checkout_protocol import run_checkout_protocol
 from gss_core.chatgpt import _processor_from_checkout_url
 from gss_core.vault import vault
 
-from ..schemas import BillingIn, CardIn
+from ..public_payment import protocol_view
+from ..schemas import AddressedRequest, BillingIn, CardIn
 from ..store import store
 from .events import notify_order_update
 from .orders import (
     PAID_AWAITING_ENTITLEMENT, PAYMENT_UNCONFIRMED,
     _accept_receipt, _error, _mark_delivered, _receipt_for, _set_delivery_status,
-    _set_payment_status, _team_locks, _to_out,
+    _set_payment_status, _team_locks, _to_out, _verified_order_billing,
 )
 
 logger = logging.getLogger("gss.protocol_cards")
 router = APIRouter(prefix="/api/orders", tags=["card-protocol"])
 
 
-class BindProtocolRequest(BaseModel):
+class BindProtocolRequest(AddressedRequest):
     card: CardIn = Field(repr=False)
     billing: BillingIn
     expected_amount: str = Field(min_length=1, max_length=40)
@@ -70,7 +71,7 @@ def _cached(order_id: str) -> dict | None:
         result = dict(view.protocol_saved_result or {})
         if not result:
             raise HTTPException(409, "订单已有最终结果，请查询原订单")
-        return {**result, "order": _to_out(order)}
+        return {**protocol_view(result), "order": _to_out(order)}
     return None
 
 
@@ -151,8 +152,8 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
             "status_summary": view.status_summary,
             "receipt": _receipt_for(order, view),
         })
-        view.protocol_saved_result = result
-        return {**result, "order": _to_out(order)}
+        view.protocol_saved_result = protocol_view(result)
+        return {**protocol_view(result), "order": _to_out(order)}
     if (order.status is OrderStatus.UNKNOWN and not payment_succeeded
             and (result["stage"], result["state"]) != ("payment", "card_declined")):
         # A stale/incomplete observation cannot re-open an ambiguous financial attempt.
@@ -207,12 +208,12 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
         "status_summary": view.status_summary,
         "receipt": _receipt_for(order, view),
     })
-    view.protocol_saved_result = result
+    view.protocol_saved_result = protocol_view(result)
     if not payment_succeeded and result["state"] != "paid":
         view.last_error = result.get("message")
         view.next_action = result.get("next_action")
         await notify_order_update(order.id, order.status, {"protocol_stage": result["stage"], "protocol_state": result["state"]})
-    return {**result, "order": _to_out(order)}
+    return {**protocol_view(result), "order": _to_out(order)}
 
 
 def _form_fingerprint(context, card, billing) -> bytes:
@@ -237,13 +238,13 @@ def _local_receipt(order, view) -> dict:
     state = "unknown" if order.status is OrderStatus.UNKNOWN else "pending"
     if order.status is OrderStatus.REQUIRES_ACTION:
         state = "challenge_required"
-    return {
+    return {**protocol_view({
         "stage": "payment", "state": state, "message": view.status_summary,
         "payment_status": view.payment_status, "delivery_status": view.delivery_status,
         "payment_intent_id": view.payment_intent_id, "tax_delta": view.tax_delta,
         "plan_type": view.plan_type or str(order.plan), "status_summary": view.status_summary,
-        "receipt": _receipt_for(order, view), "order": _to_out(order),
-    }
+        "receipt": _receipt_for(order, view),
+    }), "order": _to_out(order)}
 
 
 async def _recheck(order, view, secrets, context):
@@ -282,7 +283,18 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
             raise HTTPException(409, "尚未读到可确认的订单金额")
         if not amount.is_finite() or amount < 0 or amount != current_amount or payload.expected_currency.upper() != str(view.currency or "").upper():
             raise HTTPException(409, "订单报价已改变，请重新确认当前金额")
-        billing = _billing_form(payload)
+        if secrets is None:
+            raise _error(401, ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
+        payload.reject_unknown_fields()
+        claims = [payload.billing]
+        if context and context.get("protocol_kind") == "checkout_v2":
+            # A prepared token cannot be rebound to a fresh address claim.
+            if not context.get("protocol_billing"):
+                raise HTTPException(409, "旧版付款上下文缺少原始账单核验记录，不能继续付款。")
+            claims.append(context["protocol_billing"])
+        # Never initialise a card context, lock a quote, or mutate the stored
+        # payer before validating this exact payment against the verified order.
+        billing = _verified_order_billing(order, secrets, *claims)
         order, secrets, view, context = _context(order_id, start=True)
         card = payload.card.model_dump()
         fingerprint = _form_fingerprint(context, card, billing)
@@ -291,8 +303,6 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
             raise HTTPException(409, "本订单已开始处理另一份支付资料，请查询原结果或重新创建订单")
         context["request_fingerprint"] = fingerprint
         context["protocol_billing"] = billing
-        secrets.billing = billing
-        view.billing = dict(billing)
         try:
             result = await asyncio.to_thread(_run, secrets, context, _spec(order, view, secrets, payload), card=card, billing=billing)
         except asyncio.CancelledError:

@@ -35,13 +35,14 @@ def build_deps(payment_script=None, active=True) -> PipelineDeps:
     )
 
 
-def test_happy_path_checkout_pay_verify() -> None:
+def test_happy_path_checkout_pay_verify(verified_us_payer) -> None:
     pipeline = OrderPipeline(build_deps())
     checkout = asyncio.run(
         pipeline.create_checkout(
-            session="s", plan=Plan.PLUS, billing_country="US", mode=Mode()
+            session="s", plan=Plan.PLUS, billing_country="US", mode=Mode(), verified_billing=verified_us_payer
         )
     )
+    assert checkout.billing == verified_us_payer
     assert checkout.currency == "USD"
 
     payment = asyncio.run(
@@ -49,7 +50,7 @@ def test_happy_path_checkout_pay_verify() -> None:
             checkout_url=checkout.checkout_url,
             country="US",
             mode=Mode(),
-            payment_method_token="pm_fake",
+            payment_method_token="pm_fake", billing=checkout.billing,
         )
     )
     assert payment.status is PaymentStatus.SUCCEEDED

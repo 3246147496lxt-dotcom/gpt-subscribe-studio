@@ -8,6 +8,11 @@
 
 不产生扣款：只创建 PaymentMethod。
 """
+
+# Standalone checkout/probing has no verified payer binding from the order service.
+if __name__ == "__main__":
+    raise SystemExit("非 Team 独立写入入口已关闭：请使用绑定了已核验账单的原订单。")
+
 import json
 import re
 import secrets
@@ -170,7 +175,3 @@ def main() -> None:
                           f"{err.get('type')} / {err.get('code')} / {str(err.get('message'))[:110]}")
             except Exception as e:
                 print(f"  [{name}] 异常 {str(e)[:110]}")
-
-
-if __name__ == "__main__":
-    main()

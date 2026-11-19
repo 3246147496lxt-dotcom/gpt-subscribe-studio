@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -15,6 +16,8 @@ from gss_api.schemas import OrderCreateRequest
 from gss_api.store import store
 from gss_core.vault import vault
 
+
+pytestmark = pytest.mark.usefixtures("verified_us_payer")
 
 @pytest.mark.parametrize("origin", ["US", "JP"])
 def test_rotation_is_checkpointed_before_client_close_and_failed_checkout(monkeypatch, origin, tmp_path):

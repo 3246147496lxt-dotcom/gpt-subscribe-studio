@@ -1,4 +1,4 @@
-"""目标充值国家决定订单币种/地址/出口；跨区时重签发 session。"""
+"""核验地址与渠道账单声明必须一致；保留合法订单的 Session 回归覆盖。"""
 
 from __future__ import annotations
 
@@ -64,7 +64,8 @@ def _fake_reauth(monkeypatch):
     return calls
 
 
-def test_cross_country_reissues_session_and_uses_target_country(monkeypatch):
+def test_cross_country_reissues_session_and_uses_target_country(monkeypatch, verified_payer):
+    profile = verified_payer(country="PH")
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     pipeline = build_pipeline()
     monkeypatch.setattr(orders_router, "build_pipeline", lambda: pipeline)
@@ -108,15 +109,14 @@ def test_cross_country_reissues_session_and_uses_target_country(monkeypatch):
             },
         },
     )
-    assert paid.status_code == 200, paid.text
-    assert paid.json()["billing"]["country"] == "PH"
-    request = pipeline.deps.payment.calls[0]
-    assert request.country == "PH"
-    assert request.billing["country"] == "PH"
+    assert paid.status_code == 409, paid.text
+    assert not pipeline.deps.payment.calls
+    assert secrets.billing == body["billing"] == profile
     vault.drop(body["id"])
     store.clear()
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_same_country_does_not_reissue(monkeypatch):
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     pipeline = build_pipeline()
@@ -136,6 +136,7 @@ def test_same_country_does_not_reissue(monkeypatch):
     store.clear()
 
 
+@pytest.mark.usefixtures("verified_us_payer")
 def test_order_without_session_country_keeps_requested_billing(monkeypatch):
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     pipeline = build_pipeline()
@@ -154,7 +155,8 @@ def test_order_without_session_country_keeps_requested_billing(monkeypatch):
     store.clear()
 
 
-def test_cross_country_without_session_token_is_rejected(monkeypatch):
+def test_cross_country_without_session_token_is_rejected(monkeypatch, verified_payer):
+    verified_payer(country="PH")
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     pipeline = build_pipeline()
     monkeypatch.setattr(orders_router, "build_pipeline", lambda: pipeline)
@@ -174,73 +176,25 @@ def test_cross_country_without_session_token_is_rejected(monkeypatch):
     store.clear()
 
 
-def test_ph_exit_with_us_tax_free_billing(monkeypatch, tmp_path):
-    """PH 出口锁定 PHP 定价，US 免税州地址只负责税务重算。"""
-    from gss_core.proxies import proxy_exit_region
-
-    config = tmp_path / "proxy-gateways.json"
-    gateway = {
-        "host": "gw.example.com",
-        "port": 3010,
-        "scheme": "http",
-        "username": "u-region-PH-sid-BASE",
-        "password": "pw",
-        "region": "PH",
-        "sid": "BASE",
-        "enabled": True,
-    }
-    config.write_text(json.dumps({"version": 1, "checkout": gateway, "approve": gateway}))
-    monkeypatch.setenv("GSS_PROXY_CONFIG", str(config))
-    monkeypatch.setenv("GSS_PROXY_SID", "PINNED01")
-    monkeypatch.setenv("GSS_CONFIG_DIR", str(tmp_path))
+@pytest.mark.usefixtures("verified_us_payer")
+def test_conflicting_channel_billing_country_rejected_before_refresh(monkeypatch):
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     pipeline = build_pipeline()
     monkeypatch.setattr(orders_router, "build_pipeline", lambda: pipeline)
-    _fake_reauth(monkeypatch)
+    reauth = _fake_reauth(monkeypatch)
     store.clear()
-    client = TestClient(create_app())
-
-    created = client.post(
-        "/api/orders",
-        json={
-            "plan": "plus",
-            "billing_country": "US",
-            "exit_country": "PH",
-            "session": _session("US"),
-        },
-    )
-    assert created.status_code == 201, created.text
-    body = created.json()
-    assert body["billing_country"] == "US"
-    assert body["exit_country"] == "PH"
-    assert body["currency"] == "PHP"
-    assert body["session_reissued_for_country"] is True
-    call = pipeline.deps.checkout.calls[0]
-    assert (call.billing_country, call.exit_country) == ("US", "PH")
-
-    secrets = vault.get(body["id"])
-    assert secrets is not None
-    assert secrets.exit_country == "PH"
-    assert secrets.billing["country"] == "US"
-    assert secrets.billing["state"] in {"OR", "DE"}
-    assert proxy_exit_region(secrets.proxy) == "PH"
-
-    paid = client.post(
-        f"/api/orders/{body['id']}/pay",
-        json={"payment_method_token": "pm_fixture", "billing": secrets.billing},
-    )
-    assert paid.status_code == 200, paid.text
-    request = pipeline.deps.payment.calls[0]
-    assert request.country == "US"
-    assert request.billing["country"] == "US"
-    assert proxy_exit_region(request.checkout_proxy) == "PH"
-    vault.drop(body["id"])
-    store.clear()
+    response = TestClient(create_app()).post("/api/orders", json={
+        "plan": "plus", "billing_country": "US", "exit_country": "PH", "session": _session("US"),
+    })
+    assert response.status_code == 409
+    assert not reauth and not pipeline.deps.checkout.calls
+    assert not store.orders and not store.jobs
 
 
 @pytest.mark.parametrize("stage", ["checkout", "pay"])
 @pytest.mark.parametrize("reissued", [False, True])
-def test_failure_reports_session_state_without_credentials(monkeypatch, stage, reissued):
+def test_failure_reports_session_state_without_credentials(monkeypatch, stage, reissued, verified_payer):
+    verified_payer(country="PH")
     from gss_contracts.errors import DomainError, ErrorCode
 
     monkeypatch.setenv("GSS_USE_FAKE", "1")
@@ -268,7 +222,7 @@ def test_failure_reports_session_state_without_credentials(monkeypatch, stage, r
         if stage == "pay":
             assert response.status_code == 201
             order_id = response.json()["id"]
-            response = client.post(f"/api/orders/{order_id}/pay", json={"payment_method_token": "pm_fake"})
+            response = client.post(f"/api/orders/{order_id}/pay", json={"payment_method_token": "offline-verified-instrument"})
         else:
             order_id, = store.orders
 

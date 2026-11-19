@@ -2,6 +2,7 @@
 from unittest.mock import AsyncMock
 
 import pytest
+
 from fastapi.testclient import TestClient
 
 from gss_api.main import create_app
@@ -9,6 +10,8 @@ from gss_api.routers import orders
 from gss_api.store import store
 from gss_core.vault import vault
 
+
+pytestmark = pytest.mark.usefixtures("verified_us_payer")
 
 @pytest.fixture
 def attempt(monkeypatch, tmp_path):
@@ -22,7 +25,7 @@ def attempt(monkeypatch, tmp_path):
     with TestClient(create_app()) as api:
         yield api, payment, {"plan": "plus", "billing_country": "US",
                              "session": "private-session-fixture",
-                             "payment_method_token": "pm_private_fixture"}
+                             "payment_method_token": "offline-verified-instrument"}
     for oid in list(store.orders):
         vault.drop(oid)
     store.clear()

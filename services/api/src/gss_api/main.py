@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from gss_core import install_logging_filter
 from gss_core.config import load_settings, missing_upstreams, use_fake_adapters
 from gss_core.proxies import GatewayStore
 
+from .store import store
 from .routers import events, orders, promo, proxies, saved_cards, protocol_cards
 
 __version__ = "0.1.0"
@@ -38,6 +41,20 @@ def create_app() -> FastAPI:
         version=__version__,
         description="独立的 ChatGPT 订阅开通工具：粘贴 session，浏览器填卡。",
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def _private_order_input(request: Request, exc: RequestValidationError):
+        # Malformed financial inputs may contain a whole address, card or session.
+        path = request.url.path.rstrip("/")
+        if request.method == "POST" and (path == "/api/orders" or path.startswith("/api/orders/")):
+            order = store.get_order(request.path_params.get("order_id", ""))
+            is_team = ((order is not None and order.plan.value == "team")
+                       or (path == "/api/orders" and isinstance(exc.body, dict) and exc.body.get("plan") == "team"))
+            if not is_team:
+                return JSONResponse(status_code=422, content={"detail": {
+                    "code": "INVALID_ORDER_INPUT", "message": "订单请求字段无效，未提交。"}})
+        return await request_validation_exception_handler(request, exc)
+
     app.include_router(orders.router)
     app.include_router(saved_cards.router)
     app.include_router(protocol_cards.router)

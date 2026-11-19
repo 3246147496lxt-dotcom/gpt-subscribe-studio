@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import List, Optional
 
@@ -17,6 +17,7 @@ from gss_contracts import (
 )
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
+from gss_core.verified_payer import checkout_address
 from gss_core.chatgpt import ChatGPTClient, clamp_team_seats
 from gss_core.config import ORDER_HTTP_TIMEOUT_S
 from gss_core.session_token import parse_session
@@ -92,6 +93,7 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         # exit_country 决定代理出口与建单定价；billing_country 只决定地址/税额。
         # 已 pin 的 req.proxy 必须原样保留，不能再按 billing_country 改写。
         exit_country = req.exit_country or req.billing_country
+        pinned_billing = None if req.plan is Plan.TEAM else checkout_address(exit_country, req.billing_country, req.verified_billing)
         proxy = req.proxy or session_proxy("checkout", exit_country) or configured_proxy("checkout")
         if not req.proxy:
             proxy = align_proxy_region(proxy, exit_country)
@@ -102,6 +104,9 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
                     ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                     "订单代理连接Stripe失败，未创建结账/未付款",
                 )
+        if pinned_billing is not None:
+            # Bind payer + attestation across the worker handoff, even for internal callers.
+            req = replace(req, verified_billing=pinned_billing)
         # One attempt on the selected route. An upstream refusal is terminal.
         created = await asyncio.to_thread(self._create, req, proxy)
         amount = created.amount
@@ -118,7 +123,7 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
             checkout_session_id=created.checkout_session_id,
             publishable_key=created.publishable_key or None,
             customer_session_client_secret=created.customer_session_client_secret or None,
-            billing=dict(address_for(req.billing_country)),
+            billing=dict(pinned_billing if pinned_billing is not None else address_for(req.billing_country)),
             tax_delta=getattr(created, "tax_delta", None),
             checkout_kind=created.checkout_kind or ("hosted" if req.plan is Plan.TEAM else "custom"),
             confirm_return_url=created.confirm_return_url or "",
@@ -139,6 +144,7 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
                 workspace_name=req.workspace_name,
                 seat_quantity=req.seat_quantity,
                 price_interval=req.price_interval,
+                **({"verified_billing": req.verified_billing} if req.plan is not Plan.TEAM else {}),
             )
         finally:
             client.close()
@@ -149,6 +155,8 @@ class FakeCheckoutAdapter(CheckoutAdapterBase):
     calls: List[CheckoutRequest] = field(default_factory=list)
 
     async def create_checkout(self, req: CheckoutRequest) -> CheckoutResult:
+        pinned_billing = None if req.plan is Plan.TEAM else checkout_address(
+            req.exit_country or req.billing_country, req.billing_country, req.verified_billing)
         self.calls.append(req)
         currency = currency_for(req.exit_country or req.billing_country)
         amount = Decimal("0.00") if req.billing_mode is BillingMode.PROMO else _list_price(req)
@@ -167,7 +175,7 @@ class FakeCheckoutAdapter(CheckoutAdapterBase):
             upstream_request_id="fake-checkout-req",
             checkout_session_id=checkout_id,
             publishable_key="pk_test_fake" if hosted else None,
-            billing=dict(address_for(req.billing_country)),
+            billing=dict(pinned_billing if pinned_billing is not None else address_for(req.billing_country)),
             checkout_kind="hosted" if hosted else "custom",
         )
 

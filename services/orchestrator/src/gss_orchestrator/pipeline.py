@@ -75,6 +75,7 @@ class OrderPipeline:
         price_interval: str = "month",
         pin_proxy: bool = False,
         session_reissued: bool = False,
+        verified_billing: Optional[Dict[str, str]] = None,
     ) -> CheckoutResult:
         """阶段一：生成托管结账链接。``mode`` 非法时拒绝（含 promo 未确认）。"""
 
@@ -94,6 +95,7 @@ class OrderPipeline:
             price_interval=price_interval,
             pin_proxy=pin_proxy,
             session_reissued=session_reissued,
+            verified_billing=verified_billing,
         )
         return await self.deps.checkout.create_checkout(req)
 
