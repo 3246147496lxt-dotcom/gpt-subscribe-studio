@@ -570,3 +570,26 @@ def test_settle_marks_subscription_limit_rejected():
     out = engine._settle()
     assert out.state == "rejected"
     assert out.code == "subscription_limit"
+
+
+def test_string_payment_intent_is_retrieved_and_confirmed():
+    engine = build_harness()
+    engine.client = StubClient()
+    original = engine.app.request
+
+    def string_confirm(method, url, **kwargs):
+        if url.endswith("/backend-api/payments/checkout/confirm"):
+            return FakeResponse({
+                "status": "success",
+                "type": "payment_intent",
+                "payment_intent": "pi_fixture",
+                "client_secret": "pi_fixture_secret_fixture",
+            })
+        return original(method, url, **kwargs)
+
+    engine.app.request = string_confirm
+    engine._app_confirm()
+    assert engine.intent_id == "pi_fixture"
+    assert engine.intent_secret == "pi_fixture_secret_fixture"
+    assert engine.raw["intent"]["status"] == "succeeded"
+    assert engine.confirmed["payment_intent"]["id"] == "pi_fixture"

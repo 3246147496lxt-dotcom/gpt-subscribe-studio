@@ -923,6 +923,41 @@ class PlusHarProtocol:
         self._safe_close(self._stripe)
         self._stripe = None
 
+    def _hydrate_confirmed_intent(self) -> None:
+        """Resolve a string-only payment_intent without minting another charge."""
+        if _intent_object(self.confirmed):
+            return
+        raw = self.confirmed.get("payment_intent") if isinstance(self.confirmed, dict) else ""
+        if not isinstance(raw, str) or not raw.startswith("pi_"):
+            return
+        started = time.monotonic()
+        logger.info("plus_har_intent_retrieve_start intent=%s", raw[:14])
+        try:
+            retrieved = self.client.retrieve_stripe_intent(
+                intent_id=raw,
+                client_secret=self.intent_secret,
+                publishable_key=self.publishable_key,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "plus_har_intent_retrieve_failed type=%s elapsed=%.2f",
+                type(exc).__name__, time.monotonic() - started,
+            )
+            retrieved = {}
+        if isinstance(retrieved, dict) and retrieved.get("id") == raw:
+            self.confirmed["payment_intent"] = retrieved
+            self.raw["intent"] = retrieved
+            logger.info(
+                "plus_har_intent_retrieve_ok intent=%s status=%s elapsed=%.2f",
+                raw[:14], str(retrieved.get("status") or "-")[:30],
+                time.monotonic() - started,
+            )
+        else:
+            logger.warning(
+                "plus_har_intent_retrieve_unusable intent=%s elapsed=%.2f",
+                raw[:14], time.monotonic() - started,
+            )
+
     def _app_confirm(self) -> Dict[str, Any]:
         body = {
             "checkout_session_id": self.checkout_id,
@@ -973,6 +1008,7 @@ class PlusHarProtocol:
             self.confirm_return_url = return_url
         self.intent_id = intent_id
         self.intent_secret = secret
+        self._hydrate_confirmed_intent()
         logger.info("plus_har_confirm status=%s intent=%s", payload.get("status"), intent_id[:12])
         return payload
 
@@ -1342,6 +1378,11 @@ class PlusHarProtocol:
         self.on_confirmation_start()
         self._app_confirm()
         observed = _intent_object(self.confirmed)
+        if not observed and self.intent_id.startswith("pi_") and self.intent_secret:
+            # Some app responses expose only the string id. The GET above
+            # failed, but the client secret still authorizes the original
+            # confirmation; never invent a new intent id.
+            observed = {"id": self.intent_id, "status": "requires_confirmation"}
         # A successful application response, an intent ID or a secret alone is
         # not permission to confirm again. Only the original, unsubmitted PI
         # explicitly requiring confirmation may take the existing initial step.

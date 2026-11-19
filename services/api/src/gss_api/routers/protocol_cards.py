@@ -126,6 +126,10 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
         secrets.account_id = context["account_id"]
     result = dict(result)
     result["payment_method_id"] = context.get("payment_method_id")
+    observed_intent = result.get("payment_intent_id") or result.get("intent_id")
+    if (isinstance(observed_intent, str) and observed_intent.startswith("pi_")
+            and view.payment_intent_id is None):
+        view.payment_intent_id = observed_intent
     evidence = result.pop("_receipt_evidence", None)
     plus_verified = result.pop("_plus_verified", False) is True
     verified_zero = result.pop("_verified_zero", False) is True and view.amount is not None and Decimal(str(view.amount)) == 0
