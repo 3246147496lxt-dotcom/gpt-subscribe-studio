@@ -9,11 +9,13 @@ import json
 from decimal import Decimal, InvalidOperation
 from secrets import token_bytes
 from threading import Lock
+from weakref import ref
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from gss_contracts import BillingMode, OrderStatus, Plan
+from gss_contracts import BillingMode, OrderStatus, Plan, SubscriptionInfo
+from gss_contracts.adapter import PaymentReceiptEvidence
 from gss_contracts.errors import ErrorCode
 from gss_core.chatgpt import ChatGPTClient
 from gss_core.config import use_fake_adapters
@@ -26,7 +28,7 @@ from ..store import store
 from .events import notify_order_update
 from .orders import (
     PAID_AWAITING_ENTITLEMENT, PAYMENT_UNCONFIRMED,
-    _error, _mark_delivered, _receipt_for, _set_delivery_status,
+    _accept_receipt, _error, _mark_delivered, _receipt_for, _set_delivery_status,
     _set_payment_status, _team_locks, _to_out,
 )
 
@@ -47,6 +49,8 @@ def _run(secrets, context, spec, *, card=None, billing=None, read_only=False):
         return {"state": "pending", "stage": "payment" if context.get("app_confirmation_started") else "checkout",
                 "message": "原协议请求仍在处理，请查询协议状态", "intent_status": "processing"}
     try:
+        if not spec["credentials_current"]():
+            return {"stage": "payment", "state": "unknown", "message": PAYMENT_UNCONFIRMED}
         client = ChatGPTClient.from_raw_session(secrets.session, proxy=secrets.proxy or None)
         client.timeout = 45.0
         try:
@@ -90,6 +94,9 @@ def _context(order_id: str, *, start: bool):
 
 def _spec(order, view, secrets, payload=None):
     return {
+        "credentials_current": lambda oid=order.id, original=ref(secrets): (
+            (current := vault.get(oid)) is not None and current is original()
+        ),
         "account_id": secrets.account_id, "country": order.billing_country,
         "exit_country": getattr(secrets, "exit_country", "") or "",
         "promo": order.mode.billing_mode is BillingMode.PROMO,
@@ -106,7 +113,7 @@ def _spec(order, view, secrets, payload=None):
 
 
 async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
-    if context.get("quoted"):
+    if context.get("quoted") and not _submitted(order, view, context):
         view.amount = str(context["amount"])
         view.currency = context["currency"]
         view.quote_error = None
@@ -115,10 +122,22 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
         secrets.account_id = context["account_id"]
     result = dict(result)
     result["payment_method_id"] = context.get("payment_method_id")
-    payment_succeeded = (
-        result["stage"] == "payment"
-        and (result["state"] == "paid" or result.get("intent_status") == "succeeded")
-    )
+    evidence = result.pop("_receipt_evidence", None)
+    plus_verified = result.pop("_plus_verified", False) is True
+    verified_zero = result.pop("_verified_zero", False) is True and view.amount is not None and Decimal(str(view.amount)) == 0
+    if result["state"] == "no_payment_required" and not verified_zero:
+        result.update(stage="payment", state="unknown", message=PAYMENT_UNCONFIRMED)
+    observed_id = context.get("intent_id")
+    if (isinstance(observed_id, str) and observed_id.startswith("pi_")
+            and view.observed_payment_id is None and context.get("app_confirmation_started")):
+        view.observed_payment_id = observed_id
+    claimed_paid = result["state"] == "paid" or result.get("intent_status") == "succeeded"
+    payment_succeeded = bool(claimed_paid and isinstance(evidence, PaymentReceiptEvidence)
+                             and _accept_receipt(order, evidence))
+    if claimed_paid and not payment_succeeded:
+        result.update(stage="payment", state="unknown", message=PAYMENT_UNCONFIRMED, intent_status=None)
+    if result["state"] == "paid" and not plus_verified:
+        result.update(state="pending", message=PAID_AWAITING_ENTITLEMENT)
     if view.payment_status == "succeeded" and not payment_succeeded:
         # 已完成扣款后，只读核验返回的 unknown/pending 不能把支付状态降级。
         result.update({
@@ -139,25 +158,17 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
         # A stale/incomplete observation cannot re-open an ambiguous financial attempt.
         result.update(stage="payment", state="unknown", message=PAYMENT_UNCONFIRMED)
         result.pop("next_action", None)
-    if result["stage"] == "checkout" and result["state"] == "pending":
+    if (result["stage"] == "checkout" and result["state"] == "pending"
+            and not _submitted(order, view, context)):
         store.update_status(order.id, OrderStatus.AWAITING_PAYMENT)
     if payment_succeeded:
-        _set_payment_status(
-            order.id,
-            "succeeded",
-            intent_id=result.get("payment_intent_id") or result.get("charge_id"),
-            amount=view.amount,
-            currency=view.currency,
-            tax_delta=view.tax_delta,
-            plan_type=str(order.plan),
-            summary="扣款成功，正在核验订阅",
-        )
         if result["state"] == "paid":
             # HAR 自身已确认订阅生效，直接交付；不再重复查订阅。
             if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION, OrderStatus.UNKNOWN}:
                 store.update_status(order.id, OrderStatus.PAYING)
             if order.status is OrderStatus.PAYING:
                 store.update_status(order.id, OrderStatus.VERIFYING)
+            view.subscription = SubscriptionInfo(active=True, raw_kind="plus")
             store.update_status(order.id, OrderStatus.ACTIVE)
             await _mark_delivered(order.id)
         else:
@@ -171,7 +182,10 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
             result["message"] = view.status_summary
     elif result["stage"] == "payment":
         state = result["state"]
-        if state == "card_declined":
+        if state == "no_payment_required":
+            _set_payment_status(order.id, "unpaid", summary="本单无需扣款，待核验权益")
+            store.update_status(order.id, OrderStatus.VERIFYING)
+        elif state == "card_declined":
             _set_payment_status(order.id, "failed", summary=result.get("message") or "支付失败")
             store.update_status(order.id, OrderStatus.FAILED)
         elif state == "challenge_required":
@@ -201,45 +215,66 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
     return {**result, "order": _to_out(order)}
 
 
+def _form_fingerprint(context, card, billing) -> bytes:
+    material = json.dumps({"card": card, "billing": billing}, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(context["request_key"], material, hashlib.sha256).digest()
+
+
+def _billing_form(payload) -> dict:
+    billing = {key: value.strip() for key, value in payload.billing.model_dump().items()}
+    billing["country"] = billing["country"].upper()
+    return billing
+
+
+def _submitted(order, view, context) -> bool:
+    return (order.status in {OrderStatus.UNKNOWN, OrderStatus.REQUIRES_ACTION, OrderStatus.PAYING,
+                             OrderStatus.VERIFYING}
+            or view.payment_status in {"succeeded", "processing"}
+            or bool(context and (context.get("app_confirmation_started") or context.get("intent_id"))))
+
+
+def _local_receipt(order, view) -> dict:
+    state = "unknown" if order.status is OrderStatus.UNKNOWN else "pending"
+    if order.status is OrderStatus.REQUIRES_ACTION:
+        state = "challenge_required"
+    return {
+        "stage": "payment", "state": state, "message": view.status_summary,
+        "payment_status": view.payment_status, "delivery_status": view.delivery_status,
+        "payment_intent_id": view.payment_intent_id, "tax_delta": view.tax_delta,
+        "plan_type": view.plan_type or str(order.plan), "status_summary": view.status_summary,
+        "receipt": _receipt_for(order, view), "order": _to_out(order),
+    }
+
+
+async def _recheck(order, view, secrets, context):
+    if not secrets or not context or context.get("protocol_kind") != "checkout_v2" or use_fake_adapters():
+        return _local_receipt(order, view)
+    try:
+        result = await asyncio.to_thread(_run, secrets, context, _spec(order, view, secrets), read_only=True)
+    except Exception as exc:
+        logger.warning("bind_recheck_failed id=%s type=%s", order.id, type(exc).__name__)
+        return _local_receipt(order, view)
+    return await _apply(order, secrets, view, context, result)
+
+
 @router.post("/{order_id}/bind-and-pay-protocol")
 async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> dict:
     async with _team_locks.setdefault(order_id, asyncio.Lock()):
         cached = _cached(order_id)
         if cached:
             return cached
-        if use_fake_adapters():
-            raise HTTPException(409, "离线模式不会提交真实绑卡或付款请求")
-        # Validate the quote before creating or mutating a binding context.
         order = store.get_order(order_id)
         view = store.view(order_id)
-        if view.payment_status == "succeeded" or order.status is OrderStatus.UNKNOWN:
-            # 无论凭证/上下文是否仍在，只允许查询原付款，不再传入卡资料。
-            unknown = view.payment_status != "succeeded"
-            secrets = vault.get(order_id)
-            context = secrets.saved_card_context if secrets is not None else None
-            if secrets is not None and context and context.get("protocol_kind") == "checkout_v2":
-                try:
-                    result = await asyncio.to_thread(
-                        _run, secrets, context, _spec(order, view, secrets), read_only=True
-                    )
-                    return await _apply(order, secrets, view, context, result)
-                except HTTPException:
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("bind_recheck_failed id=%s type=%s", order_id, type(exc).__name__)
-            return {
-                "state": "unknown" if unknown else ("paid" if view.delivery_status == "delivered" else "pending"),
-                "stage": "payment",
-                "message": PAYMENT_UNCONFIRMED if unknown else view.status_summary,
-                "payment_status": view.payment_status,
-                "delivery_status": view.delivery_status,
-                "payment_intent_id": view.payment_intent_id,
-                "tax_delta": view.tax_delta,
-                "plan_type": view.plan_type or str(order.plan),
-                "status_summary": view.status_summary,
-                "receipt": _receipt_for(order, view),
-                "order": _to_out(order),
-            }
+        secrets = vault.get(order_id)
+        context = secrets.saved_card_context if secrets is not None else None
+        if _submitted(order, view, context):
+            if context and context.get("request_fingerprint") and not hmac.compare_digest(
+                context["request_fingerprint"], _form_fingerprint(context, payload.card.model_dump(), _billing_form(payload))
+            ):
+                raise HTTPException(409, "原付款已提交，不接受变更支付资料；请查询原订单")
+            return await _recheck(order, view, secrets, context)
+        if use_fake_adapters():
+            raise HTTPException(409, "离线模式不会提交真实绑卡或付款请求")
         try:
             amount = Decimal(payload.expected_amount)
             current_amount = Decimal(str(view.amount))
@@ -247,12 +282,10 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
             raise HTTPException(409, "尚未读到可确认的订单金额")
         if not amount.is_finite() or amount < 0 or amount != current_amount or payload.expected_currency.upper() != str(view.currency or "").upper():
             raise HTTPException(409, "订单报价已改变，请重新确认当前金额")
-        billing = {key: value.strip() for key, value in payload.billing.model_dump().items()}
-        billing["country"] = billing["country"].upper()
+        billing = _billing_form(payload)
         order, secrets, view, context = _context(order_id, start=True)
         card = payload.card.model_dump()
-        request = json.dumps({"card": card, "billing": billing}, sort_keys=True, separators=(",", ":")).encode()
-        fingerprint = hmac.new(context["request_key"], request, hashlib.sha256).digest()
+        fingerprint = _form_fingerprint(context, card, billing)
         previous = context.get("request_fingerprint")
         if previous and not hmac.compare_digest(previous, fingerprint):
             raise HTTPException(409, "本订单已开始处理另一份支付资料，请查询原结果或重新创建订单")
@@ -277,6 +310,12 @@ async def get_bind_protocol_status(order_id: str) -> dict:
         cached = _cached(order_id)
         if cached:
             return cached
+        order = store.get_order(order_id)
+        view = store.view(order_id)
+        secrets = vault.get(order_id)
+        context = secrets.saved_card_context if secrets is not None else None
+        if _submitted(order, view, context):
+            return await _recheck(order, view, secrets, context)
         order, secrets, view, context = _context(order_id, start=False)
         if not context:
             return {"state": "not_started", "stage": "checkout", "message": "协议流程尚未开始", "order": _to_out(order)}

@@ -152,10 +152,12 @@ class FakeCheckoutAdapter(CheckoutAdapterBase):
         self.calls.append(req)
         currency = currency_for(req.exit_country or req.billing_country)
         amount = Decimal("0.00") if req.billing_mode is BillingMode.PROMO else _list_price(req)
+        from gss_core.fake_receipts import checkout_id_for
         hosted = req.plan is Plan.TEAM
+        checkout_id = checkout_id_for(hosted=hosted, amount=amount, currency=currency)
         return CheckoutResult(
             checkout_url=(
-                f"https://pay.openai.com/c/pay/cs_test_fake_{len(self.calls)}"
+                f"https://pay.openai.com/c/pay/{checkout_id}"
                 if hosted
                 else f"https://chatgpt.com/checkout/fake/{len(self.calls)}"
             ),
@@ -163,9 +165,7 @@ class FakeCheckoutAdapter(CheckoutAdapterBase):
             currency=currency,
             amount=amount,
             upstream_request_id="fake-checkout-req",
-            checkout_session_id=(
-                f"cs_test_fake_{len(self.calls)}" if hosted else f"oaics_fake_{len(self.calls)}"
-            ),
+            checkout_session_id=checkout_id,
             publishable_key="pk_test_fake" if hosted else None,
             billing=dict(address_for(req.billing_country)),
             checkout_kind="hosted" if hosted else "custom",

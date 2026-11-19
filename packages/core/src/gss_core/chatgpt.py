@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from http.cookiejar import CookieJar
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from gss_contracts.errors import DomainError, ErrorCode
@@ -528,6 +528,7 @@ class ChatGPTClient:
     sentinel_so: str = ""
     _http: Any = field(default=None, repr=False)
     _stripe_http: Any = field(default=None, repr=False)
+    credentials_current: Optional[Callable[[], bool]] = field(default=None, repr=False, compare=False, kw_only=True)
     _stripe_js_id: str = field(default="", repr=False)
     _elements_session_id: str = field(default="", repr=False)
 
@@ -846,8 +847,13 @@ class ChatGPTClient:
         self.warmup(page_url=url)
         self.mint_sentinel(flow=flow, page_url=url)
 
+    def _check_credentials(self) -> None:
+        if self.credentials_current is not None and not self.credentials_current():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "付款凭证已过期，停止后续请求")
+
     @property
     def http(self):
+        self._check_credentials()
         if self._http is None:
             self._http = _new_session(proxy=self.proxy, timeout=self.timeout)
             jar = getattr(self._http, "cookies", None)
@@ -875,6 +881,7 @@ class ChatGPTClient:
 
     @property
     def stripe_http(self):
+        self._check_credentials()
         if self._stripe_http is None:
             self._stripe_http = _new_session(proxy=self.proxy, timeout=self.timeout)
             self._stripe_http.headers.update(
@@ -1627,6 +1634,8 @@ class ChatGPTClient:
                 attempts=min(3, attempts),
                 interval=min(0.6, interval) if interval else 0,
             ) or page
+        if self.credentials_current is not None and not self.credentials_current():
+            return page
         if checkout_requires_approval(page):
             approved = self.approve_checkout(
                 checkout_session_id=checkout_session_id,
@@ -1669,6 +1678,8 @@ class ChatGPTClient:
             return {}
         last: Dict[str, Any] = {}
         for _ in range(max(1, attempts)):
+            if self.credentials_current is not None and not self.credentials_current():
+                break
             payload = self._poll_payment_page_once(session_id=session_id, publishable_key=pk)
             if payload:
                 last = payload
@@ -1930,8 +1941,10 @@ class ChatGPTClient:
         return payload
 
     def subscription_payload(self) -> Dict[str, Any]:
+        self._check_credentials()
         if not self.account_id:
             self.hydrate()
+        self._check_credentials()  # /me can finish after the Vault lease expires.
         response = self.http.get(
             f"{APP_BASE}/backend-api/subscriptions",
             # 上游现已要求显式 account_id，否则 400 "must specify either organization_id or account_id"。

@@ -147,14 +147,50 @@ def test_fake_account_reports_inactive_when_configured() -> None:
     ("active", None, True),
     ("trialing", "2099-01-01T00:00:00Z", True),
 ])
-def test_team_entitlement_needs_current_active_status(monkeypatch, status, expiry, expected):
+@pytest.mark.parametrize("plan", ["team", "plus"])
+def test_entitlement_needs_current_active_status(monkeypatch, status, expiry, expected, plan):
     from types import SimpleNamespace
     from gss_account import adapter
 
-    subscription = {"plan": "team", "status": status, "expires_at": expiry}
+    subscription = {"plan": plan, "status": status, "expires_at": expiry}
     client = SimpleNamespace(subscription_payload=lambda: {"subscription": subscription}, close=lambda: None)
     monkeypatch.setattr(adapter, "configured_proxy", lambda *args: None)
     monkeypatch.setattr(adapter.ChatGPTClient, "from_raw_session", lambda *args, **kwargs: client)
     info = asyncio.run(UpstreamAccountAdapter().subscription_status("fixture"))
-    assert info.raw_kind == "team"
+    assert info.raw_kind == plan
     assert info.active is expected
+
+
+def test_account_verification_lease_expires_during_hydration(monkeypatch):
+    from unittest.mock import Mock
+    from gss_account import adapter
+    from gss_contracts.adapter import current_verification_lease, verification_lease
+    from gss_contracts.errors import DomainError, ErrorCode
+
+    current = True
+    client = adapter.ChatGPTClient(access_token="fixture")
+    http = Mock()
+    client._http = http
+    def hydrate():
+        nonlocal current
+        current = False
+        client.account_id = "acct_fixture"
+    monkeypatch.setattr(client, "hydrate", hydrate)
+    monkeypatch.setattr(adapter, "configured_proxy", lambda *a: None)
+    monkeypatch.setattr(adapter.ChatGPTClient, "from_raw_session", lambda *a, **kw: client)
+    with verification_lease(lambda: current):
+        with pytest.raises(DomainError) as exc:
+            asyncio.run(UpstreamAccountAdapter().subscription_status("fixture"))
+    assert exc.value.code is ErrorCode.SESSION_EXPIRED
+    http.get.assert_not_called()  # no new subscription query using the stale session
+    assert current_verification_lease() is None
+
+
+def test_conflicting_subscription_plan_never_counts_as_active(monkeypatch):
+    from types import SimpleNamespace
+    from gss_account import adapter
+    payload = {"plan_type": "plus", "subscription": {"plan": "pro", "status": "active"}}
+    client = SimpleNamespace(subscription_payload=lambda: payload, close=lambda: None)
+    monkeypatch.setattr(adapter, "configured_proxy", lambda *a: None)
+    monkeypatch.setattr(adapter.ChatGPTClient, "from_raw_session", lambda *a, **kw: client)
+    assert not asyncio.run(UpstreamAccountAdapter().subscription_status("fixture")).active

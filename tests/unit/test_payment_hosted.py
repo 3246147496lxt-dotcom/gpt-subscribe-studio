@@ -179,3 +179,83 @@ def test_custom_confirmation_without_payment_evidence_is_not_resubmitted(monkeyp
     result = _pay(plan="plus")
     repeat.assert_not_called()
     assert result.status in {PaymentStatus.PROCESSING, PaymentStatus.ERROR}
+
+
+@pytest.mark.parametrize("change, expected", [
+    ({}, True), ({"session_id": None}, False), ({"id": "cs_test_other"}, False),
+    ({"payment_status": "paid"}, False), ({"payment_intent": "pi_started"}, False),
+    ({"submission_attempt": {"state": "processing"}}, False),
+    ({"payment_object_status": "processing"}, False),
+])
+def test_only_explicit_unattempted_bound_checkout_is_open(change, expected):
+    from gss_payment.adapter import hosted_payment_result
+    data = {"session_id": "cs_fixture", "status": "open", "payment_status": "unpaid", **change}
+    assert hosted_payment_result(data, "cs_fixture").hosted_open_unpaid is expected
+
+
+@pytest.mark.parametrize("change, has_evidence", [
+    ({}, True), ({"session_id": "cs_foreign"}, False), ({"currency": "eur"}, False),
+])
+def test_custom_plus_preserves_only_observed_settlement(monkeypatch, change, has_evidence):
+    from gss_contracts.adapter import receipt_matches_order
+    client = _StubChatGPTClient()
+    _stub_factory(monkeypatch, client)
+    raw = {"session_id": "cs_live_1", "payment_status": "paid", "currency": "usd",
+           "payment_intent": {"id": "pi_test", "object": "payment_intent", "status": "succeeded",
+                              "currency": "usd", "amount_received": 2000}, **change}
+    monkeypatch.setattr(client, "confirm_checkout", lambda **_: raw)
+    monkeypatch.setattr(client, "finalize_stripe_custom_checkout", lambda **_: raw)
+    record = _pay(plan="plus").receipt_evidence
+    assert receipt_matches_order(record, checkout_id="cs_live_1", payment_id="pi_test",
+                                 amount="20", currency="USD") is has_evidence
+    assert not receipt_matches_order(record, checkout_id="cs_live_1", payment_id="pi_other",
+                                     amount="20", currency="USD")
+
+
+@pytest.mark.parametrize("plan", ["team", "plus"])
+@pytest.mark.parametrize("settled", [False, True])
+def test_expired_lease_keeps_confirm_reply_without_new_poll_or_finalize(monkeypatch, plan, settled):
+    from types import SimpleNamespace
+    current = True
+    reads = []
+    raw = ({"session_id": "cs_live_1", "payment_status": "paid",
+            "payment_intent": {"object": "payment_intent", "id": "pi_fixture", "status": "succeeded",
+                               "amount_received": 2000, "currency": "usd"}} if settled else _REQUIRES_APPROVAL)
+
+    def confirm(*args, **kwargs):
+        nonlocal current
+        current = False  # Simulate vault expiry during the original outbound confirmation.
+        return raw
+    def read(*args, **kwargs):
+        reads.append("unexpected")
+        return {}
+
+    client = _StubChatGPTClient()
+    client.close = lambda: None
+    _stub_factory(monkeypatch, client)
+    monkeypatch.setattr(client, "confirm_checkout", confirm)
+    monkeypatch.setattr(client, "finalize_stripe_custom_checkout", read)
+    monkeypatch.setattr("gss_payment.adapter.TeamHostedClient", lambda _: SimpleNamespace(confirm=confirm, poll=read))
+    result = asyncio.run(UpstreamPaymentAdapter().pay(PaymentRequest(
+        checkout_url="https://example.invalid/fixture", country="US", plan=plan, session="fixture",
+        checkout_session_id="cs_live_1", publishable_key="pk_fixture", payment_method_token="ctoken_fixture",
+        team_context={"session_id": "cs_live_1", "publishable_key": "pk_fixture"},
+        credentials_current=lambda: current,
+    )))
+    assert reads == []
+    if settled:
+        assert result.status is PaymentStatus.SUCCEEDED and result.receipt_evidence.amount == 20
+    else:
+        assert result.status is not PaymentStatus.SUCCEEDED and result.receipt_evidence is None
+
+
+@pytest.mark.parametrize("outer, inner", [
+    ({"payment_intent_id": "pi_other"}, {}), ({}, {"checkout_session_id": "cs_other"}),
+    ({"checkout_id": "cs_other"}, {}), ({"intent_id": "pi_other"}, {}),
+])
+def test_contradictory_cross_references_are_never_payment_evidence(outer, inner):
+    from gss_payment.adapter import hosted_payment_result
+    payload = {"session_id": "cs_this", "payment_status": "paid", **outer,
+               "payment_intent": {"id": "pi_this", "status": "succeeded", "amount_received": 2000,
+                                  "currency": "usd", **inner}}
+    assert hosted_payment_result(payload, "cs_this").receipt_evidence is None

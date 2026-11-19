@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from gss_contracts import (
     AccountAdapter,
@@ -30,6 +30,7 @@ from gss_contracts import (
     assert_transition,
     is_deliverable,
 )
+from gss_contracts.adapter import verification_lease
 from gss_contracts.errors import DomainError, ErrorCode
 
 #: 支付结果 → 订单状态映射（ADR 0002：不允许把「请求成功」当成「订阅生效」）。
@@ -116,6 +117,7 @@ class OrderPipeline:
         rv_timestamp: Optional[str] = None,
         session_reissued: bool = False,
         exit_country: Optional[str] = None,
+        credentials_current: Optional[Callable[[], bool]] = None,
     ) -> PaymentResult:
         """阶段二：卡支付。按 ``card_source`` 校验必备入参（凭证只在此处入参传递）。"""
 
@@ -141,13 +143,16 @@ class OrderPipeline:
             billing=billing, plan=plan, team_context=team_context,
             passive_captcha_token=passive_captcha_token, rv_timestamp=rv_timestamp,
             session_reissued=session_reissued,
-            exit_country=exit_country,
+            exit_country=exit_country, credentials_current=credentials_current,
         )
         return await self.deps.payment.pay(req)
 
-    async def verify(self, *, session: str) -> SubscriptionInfo:
+    async def verify(self, *, session: str, credentials_current: Optional[Callable[[], bool]] = None) -> SubscriptionInfo:
         """阶段三：订阅校验。交付前必须调用。"""
 
+        if credentials_current is not None:
+            with verification_lease(credentials_current):
+                return await self.deps.account.subscription_status(session)
         return await self.deps.account.subscription_status(session)
 
 

@@ -58,6 +58,7 @@ def flow(monkeypatch):
                 "publishable_key": state.get("response_key", "pk_test_direct"), "account_id": state.get("response_account", state["account"]),
                 "customer_session_client_secret": state.get("response_cuss", "cuss_fixture"),
                 "status": state["page_status"], "payment_status": state["payment_status"],
+                "amount_paid": state["minor"] if state["payment_status"] == "paid" else 0,
                 "billing_details": {"country": "JP", "currency": state.get("response_currency", "JPY")},
                 "checkout_state": {"currency": state.get("response_currency", "JPY"),
                     "total": {"subtotal": {"minorUnitsAmount": 2727}, "discount": {"minorUnitsAmount": 1364},
@@ -66,6 +67,7 @@ def flow(monkeypatch):
     def intent():
         return {"id": state.get("pi_response_id", "pi_direct_fixture"), "status": state["pi_status"],
                 "customer": state.get("pi_customer", "cus_fixture"), "payment_method": state.get("pi_pm", "pm_fixture"),
+                "amount_received": state["minor"] if state["pi_status"] == "succeeded" else 0,
                 "amount": state.get("pi_amount", state["minor"]), "currency": state.get("pi_currency", "jpy"),
                 "next_action": {"type": "use_stripe_sdk", "use_stripe_sdk": {"secret": "not-returned-fixture"}},
                 "last_payment_error": {"code": "card_declined", "decline_code": "insufficient_funds", "message": "Fixture insufficient funds"}}
@@ -453,7 +455,8 @@ def test_already_completed_checkout_never_creates_a_second_financial_attempt(flo
 
 def test_expired_checkout_is_not_submitted_again(flow):
     flow.state["page_status"] = "expired"
-    assert post(flow)["state"] == "request_rejected"
+    assert post(flow)["state"] == "unknown"
+    assert post(flow)["payment_status"] == "processing"
     assert "token_create" not in names(flow)
 
 

@@ -42,18 +42,21 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode, urlsplit
 
 import httpx
 
+from gss_contracts.adapter import PaymentReceiptEvidence
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.chatgpt import (
     APP_BASE,
     STRIPE_API_VERSION,
     STRIPE_BASE,
     ChatGPTClient,
+    _intent_object,
     _json,
     payment_intent_from_confirm,
     public_checkout_id,
@@ -87,6 +90,44 @@ logger = logging.getLogger("gss.plus_har")
 
 _DECLINED_INTENT_STATES = {"requires_payment_method", "canceled", "cancelled"}
 _CARD_REJECTION_CODES = {"card_declined", "expired_card", "incorrect_cvc", "incorrect_number"}
+
+
+def cash_receipt(checkout_id, payment_id, received_minor, currency, expected_minor):
+    """Only settled money with an original transaction reference, never the quoted total."""
+    if (not checkout_id or not isinstance(payment_id, str) or not payment_id.startswith("pi_")
+            or type(received_minor) is not int or received_minor <= 0 or received_minor != expected_minor
+            or not currency):
+        return None
+    code = str(currency).upper()
+    return PaymentReceiptEvidence(checkout_id=checkout_id, payment_id=payment_id,
+                                  amount=Decimal(received_minor) / _factor(code), currency=code)
+
+
+def active_plus_entitlement(payload: dict, account_id: str = "") -> bool:
+    entitlement = payload.get("entitlement") or {}
+    subscription = payload.get("subscription") or {}
+    if not isinstance(entitlement, dict) or not isinstance(subscription, dict):
+        return False
+    plans = [str(v).lower() for v in (payload.get("plan_type"), entitlement.get("subscription_plan"),
+                                      subscription.get("plan")) if v]
+    flags = [payload.get("is_active"), entitlement.get("has_active_subscription")]
+    if not plans or any(v not in {"plus", "chatgptplusplan"} for v in plans):
+        return False
+    if not any(v is True for v in flags) or any(v is False for v in flags):
+        return False
+    for record in (payload, entitlement, subscription):
+        if record.get("is_delinquent") is True or (record.get("account_id") and record["account_id"] != account_id):
+            return False
+        if record.get("status") and record["status"] not in {"active", "trialing", "paid"}:
+            return False
+        if record.get("expires_at") is not None:
+            try:
+                expiration = datetime.fromisoformat(str(record["expires_at"]).replace("Z", "+00:00"))
+                if expiration.tzinfo is None or expiration <= datetime.now(timezone.utc):
+                    return False
+            except ValueError:
+                return False
+    return True
 
 
 def _confirmed_decline(out: PaymentOutcome) -> bool:
@@ -190,6 +231,12 @@ class PlusHarProtocol:
 
         self.mode = (telemetry or os.environ.get("GSS_HAR_TELEMETRY", "full")).lower()
         self.read_only = bool(read_only)
+        self.confirmation_started = False
+        self.on_confirmation_start = lambda: None
+        self.receipt_expected_minor: int | None = None
+        self.receipt_evidence = None
+        self.plus_entitlement_verified = False
+        self.credentials_current = lambda: True
         self.stage = "checkout"
         self._owns_client = client is None
         self.client: Optional[ChatGPTClient] = client
@@ -329,9 +376,14 @@ class PlusHarProtocol:
             headers["openai-sentinel-so-token"] = self.client.sentinel_so
         return headers
 
+    def _require_credentials(self) -> None:
+        if not self.credentials_current():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期，本次未发起新查询")
+
     def _app(self, method: str, route: str, *, json_body: Any = None,
              params: Optional[Dict[str, Any]] = None, telemetry: Optional[str] = None,
              referer: str = "https://chatgpt.com/") -> Any:
+        self._require_credentials()
         url = f"{APP_BASE}{route}"
         headers = self._web_headers(referer=referer, json_body=json_body is not None,
                                     telemetry=telemetry)
@@ -350,7 +402,7 @@ class PlusHarProtocol:
             self.client.language = self.device.locale
             self.client.timezone = self.device.timezone
             try:
-                restore_account(self.client, self.expected_account)
+                restore_account(self.client, self.expected_account, credentials_current=self.credentials_current)
             except DomainError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -378,6 +430,7 @@ class PlusHarProtocol:
             self.telemetry.deadline = time.time() + budget
 
     def _sentinel(self, flow: str) -> None:
+        self._require_credentials()
         try:
             self.client.mint_sentinel(flow=flow, page_url="https://chatgpt.com/")
         except Exception as exc:  # noqa: BLE001
@@ -847,13 +900,12 @@ class PlusHarProtocol:
     # ── 6. settle ──────────────────────────────────────────────────
     def _subscription_active(self) -> bool:
         try:
+            self._require_credentials()
             payload = self.client.subscription_payload()
         except Exception:  # noqa: BLE001
             return False
-        entitlement = payload.get("entitlement") if isinstance(payload.get("entitlement"), dict) else {}
-        plan = str(payload.get("plan_type") or entitlement.get("subscription_plan") or "").lower()
-        active = payload.get("is_active") is True or entitlement.get("has_active_subscription") is True
-        return plan in {"plus", "chatgptplusplan"} and active
+        self.plus_entitlement_verified = active_plus_entitlement(payload, self.expected_account or self.client.account_id)
+        return self.plus_entitlement_verified
 
     def _ack_checkout(self) -> bool:
         body = {"stripe_checkout_session_id": self.checkout_id,
@@ -865,6 +917,57 @@ class PlusHarProtocol:
             return int(getattr(response, "status_code", 0) or 0) < 400 and payload.get("success") is True
         except Exception:  # noqa: BLE001
             return False
+
+    def _bound_page(self, page: dict) -> bool:
+        if self.receipt_expected_minor is None or not self.checkout_id or page.get("checkout_session_id") != self.checkout_id:
+            return False
+        if page.get("account_id") and page["account_id"] != (self.expected_account or getattr(self.client, "account_id", "")):
+            return False
+        state = page.get("checkout_state") or {}
+        if not isinstance(state, dict):
+            return False
+        currencies = [str(c).upper() for c in (page.get("currency"), state.get("currency")) if c]
+        if not currencies or any(currency != self.currency for currency in currencies):
+            return False
+        try:
+            amount = self._total_minor(page)
+        except DomainError:
+            return False
+        if amount < 0 or amount != self.receipt_expected_minor or (page.get("payment_status") == "no_payment_required" and amount != 0):
+            return False
+        if any(type(page[k]) is not int or page[k] != amount for k in ("amount_received", "amount_paid") if k in page):
+            return False
+        if page.get("id") and str(page["id"]).startswith(("cs_", "oaics_")) and page["id"] != self.checkout_id:
+            return False
+        for pi in (page.get("payment_intent"), self.raw.get("intent")):
+            if not isinstance(pi, dict):
+                continue
+            if pi.get("id") and self.intent_id and pi["id"] != self.intent_id:
+                return False
+            if pi.get("currency") and str(pi["currency"]).upper() != self.currency:
+                return False
+            if "amount_received" in pi and (type(pi["amount_received"]) is not int or pi["amount_received"] != amount):
+                return False
+        referred = page.get("payment_intent_id") or (
+            page.get("payment_intent") if isinstance(page.get("payment_intent"), str) else None)
+        return not (referred and self.intent_id and referred != self.intent_id)
+
+    def _page_receipt(self, page):
+        page_intent, _, _ = payment_intent_from_confirm(page)
+        page_intent = page_intent or page.get("payment_intent_id")
+        if self.intent_id and page_intent and self.intent_id != page_intent:
+            return None
+        nested = page.get("payment_intent")
+        nested = nested if isinstance(nested, dict) else {}
+        received = page.get("amount_paid", page.get("amount_received", nested.get("amount_received")))
+        currency = page.get("currency") or (page.get("checkout_state") or {}).get("currency")
+        return cash_receipt(self.checkout_id, page_intent, received, currency, self.receipt_expected_minor)
+
+    def _bound_intent(self, intent: dict) -> bool:
+        amount = intent.get("amount_received")
+        return bool(intent.get("status") == "succeeded" and self.intent_id.startswith("pi_") and self.intent_id == intent.get("id")
+                    and type(amount) is int and amount > 0 and amount == self.receipt_expected_minor
+                    and str(intent.get("currency") or "").upper() == self.currency)
 
     def _settle(self) -> PaymentOutcome:
         out = PaymentOutcome()
@@ -922,6 +1025,20 @@ class PlusHarProtocol:
         status = str(page.get("status") or "")
         payment_status = str(page.get("payment_status") or "")
         if status == "complete" and payment_status in {"paid", "no_payment_required"}:
+            if not self._bound_page(page):
+                out.message = "回执与原结账或报价未匹配，不能确认扣款"
+                return out
+            if page.get("payment_status") == "no_payment_required" and self.receipt_expected_minor == 0:
+                out.state, out.message = "no_payment_required", "本单无需扣款"
+                return out
+            self.receipt_evidence = self._page_receipt(page)
+            if self.receipt_evidence is None and self._bound_intent(intent_payload):
+                self.receipt_evidence = cash_receipt(self.checkout_id, self.intent_id, intent_payload["amount_received"],
+                                                    intent_payload["currency"], self.receipt_expected_minor)
+            if self.receipt_evidence is None:
+                out.message = "缺少可对应原订单的实收回执"
+                return out
+            out.intent_id = self.receipt_evidence.payment_id
             if not self.read_only:
                 self._ack_checkout()
             if self._subscription_active():
@@ -934,6 +1051,11 @@ class PlusHarProtocol:
                 out.message = "付款已确认，等待 Plus 订阅生效"
             return out
         if intent_status == "succeeded":
+            if not self._bound_intent(intent_payload):
+                out.message = "实收凭据未与本单金额及币种匹配"
+                return out
+            self.receipt_evidence = cash_receipt(self.checkout_id, self.intent_id, intent_payload["amount_received"],
+                                                intent_payload["currency"], self.receipt_expected_minor)
             out.state = "pending"
             out.intent_status = intent_status
             out.message = "付款已确认，等待结账状态更新"
@@ -957,6 +1079,15 @@ class PlusHarProtocol:
     def pay(self) -> PaymentOutcome:
         if not self.checkout_url and not self.checkout_id:
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "缺少结账会话")
+        self._require_credentials()
+        if self.read_only or self.confirmation_started:
+            # Never mint a new checkout or send any confirmation during reconciliation.
+            if not self.checkout_id:
+                return PaymentOutcome(state="unknown", message="缺少原结账标识，请核对原付款")
+            self.read_only = True
+            self._prepare()
+            self._read_checkout()
+            return self._read_only_settle()
         self._prepare()
         self._prelude()
         self._sentinel("chatgpt_checkout")
@@ -967,7 +1098,16 @@ class PlusHarProtocol:
         # capture entries 41/42: the checkout page re-mints the chatgpt_checkout
         # sentinel right after reading the session, before Elements boots.
         self._sentinel("chatgpt_checkout")
-        if str(payload.get("status") or "") == "complete":
+        page_status, payment_status = payload.get("status"), payload.get("payment_status")
+        if (page_status != "open" or payment_status != "unpaid"
+                or payload.get("payment_intent") or payload.get("payment_intent_id")):
+            # No fresh financial write when the merchant reports a prior attempt.
+            self.confirmation_started = True
+            self.on_confirmation_start()
+            self.read_only = True
+            self.stage = "payment"
+            if page_status != "complete":
+                return self._read_only_settle()
             out = self._settle()
             if out.state == "unknown":
                 out.state = "pending"
@@ -978,9 +1118,6 @@ class PlusHarProtocol:
                     self.checkout_id, payload.get("status"), self.amount_minor, self.currency)
         if self.telemetry is not None:
             self.telemetry.ctx.amount = self.amount_minor
-        if self.read_only:
-            return self._read_only_settle()
-
         self._elements_session()
         if self.mode != "off":
             # SDK/iframe resources first, then the passive token, matching the
@@ -1016,8 +1153,27 @@ class PlusHarProtocol:
 
         self._sentinel("checkout_session_approval")
         self._sentinel("chatgpt_checkout")
+        # Set the fence before I/O: a lost reply cannot prove the request was not applied.
+        self._require_credentials()
+        if self.receipt_expected_minor is None:
+            self.receipt_expected_minor = self.amount_minor
+        self.confirmation_started = True
+        self.on_confirmation_start()
         self._app_confirm()
+        observed = _intent_object(self.confirmed)
+        # A successful application response, an intent ID or a secret alone is
+        # not permission to confirm again. Only the original, unsubmitted PI
+        # explicitly requiring confirmation may take the existing initial step.
+        if (observed.get("status") != "requires_confirmation"
+                or not self.intent_id.startswith("pi_") or observed.get("id") != self.intent_id
+                or not self.intent_secret.startswith(self.intent_id + "_secret_")
+                or self.confirmed.get("payment_status") == "paid"
+                or self.confirmed.get("status") in {"complete", "completed", "processing", "succeeded", "requires_action"}):
+            self.raw["intent"] = observed
+            self.read_only = True
+            return self._settle()
         self._sentinel("checkout_session_approval")
+        self._require_credentials()
         self._intent_confirm()
         self._flush(PHASE_CONFIRM)
 
@@ -1029,13 +1185,16 @@ class PlusHarProtocol:
         return out
 
     def _quote_guard(self) -> Optional[PaymentOutcome]:
-        """税后金额高于用户确认值时暂停，等前端确认新报价再付。
+        """有明确订单金额时，任何报价变化都需先确认，不以变化后的金额作为原收据依据。
 
         HAR 里这是 UI 自动刷新金额后由人再点一次；纯协议没有这一步，所以这里
         主动返回 pending/checkout，前端已经有 `quoteChanged` 分支接这个状态。
-        税后更低（优惠/免税）直接放行，按实际应付额收款。
+        无订单快照的旧调用保留单向报价上限。
         """
-        if not self.expected_amount_minor or self.amount_minor <= self.expected_amount_minor:
+        if self.receipt_expected_minor is not None:
+            if self.amount_minor == self.receipt_expected_minor:
+                return None
+        elif not self.expected_amount_minor or self.amount_minor <= self.expected_amount_minor:
             return None
         self.stage = "checkout"
         out = PaymentOutcome()
@@ -1055,6 +1214,17 @@ class PlusHarProtocol:
         payment_status = str(page.get("payment_status") or "")
         if status == "complete" and payment_status in {"paid", "no_payment_required"}:
             self.stage = "payment"
+            if not self._bound_page(page):
+                out.message = "回执与原结账或报价未匹配，不能确认扣款"
+                return out
+            if page.get("payment_status") == "no_payment_required" and self.receipt_expected_minor == 0:
+                out.state, out.message = "no_payment_required", "本单无需扣款"
+                return out
+            self.receipt_evidence = self._page_receipt(page)
+            if self.receipt_evidence is None:
+                out.message = "缺少可对应原订单的实收回执"
+                return out
+            out.intent_id = self.receipt_evidence.payment_id
             out.state = "paid" if self._subscription_active() else "pending"
             out.intent_status = "succeeded"
             out.message = "原结账已完成" if out.state == "paid" else "付款已确认，等待订阅生效"
@@ -1063,6 +1233,7 @@ class PlusHarProtocol:
             self.stage = "payment"
             out.intent_id = self.intent_id
             try:
+                self._require_credentials()
                 intent = self.client.retrieve_stripe_intent(
                     intent_id=self.intent_id, client_secret=self.intent_secret,
                     publishable_key=self.publishable_key)
@@ -1071,6 +1242,11 @@ class PlusHarProtocol:
             matches = self.intent_id.startswith("pi_") and intent.get("id") == self.intent_id
             state = str(intent.get("status") or "") if matches else ""
             if state == "succeeded":
+                if not self._bound_intent(intent):
+                    out.message = "实收凭据未与本单金额及币种匹配"
+                    return out
+                self.receipt_evidence = cash_receipt(self.checkout_id, self.intent_id, intent["amount_received"],
+                                                    intent["currency"], self.receipt_expected_minor)
                 out.state = "pending"
                 out.intent_status = state
                 out.message = "付款已确认，等待结账状态更新"
@@ -1084,8 +1260,13 @@ class PlusHarProtocol:
             out.intent_status = state or None
             out.message = "原付款结果待核对，请勿重复支付"
             return out
-        out.state = "pending"
-        out.message = "原结账尚未提交付款"
+        if self.confirmation_started:
+            self.stage = "payment"
+            out.state = "unknown"
+            out.message = "原付款结果待核对，请勿重复支付"
+        else:
+            out.state = "pending"
+            out.message = "原结账尚未提交付款"
         return out
 
     def _flush(self, phase: int) -> None:
@@ -1097,22 +1278,9 @@ class PlusHarProtocol:
             pass
 
     def pay_from_url(self, retries: int = 3) -> PaymentOutcome:
-        last: Optional[Exception] = None
-        for attempt in range(retries):
-            try:
-                return self.pay()
-            except DomainError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                message = str(exc)
-                if not any(key in message for key in ("SSL", "EOF", "ConnectError", "TLS")):
-                    raise
-                if attempt == retries - 1 or self.pin_proxy:
-                    raise
-                logger.warning("plus_har_proxy_retry attempt=%s err=%s", attempt + 1, message[:120])
-                self.rotate_proxy_sid()
-        raise last if last else DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "协议支付重试失败")
+        """Run a single attempt; a transport exception must never replay a payment."""
+        return self.pay()
+
 
 
 def outcome_from_payment(result: PaymentOutcome, *, stage: str = "payment") -> Dict[str, Any]:
@@ -1151,7 +1319,9 @@ def run_har_context(
     Stripe ids in `context` so a follow-up status query uses the same device.
     """
     try:
-        restore_account(client, str(spec.get("account_id") or ""))
+        if not spec.get("credentials_current", lambda: True)():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
+        restore_account(client, str(spec.get("account_id") or ""), credentials_current=spec.get("credentials_current"))
     except DomainError as exc:
         payload = outcome("unknown", "checkout", redact_sensitive(exc.message)[:240],
                           code=str(exc.code))
@@ -1161,6 +1331,7 @@ def run_har_context(
         payload = outcome("unknown", "checkout", redact_sensitive(str(exc))[:240])
         payload["stage"] = "checkout"
         return payload
+    read_only = read_only or bool(context.get("app_confirmation_started") or context.get("intent_id"))
     if client.account_id:
         context["account_id"] = client.account_id
     device = None
@@ -1175,8 +1346,8 @@ def run_har_context(
         checkout_url=str(spec.get("checkout_url") or ""),
         checkout_id=str(context.get("checkout_id") or spec.get("checkout_id") or ""),
         publishable_key=str(spec.get("publishable_key") or ""),
-        card=card or {},
-        billing=billing or {},
+        card={} if read_only else (card or {}),
+        billing={} if read_only else (billing or {}),
         proxy=getattr(client, "proxy", None),
         currency=currency,
         customer_session_client_secret=str(spec.get("customer_session_client_secret") or ""),
@@ -1190,12 +1361,22 @@ def run_har_context(
         read_only=read_only,
         hcaptcha_token=str(context.get("hcaptcha_token") or ""),
     )
+    engine.credentials_current = spec.get("credentials_current", lambda: True)
+    engine.confirmation_started = bool(context.get("app_confirmation_started") or context.get("intent_id"))
+    engine.on_confirmation_start = lambda: context.update(app_confirmation_started=True)
     if context.get("intent_id"):
         engine.intent_id = str(context["intent_id"])
         engine.intent_secret = str(context.get("intent_secret") or "")
     if context.get("confirmation_token"):
         engine.ctoken = str(context["confirmation_token"])
-    if context.get("amount_minor"):
+    expected = spec.get("expected_amount") if spec.get("expected_amount") is not None else spec.get("amount")
+    if expected is not None:
+        quoted = Decimal(str(expected)) * _factor(currency)
+        if quoted.is_finite() and quoted >= 0 and quoted == quoted.to_integral_value():
+            engine.receipt_expected_minor = int(quoted)
+    if context.get("receipt_expected_minor") is not None:
+        engine.receipt_expected_minor = context["receipt_expected_minor"]
+    if context.get("amount_minor") is not None:
         engine.amount_minor = int(context["amount_minor"])
         engine.expected_amount_minor = engine.amount_minor
     try:
@@ -1225,10 +1406,15 @@ def run_har_context(
         if pm:
             context["payment_method_id"] = pm
         context["har_stage"] = engine.stage
-        if engine.confirmed:
+        if engine.confirmation_started or engine.confirmed:
             context["app_confirmation_started"] = True
+            if engine.receipt_expected_minor is not None:
+                context.setdefault("receipt_expected_minor", engine.receipt_expected_minor)
         engine.close()
     payload = outcome_from_payment(result, stage=engine.stage)
+    payload["_receipt_evidence"] = engine.receipt_evidence
+    payload["_plus_verified"] = engine.plus_entitlement_verified
+    payload["_verified_zero"] = result.state == "no_payment_required" and engine.receipt_expected_minor == 0
     payload["stage"] = engine.stage
     return payload
 

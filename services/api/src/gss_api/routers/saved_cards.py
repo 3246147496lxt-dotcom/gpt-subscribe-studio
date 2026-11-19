@@ -46,8 +46,16 @@ def _prepare_reply(context: dict[str, Any]) -> dict[str, Any]:
     return {key: context[key] for key in ("state", "setup_intent_id", "client_secret", "publishable_key")}
 
 
-def _inspect(secrets) -> dict[str, Any]:
+def _leased_client(order_id, secrets):
+    if vault.get(order_id) is not secrets:
+        raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
     client = _client(secrets)
+    client.credentials_current = lambda: vault.get(order_id) is secrets
+    return client
+
+
+def _inspect(order_id, secrets) -> dict[str, Any]:
+    client = _leased_client(order_id, secrets)
     try:
         return inspect_account_setup(client, secrets.saved_card_context)
     finally:
@@ -73,7 +81,7 @@ async def prepare_saved_card(order_id: str) -> dict:
             raise HTTPException(409, "离线适配器不提供真实的保存卡片会话")
         context = {"state": "preparing"}
         secrets.saved_card_context = context
-        client = _client(secrets)
+        client = _leased_client(order_id, secrets)
         try:
             await asyncio.to_thread(prepare_account_setup, client, context, secrets.account_id)
             secrets.account_id = context["account_id"]
@@ -107,7 +115,7 @@ async def saved_card_status(order_id: str) -> dict:
         if not context.get("setup_intent_id") or not context.get("client_secret"):
             return {"state": "prepare_unknown", "message": "保存卡片会话的准备结果待确认，本次未重复发送请求"}
         try:
-            return await asyncio.to_thread(_inspect, secrets)
+            return await asyncio.to_thread(_inspect, order_id, secrets)
         except DomainError as exc:
             raise _from_domain(exc)
         except Exception:
@@ -123,7 +131,7 @@ async def refresh_saved_card_checkout(order_id: str) -> dict:
         if not context or not context.get("setup_intent_id"):
             raise HTTPException(409, "请先保存卡片并查询成功状态")
         try:
-            inspected = await asyncio.to_thread(_inspect, secrets)
+            inspected = await asyncio.to_thread(_inspect, order_id, secrets)
         except DomainError as exc:
             raise _from_domain(exc)
         except Exception:
@@ -134,10 +142,12 @@ async def refresh_saved_card_checkout(order_id: str) -> dict:
             if view.checkout_session_id != context["refreshed_checkout_id"]:
                 raise HTTPException(409, "结账上下文已发生变化，请重新查询订单")
             return {"order": _to_out(order), "payment_method_id": context["payment_method_id"], "card": context["card"]}
-        client = _client(secrets)
+        client = _leased_client(order_id, secrets)
         try:
             def _refresh():
                 restore_account(client, context["account_id"])
+                if not client.credentials_current():
+                    raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
                 checkout = client.create_checkout(
                     plan=str(order.plan), country=order.billing_country,
                     promo=order.mode.billing_mode is BillingMode.PROMO,

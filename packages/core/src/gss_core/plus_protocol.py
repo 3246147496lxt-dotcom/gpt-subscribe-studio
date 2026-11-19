@@ -86,6 +86,7 @@ class PlusProtocol:
         self.billing = billing or {}
         self.proxy = proxy or None
         self.pin_proxy = pin_proxy
+        self.credentials_current = lambda: True
         # 指纹必须与建单、求解器完全一致
         self.profile = dict(profile or {})
         derived = profile_from_session_ua(user_agent) if user_agent else None
@@ -150,7 +151,12 @@ class PlusProtocol:
                 pass
             self._http = None
 
+    def _require_current(self) -> None:
+        if not self.credentials_current():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
+
     def _stripe(self) -> httpx.Client:
+        self._require_current()
         if self._http is None:
             self._http = httpx.Client(
                 proxy=self.proxy,
@@ -260,6 +266,7 @@ class PlusProtocol:
         return r.status_code, payload
 
     def _confirm(self, ctoken: str, save_choice: Optional[bool]) -> Dict[str, Any]:
+        self._require_current()
         return self.client.confirm_checkout(
             checkout_session_id=self.checkout_id,
             confirm_token=ctoken,
@@ -444,6 +451,7 @@ class PlusProtocol:
                 "未能获取 hCaptcha 令牌，已终止（未提交任何支付请求）。"
                 "请检查求解器服务是否可用。",
             )
+        self._require_current()
         ctoken = self.client.create_confirmation_token(
             publishable_key=self.publishable_key, payment_method=pm, setup_future_usage="off_session",
             card=(None if pm else self.card), billing=(None if pm else self.billing),
@@ -464,6 +472,7 @@ class PlusProtocol:
         # ① Sentinel（失败不阻断，先跑通链路）
         try:
             log("① 铸造 Sentinel 令牌")
+            self._require_current()
             self.client.mint_sentinel(flow="chatgpt_checkout", page_url=self.checkout_url)
             log("   已挂 openai-sentinel-token")
         except Exception as exc:  # noqa: BLE001
@@ -493,7 +502,8 @@ class PlusProtocol:
 
         # classify 期望 HTTP 包装 {status, body}；这里只借它抽错误字段，
         # 状态由本方法自己判（hosted 流程的状态机不适用于 custom）。
-        if self.is_stripe_custom:
+        if self.is_stripe_custom and self.credentials_current():
+            self.client.credentials_current = self.credentials_current
             log("④b finalize custom checkout → PaymentIntent")
             confirmed = self.client.finalize_stripe_custom_checkout(
                 checkout_session_id=self.checkout_id,
@@ -544,6 +554,7 @@ class PlusProtocol:
         if pi_status == "requires_action":
             if intent_id and intent_secret:
                 try:
+                    self._require_current()
                     live = self.client.retrieve_stripe_intent(
                         intent_id=intent_id,
                         client_secret=intent_secret,
@@ -584,6 +595,7 @@ class PlusProtocol:
             # 带好卡数据与 radar token，直接用，不必也不能再建（无 pm_ 会 400）。
             if pm:
                 try:
+                    self._require_current()
                     intent_ctoken = self.client.create_confirmation_token(
                         publishable_key=self.publishable_key,
                         payment_method=pm,
@@ -592,6 +604,7 @@ class PlusProtocol:
                     log(f"   intent ctoken {intent_ctoken[:14]}… (off_session)")
                 except Exception as exc:  # noqa: BLE001
                     log(f"   intent ctoken 创建失败，复用原 token：{str(exc)[:70]}")
+            self._require_current()
             http_status, final = self.confirm_intent_raw(
                 intent_id=intent_id,
                 client_secret=intent_secret,

@@ -4,6 +4,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from pathlib import Path
+from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,9 +13,36 @@ from gss_api.main import create_app
 from gss_api.store import store
 from gss_core.vault import vault
 from gss_contracts import OrderStatus, PaymentResult, PaymentStatus, SubscriptionInfo
+from gss_payment.adapter import hosted_payment_result
 
 FIXTURE = json.loads((Path(__file__).parents[1] / "fixtures/team_hosted_success.json").read_text())
 BILLING = {"name": "Fixture", "line1": "Fixture Street", "city": "Fixture City", "state": "OR", "postal_code": "00000", "country": "US"}
+
+
+def _receipt_payload(oid):
+    view = store.view(oid)
+    return {"session_id": view.checkout_session_id, "payment_status": "paid",
+            "workspace_id": "ws_new_fixture", "payment_intent": {
+                "id": "pi_paid_fixture", "object": "payment_intent", "status": "succeeded",
+                "currency": view.currency.lower(), "amount_received": int(Decimal(view.amount) * 100),
+            }}
+
+
+def _paid(oid):
+    data = _receipt_payload(oid)
+    return hosted_payment_result(data, data["session_id"])
+
+
+def _confirmed_team():
+    return SubscriptionInfo(active=True, raw_kind="team", workspace_name="Team Workspace",
+                            workspace_id="ws_new_fixture", seat_quantity=2)
+
+
+def _open_for_first_payment(monkeypatch):
+    from gss_api.routers import orders
+    monkeypatch.setattr(orders.TeamHostedClient, "poll", lambda self, **kw: {
+        "session_id": kw["session_id"], "status": "open", "payment_status": "unpaid",
+    }, raising=False)
 
 
 @pytest.fixture
@@ -41,7 +69,7 @@ def setup_team(monkeypatch):
                     "guid": "fixture-guid", "muid": "fixture-muid", "sid": "fixture-sid", "passive_captcha": {}}
         def poll(self, **kw):
             calls.append(("GET-poll", kw))
-            return {**FIXTURE["poll"]["record"]["response"]["fields"], "payment_status": "paid"}
+            return {**FIXTURE["poll"]["record"]["response"]["fields"], **_receipt_payload(order_id)}
     monkeypatch.setattr("gss_api.routers.orders._team_client", lambda *a: FakeClient())
     monkeypatch.setattr("gss_api.routers.orders.TeamHostedClient", Hosted)
     return client, order_id, calls
@@ -62,7 +90,7 @@ def test_prepare_requotes_before_pm_and_keeps_egp(setup_team):
 
 def test_verified_team_entitlement_delivers_and_clears_secrets(setup_team, monkeypatch):
     client, order_id, calls = setup_team
-    verify = AsyncMock(return_value=SubscriptionInfo(active=True, raw_kind="team"))
+    verify = AsyncMock(return_value=_confirmed_team())
     monkeypatch.setattr("gss_api.routers.orders.build_pipeline", lambda: SimpleNamespace(verify=verify))
     store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
     r = client.post(f"/api/orders/{order_id}/team/poll")
@@ -119,15 +147,16 @@ def test_team_successful_confirm_is_idempotent_after_entitlement_verification(se
             assert request.team_context["checkout_config_id"] == "fixture-config-updated"
             assert request.passive_captcha_token == "fixture-captcha"
             confirms.append(request)
-            return PaymentResult(status=PaymentStatus.SUCCEEDED, provider_ref="cs_test_fixture")
+            return _paid(order_id)
     class Account:
         async def subscription_status(self, session):
-            return SubscriptionInfo(active=True, raw_kind="team")
+            return _confirmed_team()
     from gss_orchestrator.pipeline import OrderPipeline, PipelineDeps
     pipeline = OrderPipeline(PipelineDeps(checkout=None, payment=Payment(), account=Account()))
     monkeypatch.setattr("gss_api.routers.orders.build_pipeline", lambda: pipeline)
     body = {"payment_method_token": "pm_fixture", "team_context_id": "fixture-context", "billing": BILLING,
             "passive_captcha_token": "fixture-captcha"}
+    _open_for_first_payment(monkeypatch)
     r = client.post(f"/api/orders/{order_id}/pay", json=body)
     assert r.status_code == 200, r.text
     assert r.json()["payment_status"] == "succeeded"
@@ -208,17 +237,18 @@ def test_server_side_card_is_tokenized_then_confirmed(setup_team, monkeypatch):
     class Payment:
         async def pay(self, request):
             assert request.payment_method_token == "pm_server_fixture"
-            return PaymentResult(status=PaymentStatus.SUCCEEDED, provider_ref="cs_test_fixture")
+            return _paid(order_id)
 
     class Account:
         async def subscription_status(self, session):
-            return SubscriptionInfo(active=True, raw_kind="team")
+            return _confirmed_team()
 
     monkeypatch.setattr("gss_api.routers.orders.TeamHostedClient", Hosted)
     monkeypatch.setattr("gss_api.routers.orders.build_pipeline",
                         lambda: OrderPipeline(PipelineDeps(checkout=None, payment=Payment(), account=Account())))
     body = {"billing": BILLING, "team_context_id": "fixture-context",
             "card": {"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2030"}}  # release-check: ignore
+    _open_for_first_payment(monkeypatch)
     r = client.post(f"/api/orders/{order_id}/pay", json=body)
     assert r.status_code == 200, r.text
     assert tokenized and tokenized[0]["publishable_key"].startswith("pk_")
@@ -248,6 +278,7 @@ def test_server_card_decline_keeps_order_awaiting_payment(setup_team, monkeypatc
     body = {"billing": BILLING, "team_context_id": "fixture-context",
             # Public Stripe decline-test PAN, not a real card.
             "card": {"number": "4000000000000002", "cvc": "123", "exp_month": "12", "exp_year": "2030"}}  # release-check: ignore
+    _open_for_first_payment(monkeypatch)
     r = client.post(f"/api/orders/{order_id}/pay", json=body)
     assert r.status_code >= 400
     assert store.get_order(order_id).status is not OrderStatus.PAYING
@@ -257,12 +288,13 @@ def test_server_card_decline_keeps_order_awaiting_payment(setup_team, monkeypatc
 def test_team_paid_is_not_delivered_without_verified_team_entitlement(setup_team, monkeypatch, entry):
     client, order_id, _ = setup_team
     url = f"/api/orders/{order_id}"
-    pay = AsyncMock(return_value=PaymentResult(status=PaymentStatus.SUCCEEDED, provider_ref="pi_fixture"))
+    pay = AsyncMock(side_effect=lambda **kw: _paid(order_id))
     verify = AsyncMock(return_value=SubscriptionInfo(active=True, raw_kind="plus"))
     monkeypatch.setattr("gss_api.routers.orders.build_pipeline",
                         lambda: SimpleNamespace(pay=pay, verify=verify))
     try:
         if entry == "pay":
+            _open_for_first_payment(monkeypatch)
             assert client.post(f"{url}/team/prepare", json={"billing": BILLING}).status_code == 200
             body = {"payment_method_token": "pm_fixture", "team_context_id": "fixture-context", "billing": BILLING}
             first = client.post(f"{url}/pay", json=body)
@@ -285,7 +317,7 @@ def test_team_paid_is_not_delivered_without_verified_team_entitlement(setup_team
         assert_waiting(client.get(url).json())
         assert_waiting(client.post(f"{url}/verify").json())
         assert_waiting(client.post(f"{url}/team/poll").json())
-        verify.return_value = SubscriptionInfo(active=True, raw_kind="team")
+        verify.return_value = _confirmed_team()
         last = client.post(f"{url}/verify")
         assert last.status_code == 200, last.text
         assert last.json()["status"] == last.json()["delivery_status"] == "delivered"
@@ -324,3 +356,74 @@ def test_paid_team_survives_verification_timeout_and_vault_expiry(setup_team, mo
         pay.assert_not_awaited()
     finally:
         vault.drop(order_id)
+
+
+def _stub_authoritative_team_data(monkeypatch, order_id, *, receipt_changes=None, entitlement_changes=None):
+    """Independent provider observations; no runtime account/session or remote payment."""
+    from gss_account.adapter import UpstreamAccountAdapter
+    payment = _receipt_payload(order_id)
+    account = {"plan_type": "team", "status": "active", "workspace_id": "ws_new_fixture",
+               "workspace_name": "Team Workspace", "seat_quantity": 2}
+    for key, value in (receipt_changes or {}).items():
+        if key in {"amount_received", "currency", "status"}:
+            payment["payment_intent"][key] = value
+        else:
+            payment[key] = value
+    account.update(entitlement_changes or {})
+
+    class Hosted:
+        def __init__(self, _client): pass
+        def poll(self, **kw): return payment
+    class Account:
+        def subscription_payload(self): return account
+        def close(self): pass
+
+    monkeypatch.setattr("gss_api.routers.orders.TeamHostedClient", Hosted)
+    monkeypatch.setattr("gss_account.adapter.ChatGPTClient.from_raw_session", lambda *a, **kw: Account())
+    monkeypatch.setattr("gss_account.adapter.configured_proxy", lambda *a: None)
+    adapter = UpstreamAccountAdapter()
+    monkeypatch.setattr("gss_api.routers.orders.build_pipeline", lambda: SimpleNamespace(verify=adapter.subscription_status))
+
+
+@pytest.mark.parametrize("change", [
+    {"workspace_id": "ws_old_fixture"},  # same display name & seat count, different workspace
+    {"workspace_name": "Other Workspace"}, {"seat_quantity": 1}, {"seat_quantity": None},
+    {"workspace_id": None}, {"workspace_name": None}, {"plan_type": "plus"},
+])
+def test_paid_team_requires_this_workspace_plan_and_seats(setup_team, monkeypatch, change):
+    client, order_id, _ = setup_team
+    _stub_authoritative_team_data(monkeypatch, order_id, entitlement_changes=change)
+    response = client.post(f"/api/orders/{order_id}/team/poll")
+    assert response.status_code == 200
+    order = response.json()
+    assert order["payment_status"] == "succeeded"
+    assert order["status"] == "verifying", "an unrelated/ambiguous entitlement is not delivery"
+    assert order["status_summary"] == "已扣款，待核验"
+    assert vault.get(order_id) is not None
+
+
+@pytest.mark.parametrize("change", [
+    {"session_id": "cs_test_other"}, {"session_id": None},
+    {"amount_received": 7}, {"amount_received": None}, {"currency": "usd"},
+])
+def test_team_wrong_or_missing_receipt_cannot_confirm_payment(setup_team, monkeypatch, change):
+    client, order_id, _ = setup_team
+    _stub_authoritative_team_data(monkeypatch, order_id, receipt_changes=change)
+    response = client.post(f"/api/orders/{order_id}/team/poll")
+    assert response.status_code == 200
+    order = response.json()
+    assert order["status"] == "unknown"
+    assert order["payment_status"] != "succeeded"
+    assert order["paid_amount"] is None and order["paid_currency"] is None
+
+
+def test_team_exact_receipt_workspace_plan_seats_all_match(setup_team, monkeypatch):
+    client, order_id, _ = setup_team
+    _stub_authoritative_team_data(monkeypatch, order_id)
+    response = client.post(f"/api/orders/{order_id}/team/poll")
+    assert response.status_code == 200
+    order = response.json()
+    assert order["status"] == "delivered"
+    assert order["payment_status"] == "succeeded"
+    assert order["payment_intent_id"] == "pi_paid_fixture"
+    assert vault.get(order_id) is None

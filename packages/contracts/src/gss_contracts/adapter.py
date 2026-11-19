@@ -11,10 +11,12 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime
-from decimal import Decimal
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 from .models import BillingMode, Plan
 from .state import PaymentStatus
@@ -113,6 +115,32 @@ class PaymentRequest:
     rv_timestamp: Optional[str] = None
     session_reissued: bool = False
     exit_country: Optional[str] = None
+    credentials_current: Optional[Callable[[], bool]] = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class PaymentReceiptEvidence:
+    """Observed settled money and identifiers, never an order quote or a secret."""
+    checkout_id: str
+    payment_id: str
+    amount: Decimal
+    currency: str
+    workspace_id: Optional[str] = None
+
+
+def receipt_matches_order(receipt: Optional[PaymentReceiptEvidence], *, checkout_id: str,
+                          amount, currency: str, payment_id: Optional[str] = None) -> bool:
+    if receipt is None or not checkout_id or receipt.checkout_id != checkout_id:
+        return False
+    if not receipt.payment_id or (payment_id is not None and payment_id != receipt.payment_id):
+        return False
+    try:
+        quoted = Decimal(str(amount))
+        return (quoted.is_finite() and receipt.amount.is_finite() and receipt.amount > 0
+                and receipt.amount == quoted and bool(currency)
+                and receipt.currency == currency.upper())
+    except (InvalidOperation, AttributeError, TypeError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -123,6 +151,9 @@ class PaymentResult:
     next_action: Optional[Dict[str, Any]] = None
     provider_ref: Optional[str] = None
     message: Optional[str] = None
+    receipt_evidence: Optional[PaymentReceiptEvidence] = None
+    # True only for an explicitly identified open, unpaid checkout with no attempt.
+    hosted_open_unpaid: bool = False
 
 
 @runtime_checkable
@@ -139,6 +170,23 @@ class PaymentAdapter(Protocol):
 # --------------------------------------------------------------------------- #
 # account
 # --------------------------------------------------------------------------- #
+# Scoped to this verification task/thread; do not retain credentials or mutate shared adapters.
+_current_verification_lease: ContextVar[Optional[Callable[[], bool]]] = ContextVar("verification_lease", default=None)
+
+
+def current_verification_lease() -> Optional[Callable[[], bool]]:
+    return _current_verification_lease.get()
+
+
+@contextmanager
+def verification_lease(current: Callable[[], bool]):
+    token = _current_verification_lease.set(current)
+    try:
+        yield
+    finally:
+        _current_verification_lease.reset(token)
+
+
 TEAM_PLAN_KINDS = frozenset({"team", "chatgptteamplan"})
 
 
@@ -150,6 +198,23 @@ class SubscriptionInfo:
     expires_at: Optional[datetime] = None
     channel: Optional[str] = None
     raw_kind: Optional[str] = None
+    workspace_id: Optional[str] = None
+    workspace_name: Optional[str] = None
+    seat_quantity: Optional[int] = None
+
+
+def team_entitlement_matches(info: SubscriptionInfo, receipt: Optional[PaymentReceiptEvidence], *,
+                             workspace_name: str, seat_quantity: int) -> bool:
+    """Only an active, current entitlement for the workspace bound to the payment qualifies."""
+    return bool(
+        receipt is not None and receipt.workspace_id and info.workspace_id == receipt.workspace_id
+        and info.active and (info.raw_kind or "").lower() in TEAM_PLAN_KINDS
+        and (info.expires_at is None or (info.expires_at.tzinfo is not None
+                                         and info.expires_at > datetime.now(timezone.utc)))
+        and workspace_name and info.workspace_name == workspace_name
+        and type(seat_quantity) is int and seat_quantity > 0
+        and type(info.seat_quantity) is int and info.seat_quantity == seat_quantity
+    )
 
 
 @dataclass(frozen=True)
@@ -202,6 +267,9 @@ __all__ = [
     "CheckoutAdapter",
     "PaymentRequest",
     "PaymentResult",
+    "PaymentReceiptEvidence",
+    "receipt_matches_order",
+    "team_entitlement_matches",
     "PaymentAdapter",
     "SubscriptionInfo",
     "PromoCampaignInfo",

@@ -8,7 +8,7 @@
   ⑤ hCaptcha passive          解 sitekey + init rqdata
   ⑥ payment_methods           创建 pm_
   ⑦ confirm                   带 passive_captcha_token
-     └─ 若触发 intent_confirmation_challenge：解第二次 → verify_challenge
+     └─ 需要验证时返回原付款状态，不自动再次确认
   ⑧ poll                      终态
 
 Stripe API 版本：2025-03-31.basil
@@ -27,6 +27,8 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+
+from gss_contracts.errors import DomainError, ErrorCode
 
 from gss_core.chatgpt import profile_from_session_ua
 from gss_core.redaction import redact_sensitive
@@ -175,6 +177,7 @@ class StripeProtocol:
     ) -> None:
         self.proxy = proxy or None
         self.pin_proxy = pin_proxy
+        self.credentials_current = lambda: True
         self.locale = ""
         self.timezone = ""
         # 指纹必须与建单、求解器完全一致：优先使用 Session 的真实 UA。
@@ -271,6 +274,8 @@ class StripeProtocol:
 
     # ── 请求封装（兼容 httpx 与 curl_cffi）──────────────────
     def _post(self, url: str, data: str, headers: dict[str, str]):
+        if not self.credentials_current():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
         c = self._http()
         if _HAS_CURL_CFFI and curl_requests is not None and hasattr(c, "post"):
             response = c.post(url, data=data, headers=headers)
@@ -280,6 +285,8 @@ class StripeProtocol:
         return response
 
     def _get(self, url: str, params: dict[str, Any], headers: dict[str, str]):
+        if not self.credentials_current():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
         c = self._http()
         response = c.get(url, params=params, headers=headers)
         _log_http_failure(url, response)
@@ -892,8 +899,6 @@ class StripeProtocol:
           +213s  payment_methods
           +213.7s confirm
         """
-        abandoned = False
-
         if self.step_fingerprint:
             fp = self.register_fingerprint()
             self._sleep(random.uniform(2.0, 4.0))
@@ -938,46 +943,10 @@ class StripeProtocol:
         self._sleep(random.uniform(0.5, 1.0))
         confirm_res = self.confirm(cs_id, pm_id, fp, ctx, passive)
 
-        # challenge 补解：必须复用同一个 solver 会话
-        body = confirm_res.get("body") or {}
-        na = body.get("next_action") or (body.get("payment_intent") or {}).get("next_action") or {}
-        sdk = na.get("use_stripe_sdk") or {}
-        for round_no in range(2):
-            if sdk.get("type") != "intent_confirmation_challenge":
-                break
-            sj = sdk.get("stripe_js") or {}
-            pi = body.get("payment_intent") or {}
-            log(f"⑦b 命中 challenge（第 {round_no + 1} 次）site_key={str(sj.get('site_key'))[:8]}")
-            ch = self._solve_challenge(
-                str(sj.get("site_key") or ""), str(sj.get("rqdata") or "")
-            )
-            if not (ch and sj.get("verification_url")):
-                log("   未解出挑战，放弃本单")
-                abandoned = True
-                break
-            log(f"   解出 token（{len(ch.get('token') or '')} 字符），继续 verify")
-            v = self.verify_challenge(
-                str(sj["verification_url"]), ch["token"],
-                str(pi.get("client_secret") or ""), ch.get("ekey", ""),
-            )
-            vb = v.get("body") or {}
-            vna = vb.get("next_action") or (vb.get("payment_intent") or {}).get("next_action") or {}
-            vsdk = vna.get("use_stripe_sdk") or {}
-            if vsdk.get("type") == "intent_confirmation_challenge":
-                # 换了一套挑战参数，用新的 site_key/rqdata 再解一次
-                confirm_res = v
-                body = vb
-                sdk = vsdk
-                continue
-            if vb.get("last_payment_error") or vb.get("error") or vb.get("payment_intent"):
-                confirm_res = v
-            break
-
+        # Once confirmation was sent, only observe the original attempt. Never
+        # complete a challenge automatically or submit an additional confirmation.
         outcome = self.classify(confirm_res, None)
-        # 纯协议放弃的单子不必轮询：状态不会自己变成拒卡
-        if abandoned:
-            log("   已放弃，跳过轮询")
-        elif outcome.state not in ("paid", "card_declined", "captcha_rejected"):
+        if self.credentials_current() and outcome.state not in ("paid", "card_declined", "challenge_required"):
             polled = self.poll(cs_id)
             outcome = self.classify(confirm_res, polled)
         log(f"判定 {outcome.state} decline={outcome.decline_code} code={outcome.code}")

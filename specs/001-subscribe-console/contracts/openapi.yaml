@@ -37,13 +37,15 @@ paths:
       tags: [orders]
       summary: 创建开通订单
       description: >
-        幂等：相同 `idempotency_key` 的重复提交返回同一订单。
+        纯建单可省略 Idempotency-Key；携带 payment_method_token 即同时申请付款，必须提供稳定的幂等键。
+        同一笔业务的重试须沿用原键和原请求，不得因超时重新生成键。能核对原请求时返回原单；否则返回冲突，不再次付款。
         `billing_mode=promo` 时必须携带 `risk_acknowledged=true`。
       parameters:
         - name: Idempotency-Key
           in: header
           required: false
-          schema: { type: string }
+          description: 建单兼付款时必填；不能为空白，不要使用凭证作为幂等键。
+          schema: { type: string, minLength: 1, maxLength: 255 }
       requestBody:
         required: true
         content:
@@ -70,7 +72,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "409":
-          description: 幂等键冲突且原订单仍在处理
+          description: 原操作进行中、幂等键绑定不同请求或当前进程无法核对原单；勿再次发起付款
+        "503":
+          description: 无法预留幂等键，已停止本次操作
 
   /api/orders/{order_id}:
     get:

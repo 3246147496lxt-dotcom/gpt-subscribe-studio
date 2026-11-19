@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from gss_contracts import AdapterCapabilities, PaymentRequest, PaymentResult, PaymentStatus
+from gss_contracts.adapter import PaymentReceiptEvidence
+from gss_core.money import _ZERO_DECIMAL
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
 from gss_core.hosted import TeamHostedClient
@@ -104,7 +107,10 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                 or configured_proxy("approve"),
                 target_country,
             )
+        if req.credentials_current is not None and not req.credentials_current():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "付款凭证已过期")
         client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
+        client.credentials_current = req.credentials_current
         client.timeout = float(self.timeout)
         client_country = req.exit_country or proxy_exit_region(proxy) or target_country
         client.language = locale_for(client_country)
@@ -131,14 +137,26 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
             checkout_session_id=checkout_id, confirm_token=confirm_token, checkout_url=page_url,
             billing=billing, currency=currency_for(req.country), publishable_key=pk,
         )
+        if req.credentials_current is not None and not req.credentials_current():
+            # The last request ran under a valid lease. Keep its actual evidence; no follow-up.
+            return hosted_payment_result(confirmed, checkout_id)
         _check_approval_result(confirmed)
         if stripe_custom:
             confirmed = client.finalize_stripe_custom_checkout(
                 checkout_session_id=checkout_id, publishable_key=pk, checkout_url=page_url,
                 processor_entity=_processor_from_checkout_url(page_url), confirmed=confirmed,
             )
+            if req.credentials_current is not None and not req.credentials_current():
+                return hosted_payment_result(confirmed, checkout_id)
             _check_approval_result(confirmed)
         intent_id, intent_secret, return_url = payment_intent_from_confirm(confirmed)
+        def from_original_intent(observation: dict) -> PaymentResult:
+            result = _result_from_intent(observation, intent_id, intent_secret)
+            if result.status is PaymentStatus.SUCCEEDED and observation.get("id") == intent_id:
+                receipt = _hosted_receipt({**confirmed, "payment_intent": observation}, checkout_id)
+                return replace(result, receipt_evidence=receipt)
+            return result
+
         chatgpt_status = str(confirmed.get("status") or confirmed.get("result") or "")
         kind = str(confirmed.get("type") or "")
         if checkout_confirm_blocked(confirmed):
@@ -173,17 +191,10 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                     client_secret=intent_secret,
                     publishable_key=pk,
                 )
-                live_status = str(live.get("status") or "")
-                if live_status == "succeeded":
-                    return _result_from_intent(live, intent_id)
                 if live:
-                    return _result_from_intent(live, intent_id, intent_secret)
+                    return from_original_intent(live)
             if pi_status in {"succeeded", "processing", "requires_action"}:
-                return _result_from_intent(
-                    nested if nested else {"status": pi_status},
-                    intent_id,
-                    intent_secret,
-                )
+                return from_original_intent(nested if nested else {"status": pi_status})
             if intent_secret and pi_status == "requires_confirmation":
                 if not return_url:
                     return_url = stripe_verify_url(
@@ -198,11 +209,12 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                     confirmation_token=confirm_token,
                     return_url=return_url,
                 )
-                return _result_from_intent(final, intent_id, intent_secret)
+                return from_original_intent(final)
         if confirmed.get("payment_status") == "paid":
             return PaymentResult(
                 status=PaymentStatus.SUCCEEDED,
-                provider_ref=intent_id or checkout_id,
+                provider_ref=intent_id or None,
+                receipt_evidence=_hosted_receipt(confirmed, checkout_id),
                 message="支付成功",
             )
         if stripe_custom and (chatgpt_status in {"open", ""} or state in {"requires_approval", "processing", ""}):
@@ -235,7 +247,8 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
             if pending:
                 import dataclasses
                 result = dataclasses.replace(result, next_action={**(result.next_action or {}), **pending})
-        if result.status is PaymentStatus.PROCESSING:
+        if (result.status is PaymentStatus.PROCESSING
+                and (req.credentials_current is None or req.credentials_current())):
             polled = hosted.poll(session_id=context["session_id"], key=context["publishable_key"])
             result = hosted_payment_result(polled, context["session_id"], req.checkout_url)
         return result
@@ -287,19 +300,63 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                              message="验证通过，等待 Stripe 确认扣款")
 
 
+def _checkout_references(payload: dict) -> list:
+    ids = [payload[k] for k in ("session_id", "checkout_session_id", "checkout_id") if k in payload]
+    if str(payload.get("id") or "").startswith("cs_"):
+        ids.append(payload["id"])
+    return ids
+
+
+def _hosted_receipt(payload: dict, session_id: str) -> Optional[PaymentReceiptEvidence]:
+    # Never infer amount_received from an authorization, checkout quote or caller input.
+    refs = _checkout_references(payload)
+    pi = payload.get("payment_intent")
+    if (not refs or any(ref != session_id for ref in refs) or not isinstance(pi, dict)
+            or pi.get("status") != "succeeded" or pi.get("object", "payment_intent") != "payment_intent"
+            or payload.get("payment_status") not in (None, "paid")):
+        return None
+    intent_id, received, currency = pi.get("id"), pi.get("amount_received"), pi.get("currency")
+    if (not isinstance(intent_id, str) or not intent_id.startswith("pi_") or "_secret_" in intent_id
+            or type(received) is not int or received <= 0
+            or not isinstance(currency, str) or len(currency) != 3 or not currency.isascii()
+            or not currency.isalpha()):
+        return None
+    # Independent references in the same response must agree, even when the outer
+    # checkout and amount happen to match. A contradictory nested PI is not evidence.
+    if any(pi[k] != session_id for k in ("checkout_id", "checkout_session_id", "session_id") if k in pi):
+        return None
+    if any(payload[k] != intent_id for k in ("payment_intent_id", "intent_id") if k in payload):
+        return None
+    currency = currency.upper()
+    if "currency" in payload and str(payload["currency"]).upper() != currency:
+        return None
+    amount = Decimal(received).scaleb(0 if currency in _ZERO_DECIMAL else -2)
+    # A checkout-confirmed workspace ID joins the independent entitlement lookup.
+    # If absent or inconsistent, money may be confirmed but delivery must wait.
+    workspace = payload.get("workspace_id")
+    if (not isinstance(workspace, str) or not workspace.strip()
+            or ("workspace_id" in pi and pi["workspace_id"] != workspace)):
+        workspace = None
+    return PaymentReceiptEvidence(refs[0], intent_id, amount, currency, workspace)
+
+
 def hosted_payment_result(payload: dict, session_id: str, checkout_url: str = ""):
+    refs = _checkout_references(payload)
+    if any(ref != session_id for ref in refs):
+        return PaymentResult(status=PaymentStatus.ERROR, message="付款回执与原结账不符")
     object_status = str(payload.get("payment_object_status") or "").lower()
     state = str(payload.get("state") or "").lower()
     status = str(payload.get("status") or "").lower()
     intent = _intent_object(payload)
     intent_id, secret, _ = payment_intent_from_confirm(payload)
     if _setup_only(payload, intent, intent_id):
-        return PaymentResult(status=PaymentStatus.PROCESSING, provider_ref=session_id,
+        return PaymentResult(status=PaymentStatus.PROCESSING, provider_ref=None,
                              message="尚无扣款确认，请核对账单")
     # Completing a Checkout or successfully setting up a payment method is not a charge.
     payment_intent = intent_id.startswith("pi_") or intent.get("object") == "payment_intent"
     if payload.get("payment_status") == "paid" or (payment_intent and intent.get("status") == "succeeded"):
-        return PaymentResult(status=PaymentStatus.SUCCEEDED, provider_ref=intent_id or session_id, message="支付成功")
+        return PaymentResult(status=PaymentStatus.SUCCEEDED, provider_ref=intent_id or None,
+                             receipt_evidence=_hosted_receipt(payload, session_id), message="支付成功")
     if intent.get("status") == "requires_action":
         next_action = intent.get("next_action") or {}
         sdk = next_action.get("use_stripe_sdk") or {}
@@ -311,7 +368,7 @@ def hosted_payment_result(payload: dict, session_id: str, checkout_url: str = ""
         # Preserve the action for the original payment; polling never performs it.
         action["payment_intent_id"] = intent_id
         action["client_secret"] = secret or action.get("client_secret")
-        return PaymentResult(status=PaymentStatus.REQUIRES_ACTION, provider_ref=intent_id or session_id,
+        return PaymentResult(status=PaymentStatus.REQUIRES_ACTION, provider_ref=intent_id or None,
                              next_action=action, message="需要完成 Stripe 验证" if kind == "intent_confirmation_challenge" else "需要完成支付验证")
     if payment_intent and (intent.get("status") in {"requires_payment_method", "canceled", "cancelled"}
                            or intent.get("last_payment_error")):
@@ -319,9 +376,16 @@ def hosted_payment_result(payload: dict, session_id: str, checkout_url: str = ""
     if payment_intent and object_status in {"failed", "canceled"}:
         return PaymentResult(status=PaymentStatus.DECLINED, provider_ref=intent_id, message="付款未完成")
     if {state, status, object_status} & {"failed", "canceled", "expired"}:
-        return PaymentResult(status=PaymentStatus.ERROR, provider_ref=intent_id or session_id,
+        return PaymentResult(status=PaymentStatus.ERROR, provider_ref=intent_id or None,
                              message="扣款结果待核对，请勿重复支付")
-    return PaymentResult(status=PaymentStatus.PROCESSING, provider_ref=intent_id or session_id, message="Stripe 正在处理，请等待状态确认")
+    open_unpaid = (bool(refs) and status == "open" and payload.get("payment_status") == "unpaid"
+                   and state in {"", "active", "open"} and not object_status
+                   and not any(payload.get(k) for k in (
+                       "payment_intent", "setup_intent", "submission_attempt", "payment_object",
+                       "payment_intent_id", "client_secret", "last_payment_error", "charge",
+                   )))
+    return PaymentResult(status=PaymentStatus.PROCESSING, provider_ref=intent_id or None,
+                         hosted_open_unpaid=open_unpaid, message="Stripe 正在处理，请等待状态确认")
 
 
 def _confirmation_token(client: ChatGPTClient, *, publishable_key: str, token: str) -> str:
@@ -384,10 +448,13 @@ class FakePaymentAdapter(PaymentAdapterBase):
         next_action: Optional[Dict[str, Any]] = None
         if status is PaymentStatus.REQUIRES_ACTION:
             next_action = {"type": "3ds_redirect", "url": "https://3ds.example.invalid/verify"}
+        from gss_core.fake_receipts import settlement_for
+        receipt = settlement_for(req.checkout_session_id or "") if status is PaymentStatus.SUCCEEDED else None
         return PaymentResult(
             status=status,
             next_action=next_action,
-            provider_ref="fake-payment-ref",
+            receipt_evidence=receipt,
+            provider_ref=receipt.payment_id if receipt else "fake-payment-ref",
             message=f"scripted:{status}",
         )
 

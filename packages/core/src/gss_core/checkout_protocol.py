@@ -13,7 +13,7 @@ from gss_contracts.errors import DomainError, ErrorCode
 from .chatgpt import APP_BASE, STRIPE_BASE, STRIPE_API_VERSION, ChatGPTClient, payment_intent_from_confirm, redact_sensitive
 from .saved_cards import restore_account
 from .saved_card_protocol import _factor, _id, _minor, _setup_rejection, _stripe_error, outcome
-from .plus_har_protocol import har_engine_enabled, run_har_context
+from .plus_har_protocol import active_plus_entitlement, cash_receipt, har_engine_enabled, run_har_context
 
 
 def _json(response) -> dict:
@@ -33,6 +33,12 @@ def _request_error(payload: dict, status: int, stage: str) -> dict | None:
     return None
 
 
+def _require_live(context: dict) -> None:
+    guard = context.get("credentials_current")
+    if guard is not None and not guard():
+        raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
+
+
 def _page_url(context: dict) -> str:
     url = str(context.get("checkout_url") or "")
     if urlsplit(url).scheme != "https" or urlsplit(url).hostname != "chatgpt.com":
@@ -41,6 +47,7 @@ def _page_url(context: dict) -> str:
 
 
 def _read_checkout(client: ChatGPTClient, context: dict) -> dict:
+    _require_live(context)
     route = f"/backend-api/payments/checkout/{context['processor']}/{context['checkout_id']}"
     response = client.http.get(APP_BASE + route, headers=client._route_headers(route, page_url=_page_url(context)), timeout=client.timeout)
     payload = _json(response)
@@ -167,6 +174,7 @@ def _return_url(context: dict, confirmed: dict) -> str:
 
 
 def _app_confirm(client: ChatGPTClient, context: dict) -> dict | None:
+    _require_live(context)
     context["app_confirmation_started"] = True
     route = "/backend-api/payments/checkout/confirm"
     response = client.http.post(APP_BASE + route, json={"checkout_session_id": context["checkout_id"],
@@ -192,15 +200,6 @@ def _app_confirm(client: ChatGPTClient, context: dict) -> dict | None:
     return None
 
 
-def _active_plus(payload: dict) -> bool:
-    entitlement = payload.get("entitlement") if isinstance(payload.get("entitlement"), dict) else {}
-    plan = str(payload.get("plan_type") or entitlement.get("subscription_plan") or "").lower()
-    active = payload.get("is_active") is True or entitlement.get("has_active_subscription") is True
-    if payload.get("is_active") is False or entitlement.get("has_active_subscription") is False:
-        active = False
-    return plan in {"plus", "chatgptplusplan"} and active and payload.get("is_delinquent") is not True and entitlement.get("is_delinquent") is not True
-
-
 def _paid_checkout(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict | None:
     page = _read_checkout(client, context)
     if page.get("status") != "complete" or page.get("payment_status") not in {"paid", "no_payment_required"}:
@@ -213,12 +212,23 @@ def _paid_checkout(client: ChatGPTClient, context: dict, *, read_only: bool) -> 
     page_intent, _, _ = payment_intent_from_confirm(page)
     if context.get("intent_id") and page_intent and page_intent != context["intent_id"]:
         return outcome("unknown", "payment", "已完成结账引用了不同的付款 Intent")
+    if page["payment_status"] == "no_payment_required":
+        if any(type(page[k]) is not int or page[k] != 0 for k in ("amount_paid", "amount_received") if k in page):
+            return outcome("unknown", "payment", "免付款结账与实收字段冲突")
+        return outcome("no_payment_required", "payment", "本单无需扣款", _verified_zero=True)
+    received = page.get("amount_paid", page.get("amount_received"))
+    if "amount_paid" in page and "amount_received" in page and page["amount_paid"] != page["amount_received"]:
+        return outcome("unknown", "payment", "结账实收字段互相冲突")
+    evidence = cash_receipt(context["checkout_id"], page_intent, received, currency, _minor(amount, currency))
+    if evidence is None:
+        return outcome("unknown", "payment", "缺少可对应原订单的实收回执")
     if not context.get("ack_started"):
         if read_only:
-            return outcome("pending", "checkout", "付款已确认，请显式继续完成订阅登记；不会重新扣款", intent_status="succeeded")
+            return outcome("pending", "checkout", "已扣款，待核验", intent_status="succeeded", _receipt_evidence=evidence)
         context["ack_started"] = True
         route = "/backend-api/payments/checkout_session"
         try:
+            _require_live(context)
             response = client.http.post(APP_BASE + route, json={"processor_entity": context["processor"],
                 "stripe_checkout_session_id": context["checkout_id"]},
                 headers=client._route_headers(route, page_url=_page_url(context)), timeout=client.timeout)
@@ -226,13 +236,33 @@ def _paid_checkout(client: ChatGPTClient, context: dict, *, read_only: bool) -> 
             context["ack_complete"] = int(response.status_code) < 400 and acknowledgment.get("success") is True
         except Exception:
             context["ack_complete"] = False
-    subscription = client.subscription_payload()
-    if _active_plus(subscription):
+    try:
+        _require_live(context)
+        subscription = client.subscription_payload()
+    except Exception:
+        return outcome("pending", "payment", "已扣款，待核验", intent_status="succeeded", _receipt_evidence=evidence)
+    if active_plus_entitlement(subscription, context.get("account_id") or ""):
         # An active subscription plus the exact paid checkout reconciles a lost acknowledgment response.
-        return outcome("paid", "payment", "原结账已完成，Plus 订阅已生效", intent_status="succeeded")
+        return outcome("paid", "payment", "原结账已完成，Plus 订阅已生效", intent_status="succeeded", _receipt_evidence=evidence, _plus_verified=True)
     return outcome("pending" if context.get("ack_complete") else "unknown", "payment",
                    "付款已确认，等待 Plus 订阅生效" if context.get("ack_complete") else "付款已确认，订阅登记结果待核实；本次未重复登记或扣款",
-                   intent_status="succeeded")
+                   intent_status="succeeded", _receipt_evidence=evidence)
+
+
+def _confirmed_receipt(context: dict, response: dict):
+    intent_id = context.get("intent_id") or ""
+    expected = _minor(context["amount"], context["currency"])
+    if not (
+        intent_id.startswith("pi_") and response.get("id") == intent_id
+        and response.get("status") == "succeeded"
+        and str(response.get("currency") or "").upper() == context["currency"]
+        and type(response.get("amount_received")) is int and response["amount_received"] == expected
+        and ("amount" not in response or (type(response["amount"]) is int and response["amount"] == expected))
+        and all(not context.get(key) or _id(response.get(field)) == context[key]
+                for key, field in (("customer_id", "customer"), ("payment_method_id", "payment_method")))
+    ):
+        return None
+    return cash_receipt(context["checkout_id"], intent_id, response["amount_received"], response["currency"], expected)
 
 
 def _intent(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict:
@@ -242,6 +272,7 @@ def _intent(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict:
     intent_id = context.get("intent_id")
     if not intent_id or not context.get("intent_secret"):
         return outcome("unknown", "payment", "原确认结果尚未核实，本次未重新提交付款")
+    _require_live(context)
     intent = client.retrieve_stripe_intent(intent_id=intent_id, client_secret=context["intent_secret"], publishable_key=context["publishable_key"])
     if not intent or intent.get("id") != intent_id:
         return outcome("unknown", "payment", "未读到原付款 Intent，请查询协议状态")
@@ -265,20 +296,32 @@ def _intent(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict:
     if status == "requires_confirmation" and not context.get("stripe_confirmation_started"):
         if read_only:
             return outcome("pending", "checkout", "付款 Intent 已准备好，请确认当前金额后继续", intent_status=status)
+        _require_live(context)
         context["stripe_confirmation_started"] = True
+        receipt_confirmed = False
         try:
             response = client.stripe_http.post(STRIPE_BASE + f"/v1/payment_intents/{intent_id}/confirm" if intent_id.startswith("pi_")
                 else STRIPE_BASE + f"/v1/setup_intents/{intent_id}/confirm",
                 data=urlencode({"key": context["publishable_key"], "_stripe_version": STRIPE_API_VERSION,
                     "client_secret": context["intent_secret"], "confirmation_token": context["confirmation_token"],
                     "return_url": context["intent_return_url"]}), timeout=client.timeout)
-            # Retrieve the intent and checkout after any response; no success is inferred from HTTP 200.
+            # A late authenticated receipt still counts even if the Vault expires
+            # while this original confirmation is in flight. Never infer it from HTTP 200 alone.
+            payload = _json(response)
             if int(response.status_code) >= 400:
-                payload = _json(response)
                 context["stripe_last_response_error"] = _stripe_error(payload)
+            else:
+                receipt_confirmed = _confirmed_receipt(context, payload)
         except Exception:
             pass
-        return _intent(client, context, read_only=read_only)
+        try:
+            _require_live(context)
+            return _intent(client, context, read_only=read_only)
+        except Exception:
+            if receipt_confirmed:
+                return outcome("pending", "payment", "已扣款，待核验",
+                               intent_status="succeeded", payment_intent_id=intent_id, _receipt_evidence=receipt_confirmed)
+            raise
     if status in {"requires_payment_method", "canceled"}:
         error = _stripe_error(intent)
         return outcome("card_declined", "payment", error.pop("message", "Stripe 未完成本次付款"), intent_status=status, **error)
@@ -286,7 +329,18 @@ def _intent(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict:
         action = intent.get("next_action") if isinstance(intent.get("next_action"), dict) else {}
         return outcome("challenge_required", "payment", "Stripe 要求继续验证，本次未自动重新确认", intent_status=status,
                        next_action={"type": str(action.get("type") or "requires_action")})
-    if status in {"succeeded", "processing", "requires_capture"}:
+    if status == "succeeded" and not intent_id.startswith("pi_"):
+        return outcome("unknown", "payment", "未取得本单扣款回执")
+    if status == "succeeded" and (
+        type(intent.get("amount_received")) is not int or intent["amount_received"] != _minor(context["amount"], context["currency"])
+    ):
+        return outcome("unknown", "payment", "实收金额与订单不符")
+    if status == "succeeded":
+        evidence = _confirmed_receipt(context, intent)
+        if not evidence:
+            return outcome("unknown", "payment", "缺少可对应原订单的实收回执")
+        return outcome("pending", "payment", "已扣款，待核验", intent_status="succeeded", _receipt_evidence=evidence)
+    if status in {"processing", "requires_capture"}:
         return outcome("pending", "payment", "付款处理中，等待原结账和订阅状态确认", intent_status=status)
     return outcome("unknown", "payment", "原付款结果待核实，请查询协议状态", intent_status=status or None)
 
@@ -294,6 +348,8 @@ def _intent(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict:
 def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, card: dict | None = None,
                           billing: dict | None = None, read_only: bool = False) -> dict:
     checkout_id = str(context.get("checkout_id") or spec.get("checkout_id") or "")
+    if context.get("app_confirmation_started") or context.get("intent_id"):
+        read_only, card, billing = True, None, None
     if har_engine_enabled() and not checkout_id.startswith("cs_"):
         # 2026-10-29 HAR 逐请求复刻（含指纹与遥测）；GSS_PLUS_ENGINE=legacy 回退旧链路。
         # cs_ 形态的 custom checkout 需要先 finalize，仍走旧链路。
@@ -301,12 +357,16 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
             client, context, spec, card=card, billing=billing, read_only=read_only,
             exit_country=str(spec.get("exit_country") or ""),
         )
+    if "credentials_current" in spec:
+        context["credentials_current"] = spec["credentials_current"]
     stage = "checkout"
     terminal = context.get("terminal_result")
     if terminal:
         return dict(terminal)
     try:
-        restore_account(client, str(context.get("account_id") or spec.get("account_id") or ""))
+        _require_live(context)
+        restore_account(client, str(context.get("account_id") or spec.get("account_id") or ""),
+                        credentials_current=spec.get("credentials_current"))
         context["account_id"] = client.account_id
         if not context.get("checkout_id"):
             context.update(checkout_id=spec["checkout_id"], checkout_url=spec["checkout_url"],
@@ -321,8 +381,10 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
         original = _read_checkout(client, context)
         if original.get("status") == "complete":
             return _paid_checkout(client, context, read_only=read_only) or outcome("unknown", "payment", "原结账已关闭，付款状态待核实")
-        if original.get("status") != "open" or original.get("payment_status") != "unpaid":
-            return outcome("request_rejected", "checkout", "原结账不处于可付款状态，请核对原订单")
+        if (original.get("status") != "open" or original.get("payment_status") != "unpaid"
+                or original.get("payment_intent") or original.get("payment_intent_id")):
+            context["app_confirmation_started"] = True
+            return outcome("unknown", "payment", "原结账已提交或状态不明，请核对原订单")
         if context.get("token_started") and not context.get("confirmation_token"):
             return outcome("unknown", "setup", "原卡片准备结果待核实，本次未重复提交")
         if read_only:

@@ -19,9 +19,21 @@ def _identifier(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _check_lease(client):
+    guard = getattr(client, "credentials_current", None)
+    if guard is not None and not guard():
+        raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
+
+
 def restore_account(
-    client: ChatGPTClient, expected: str = "", *, trust_statsig: bool = True
+    client: ChatGPTClient, expected: str = "", *, trust_statsig: bool = True, credentials_current=None
 ) -> str:
+    def require_credentials():
+        _check_lease(client)
+        if credentials_current is not None and not credentials_current():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
+
+    require_credentials()
     refreshed = (
         client.refresh_session()
         if trust_statsig
@@ -29,6 +41,7 @@ def restore_account(
     )
     if refreshed:
         client.account_id = jwt_account_id(client.access_token)
+    require_credentials()
     client.hydrate()
     account_id = str(client.account_id or "")
     if not account_id or (expected and account_id != expected):
@@ -37,10 +50,10 @@ def restore_account(
 
 
 def verification_session(
-    client: ChatGPTClient, expected_account: str, *, trust_statsig: bool = True
+    client: ChatGPTClient, expected_account: str, *, trust_statsig: bool = True, credentials_current=None
 ) -> str:
     """Carry renewed credentials to the normal subscription adapter, only in memory."""
-    restore_account(client, expected_account, trust_statsig=trust_statsig)
+    restore_account(client, expected_account, trust_statsig=trust_statsig, credentials_current=credentials_current)
     return json.dumps({
         "accessToken": client.access_token,
         "sessionToken": client.session_token,
@@ -53,8 +66,10 @@ def verification_session(
 def prepare_account_setup(client: ChatGPTClient, context: dict[str, Any], expected_account: str = "") -> None:
     """Store credentials as soon as they arrive, so a lost response can be resumed."""
     account_id = restore_account(client, expected_account)
+    _check_lease(client)
     key = client._publishable_key()
     context.update(account_id=account_id, publishable_key=key, prepare_started=True)
+    _check_lease(client)
     setup_id, secret = client.prepare_setup_intent()
     if not re.fullmatch(r"seti_[A-Za-z0-9_]+", setup_id or "") or not str(secret).startswith(f"{setup_id}_secret_"):
         raise _error("上游未返回匹配的 SetupIntent 凭证，尚未提交卡片验证")
@@ -63,6 +78,7 @@ def prepare_account_setup(client: ChatGPTClient, context: dict[str, Any], expect
 
 def account_payment_methods(client: ChatGPTClient, account_id: str) -> list[dict[str, Any]]:
     route = "/backend-api/payments/payment_methods"
+    _check_lease(client)
     response = client.http.get(
         f"{APP_BASE}{route}", params={"account_id": account_id},
         headers=client._route_headers(route), timeout=client.timeout,
@@ -90,6 +106,7 @@ def inspect_account_setup(client: ChatGPTClient, context: dict[str, Any]) -> dic
     """Trust Stripe GET plus the account's saved-method list, not browser flags."""
     account_id = restore_account(client, str(context.get("account_id") or ""))
     setup_id = context["setup_intent_id"]
+    _check_lease(client)
     intent = client.retrieve_stripe_intent(
         intent_id=setup_id, client_secret=context["client_secret"], publishable_key=context["publishable_key"],
     )

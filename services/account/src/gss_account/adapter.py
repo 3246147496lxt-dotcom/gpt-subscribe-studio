@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from gss_contracts import (
     AdapterCapabilities,
@@ -12,32 +12,21 @@ from gss_contracts import (
     PromoEligibility,
     SubscriptionInfo,
 )
-from gss_contracts.adapter import TEAM_PLAN_KINDS
+from gss_contracts.adapter import TEAM_PLAN_KINDS, current_verification_lease
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.chatgpt import ChatGPTClient
 from gss_core.config import ORDER_HTTP_TIMEOUT_S
 from gss_core.session_token import parse_session
 from gss_core.proxies import configured_proxy
 
-_ACTIVE_PLANS = {
-    "plus",
-    "chatgptplusplan",
-    "go",
-    "chatgptgoplan",
-    "pro",
-    "chatgptpro",
-    "chatgptproplan",
-    "pro_lite",
-    "chatgptprolite",
-    "chatgptpromax",
-    "pro_max",
-    "team",
-    "chatgptteamplan",
-    "enterprise",
-    "active",
-    "trialing",
-    "paid",
-}
+
+
+def _observed(record: dict, nested: dict, key: str, expected_type: type):
+    """Missing and contradictory entitlement facts cannot qualify for delivery."""
+    values = [part[key] for part in (record, nested) if key in part]
+    if not values or any(type(v) is not expected_type or v != values[0] for v in values):
+        return None
+    return values[0] or None
 
 
 class AccountAdapterBase:
@@ -60,11 +49,16 @@ class AccountAdapterBase:
 class UpstreamAccountAdapter(AccountAdapterBase):
     timeout: float = ORDER_HTTP_TIMEOUT_S
 
-    async def subscription_status(self, session: str) -> SubscriptionInfo:
+    async def subscription_status(self, session: str, *,
+                                  credentials_current: Optional[Callable[[], bool]] = None) -> SubscriptionInfo:
+        lease = credentials_current if credentials_current is not None else current_verification_lease()
+        if lease is not None and not lease():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "凭证已过期，停止权益核验")
         if not session or not parse_session(session):
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法查询订阅")
         client = ChatGPTClient.from_raw_session(session, proxy=configured_proxy("checkout"))
         client.timeout = float(self.timeout)
+        client.credentials_current = lease
         try:
             payload = client.subscription_payload()
         finally:
@@ -89,21 +83,31 @@ class UpstreamAccountAdapter(AccountAdapterBase):
                 expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
             except ValueError:
                 expires_at = None
-        if plan_type in TEAM_PLAN_KINDS:
-            # A Team product name or a payment status does not prove entitlement.
-            # If an expiry is supplied but ambiguous, leave delivery unverified.
-            current = expires_raw is None or (
-                expires_at is not None and expires_at.tzinfo is not None
-                and expires_at > datetime.now(timezone.utc)
-            )
-            is_active = status in {"active", "trialing"} and current
-        else:
-            is_active = plan_type in _ACTIVE_PLANS or status in {"active", "trialing", "paid"}
+        sub = payload.get("subscription") or {}
+        # Product labels and paid receipts are not entitlement activation. Reject an ambiguous
+        # or expired validity window for every plan, even when another record says "active".
+        expiries = [v for v in (payload.get("expires_at"), sub.get("expires_at")) if v is not None]
+        current = not expiries or (
+            all(v == expires_raw for v in expiries) and expires_at is not None
+            and expires_at.tzinfo is not None and expires_at > datetime.now(timezone.utc)
+        )
+        states = (payload.get("status"), sub.get("status"))
+        is_active = (status in {"active", "trialing"} and current
+                     and all(str(v).lower() in {"active", "trialing"} for v in states if v))
+        aliases = (TEAM_PLAN_KINDS, {"plus", "chatgptplusplan"}, {"go", "chatgptgoplan"},
+                   {"pro", "chatgptpro", "chatgptproplan"}, {"pro_lite", "chatgptprolite"},
+                   {"pro_max", "chatgptpromax"})
+        kinds = next((group for group in aliases if plan_type in group), {plan_type})
+        plans = (payload.get("plan_type"), sub.get("plan"), (payload.get("plan") or {}).get("type"))
+        is_active = is_active and all(str(p).lower() in kinds for p in plans if p)
         return SubscriptionInfo(
             active=is_active,
             expires_at=expires_at,
             channel="card" if is_active else None,
             raw_kind=plan_type or status or "unknown",
+            workspace_id=_observed(payload, sub, "workspace_id", str),
+            workspace_name=_observed(payload, sub, "workspace_name", str),
+            seat_quantity=_observed(payload, sub, "seat_quantity", int),
         )
 
     async def promo_eligibility(self, session: str) -> PromoEligibility:
@@ -158,7 +162,7 @@ class FakeAccountAdapter(AccountAdapterBase):
             active=self.active,
             expires_at=(datetime.now(timezone.utc) + timedelta(days=30) if self.active else None),
             channel="web" if self.active else None,
-            raw_kind="fake",
+            raw_kind="plus" if self.active else None,
         )
 
     async def promo_eligibility(self, session: str) -> PromoEligibility:

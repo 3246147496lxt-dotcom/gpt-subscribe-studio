@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from gss_contracts.adapter import PaymentReceiptEvidence
 from gss_contracts import Job, Order, OrderStatus, SubscriptionInfo
 
 
@@ -12,6 +13,8 @@ from gss_contracts import Job, Order, OrderStatus, SubscriptionInfo
 class OrderView:
     """API 展示用的附加字段（不含凭证）。"""
 
+    # RAM-only keyed equality check; never part of the public order projection.
+    create_request_tag: Optional[bytes] = field(default=None, repr=False)
     checkout_url: Optional[str] = None
     checkout_session_id: Optional[str] = None
     publishable_key: Optional[str] = None
@@ -37,6 +40,8 @@ class OrderView:
     payment_status: str = "unpaid"        # unpaid | processing | succeeded | failed
     delivery_status: str = "pending"     # pending | delivered | verify_delayed
     payment_intent_id: Optional[str] = None
+    observed_payment_id: Optional[str] = None
+    receipt_evidence: Optional[PaymentReceiptEvidence] = None
     paid_amount: Optional[str] = None
     paid_currency: Optional[str] = None
     tax_delta: Optional[str] = None

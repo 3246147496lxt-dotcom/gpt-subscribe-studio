@@ -17,7 +17,8 @@ from gss_core.vault import vault
 
 
 @pytest.mark.parametrize("origin", ["US", "JP"])
-def test_rotation_is_checkpointed_before_client_close_and_failed_checkout(monkeypatch, origin):
+def test_rotation_is_checkpointed_before_client_close_and_failed_checkout(monkeypatch, origin, tmp_path):
+    monkeypatch.setenv("GSS_DATA_DIR", str(tmp_path))
     store.clear()
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     guard = AsyncMock()

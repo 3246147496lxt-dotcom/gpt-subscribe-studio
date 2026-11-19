@@ -49,6 +49,7 @@ def test_unknown_hosted_result_never_starts_another_order(monkeypatch):
 
 def test_save_choice_error_text_cannot_trigger_another_confirmation():
     protocol = object.__new__(PlusProtocol)
+    protocol.credentials_current = lambda: True
     protocol.client = Mock()
     protocol.client.create_confirmation_token.return_value = "ctoken_fixture"
     protocol.publishable_key, protocol.currency, protocol._t0 = "pk_test_fixture", "USD", 0
@@ -82,6 +83,7 @@ def test_http_402_without_card_evidence_is_not_a_decline():
 ])
 def test_legacy_plus_does_not_confirm_again_from_an_ambiguous_envelope(payload, expected):
     protocol = object.__new__(PlusProtocol)
+    protocol.credentials_current = lambda: True
     protocol.checkout_id, protocol.checkout_url = "oaics_fixture", ""
     protocol.publishable_key = "pk_test_fixture"
     protocol.is_stripe_custom = False
@@ -93,3 +95,20 @@ def test_legacy_plus_does_not_confirm_again_from_an_ambiguous_envelope(payload, 
     assert protocol.pay().state == expected
     protocol._confirm_with_ctoken.assert_called_once()
     protocol.confirm_intent_raw.assert_not_called()
+
+
+def test_standalone_checkout_returns_original_challenge_without_another_submission(monkeypatch):
+    protocol = StripeProtocol()
+    protocol.step_fingerprint = protocol.step_elements = protocol.step_dwell = protocol.step_tax_region = False
+    protocol.external_pm = "pm_fixture"
+    confirm = Mock(return_value={"status": 200, "body": {"payment_intent": {
+        "id": "pi_fixture", "object": "payment_intent", "status": "requires_action"}}})
+    monkeypatch.setattr(protocol, "_sleep", lambda seconds: None)
+    monkeypatch.setattr(protocol, "init_checkout", lambda oid: (None, object()))
+    monkeypatch.setattr(protocol, "confirm", confirm)
+    monkeypatch.setattr(protocol, "poll", Mock(side_effect=AssertionError("must not continue")))
+    try:
+        assert protocol.pay("cs_test_fixture").state == "challenge_required"
+        confirm.assert_called_once()
+    finally:
+        protocol.close()

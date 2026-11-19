@@ -327,17 +327,18 @@ def test_verify_before_official_payment_never_closes_refreshed_checkout(flow, pa
     assert vault.get(oid) is not None
 
 
-def test_real_subscription_activation_finishes_and_repeated_verify_is_idempotent(flow):
+def test_account_activation_alone_does_not_deliver_saved_checkout(flow):
     saved(flow)
     api, oid, root, state = flow
     assert api.post(root + "/refresh-checkout").status_code == 200
     state["verify_active"] = True
     result = api.post(f"/api/orders/{oid}/verify")
     assert result.status_code == 200, result.text
-    assert result.json()["status"] == "delivered"
-    assert result.json()["subscription"]["active"] is True
-    assert vault.get(oid) is None
-    assert api.post(f"/api/orders/{oid}/verify").json()["status"] == "delivered"
+    assert result.json()["status"] == "unknown"
+    assert result.json()["subscription"] is None  # do not project an unrelated plan as delivery
+    assert result.json()["payment_status"] != "succeeded"
+    assert vault.get(oid) is not None
+    assert api.post(f"/api/orders/{oid}/verify").json()["status"] == "unknown"
     assert state["calls"].count("verify_subscription") == 1
 
 
@@ -373,7 +374,7 @@ def test_final_verify_uses_renewed_session_and_preserves_account_context(flow, m
     monkeypatch.setattr("gss_core.saved_cards.jwt_account_id", lambda token: "account_fixture")
     checked = api.post(f"/api/orders/{oid}/verify")
     assert checked.status_code == 200, checked.text
-    assert checked.json()["status"] == "delivered"
+    assert checked.json()["status"] == "unknown"  # correct account, but no receipt for this order
     assert state["verified_session"]["accessToken"] == "refreshed-fixture-token"
     assert state["verified_session"]["cookies"] == {"fixture_cookie": "fixture_value"}
 
@@ -402,6 +403,6 @@ def test_final_verify_real_account_adapter_receives_refreshed_credentials(flow, 
     monkeypatch.setattr("gss_api.routers.orders.build_pipeline", lambda: SimpleNamespace(verify=real_verify))
     response = api.post(f"/api/orders/{oid}/verify")
     assert response.status_code == 200, response.text
-    assert response.json()["subscription"]["active"] is True
-    assert response.json()["status"] == "delivered"
+    assert response.json()["subscription"] is None
+    assert response.json()["status"] == "unknown"  # account status is not an order receipt
     assert state["calls"].count("real_adapter_subscription_payload") == 1

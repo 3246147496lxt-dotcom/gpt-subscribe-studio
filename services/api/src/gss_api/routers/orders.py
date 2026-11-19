@@ -25,7 +25,7 @@ from gss_contracts import (
     OrderStatus,
     Plan,
 )
-from gss_contracts.adapter import TEAM_PLAN_KINDS
+from gss_contracts.adapter import receipt_matches_order, team_entitlement_matches, verification_lease
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
 from gss_core.config import ORDER_HTTP_TIMEOUT_S, load_settings, use_fake_adapters
@@ -48,6 +48,7 @@ from gss_core.session_token import (
     parse_session_bundle,
 )
 from gss_core.vault import OrderSecrets, vault
+from gss_core.saved_card_protocol import _minor
 from gss_core.saved_cards import verification_session
 from gss_orchestrator.pipeline import apply_payment_result, assert_deliverable
 from gss_payment.adapter import hosted_payment_result
@@ -66,6 +67,7 @@ from ..schemas import (
     TeamQuoteRequest,
 )
 from ..store import store
+from .. import purchase_claims
 from .events import notify_order_update
 
 router = APIRouter(prefix="/api", tags=["orders"])
@@ -124,7 +126,9 @@ def _assert_saved_card_resolved(secrets: OrderSecrets) -> None:
         raise HTTPException(409, "请先完成保存卡片的验证与账号同步，再提交付款")
 
 
-def _verify_saved_checkout(pipeline, secrets: OrderSecrets):
+def _verify_saved_checkout(pipeline, order_id: str, secrets: OrderSecrets):
+    if vault.get(order_id) is not secrets:
+        raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
     client = ChatGPTClient.from_raw_session(secrets.session, proxy=secrets.proxy or None)
     client.timeout = ORDER_HTTP_TIMEOUT_S
     try:
@@ -132,11 +136,15 @@ def _verify_saved_checkout(pipeline, secrets: OrderSecrets):
             client,
             secrets.saved_card_context["account_id"],
             trust_statsig=not getattr(secrets, "session_reissued", False),
+            credentials_current=lambda: vault.get(order_id) is secrets,
         )
     finally:
         client.close()
     # The upstream account adapter uses blocking HTTP; keep the entire lookup off the API loop.
-    return session, asyncio.run(pipeline.verify(session=session))
+    if vault.get(order_id) is not secrets:
+        raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
+    with verification_lease(lambda: vault.get(order_id) is secrets):
+        return session, asyncio.run(pipeline.verify(session=session))
 
 
 def _to_mode(mode_in: ModeIn) -> Mode:
@@ -161,8 +169,7 @@ def _default_status_summary(payment_status: str, delivery_status: str) -> str:
 
 
 def _receipt_for(order: Order, view) -> dict:
-    amount = view.paid_amount if view.paid_amount is not None else view.amount
-    currency = view.paid_currency if view.paid_currency is not None else view.currency
+    amount, currency = view.paid_amount, view.paid_currency  # quotes are not receipts
     summary = view.status_summary or _default_status_summary(view.payment_status, view.delivery_status)
     return {
         "payment_intent_id": view.payment_intent_id,
@@ -224,7 +231,31 @@ async def _mark_payment_unknown(order: Order) -> None:
     await notify_order_update(order.id, OrderStatus.UNKNOWN, {"payment_status": "processing"})
 
 
-async def _verify_after_payment(order: Order, secrets: OrderSecrets | None, view) -> bool:
+def _accept_receipt(order: Order, evidence) -> bool:
+    view = store.view(order.id)
+    if not receipt_matches_order(evidence, checkout_id=view.checkout_session_id,
+                                 amount=view.amount, currency=view.currency,
+                                 payment_id=view.observed_payment_id):
+        return False
+    view.observed_payment_id = evidence.payment_id
+    view.receipt_evidence = evidence
+    _set_payment_status(order.id, "succeeded", intent_id=evidence.payment_id,
+                        amount=str(evidence.amount), currency=evidence.currency,
+                        plan_type=str(order.plan), summary=PAID_AWAITING_ENTITLEMENT)
+    return True
+
+
+def _plan_matches(order: Order, info, view) -> bool:
+    if order.plan is Plan.TEAM:
+        return team_entitlement_matches(info, view.receipt_evidence,
+                                        workspace_name=view.workspace_name, seat_quantity=view.seat_quantity)
+    aliases = {"plus": {"plus", "chatgptplusplan"}, "go": {"go", "chatgptgoplan"},
+               "pro": {"pro", "chatgptpro", "chatgptproplan"},
+               "pro_lite": {"pro_lite", "chatgptprolite"}, "pro_max": {"pro_max", "chatgptpromax"}}
+    return info.active and (info.raw_kind or "").strip().lower() in aliases.get(str(order.plan), set())
+
+
+async def _verify_after_payment(order: Order, view) -> bool:
     """付款事实已经确定；仅凭匹配的权益证据完成交付。"""
     if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION, OrderStatus.UNKNOWN}:
         # Reconciliation observes an existing payment attempt; no provider write here.
@@ -236,17 +267,18 @@ async def _verify_after_payment(order: Order, secrets: OrderSecrets | None, view
     await notify_order_update(order.id, order.status, {
         "payment_status": "succeeded", "delivery_status": "verify_delayed",
     })
+    # Do not carry a credential lease across the preceding payment/poll/notification.
+    secrets = vault.get(order.id)
     if secrets is None:
         return False
     try:
-        info = await build_pipeline().verify(session=secrets.session)
+        with verification_lease(lambda: vault.get(order.id) is secrets):
+            info = await build_pipeline().verify(session=secrets.session)
     except Exception as exc:
         # Account lookup is read-only. Never release custody or downgrade a paid receipt here.
         logger.warning("entitlement_lookup_delayed id=%s type=%s", order.id, type(exc).__name__)
         return False
-    if not info.active:
-        return False
-    if order.plan is Plan.TEAM and (info.raw_kind or "").strip().lower() not in TEAM_PLAN_KINDS:
+    if not _plan_matches(order, info, view):
         return False
     assert_deliverable(OrderStatus.ACTIVE, info)
     view.subscription = info
@@ -376,8 +408,14 @@ async def create_order(
 ) -> OrderOut:
     # Single-process API: no await between the check and reservation. A concurrent
     # duplicate must not spend the incoming session or start a second checkout.
+    idempotency_key = (idempotency_key or "").strip()
     if not idempotency_key:
+        if payload.payment_method_token:
+            raise _error(400, ErrorCode.IDEMPOTENCY_CONFLICT,
+                         "建单并付款必须提供稳定的 Idempotency-Key；重试须沿用同一键。")
         return await _create_order(payload, None)
+    if len(idempotency_key) > 255:
+        raise _error(400, ErrorCode.IDEMPOTENCY_CONFLICT, "Idempotency-Key 长度不能超过 255")
     if idempotency_key in _creating_keys:
         raise _error(409, ErrorCode.IDEMPOTENCY_CONFLICT, "同一订单正在处理，请勿重复提交。")
     _creating_keys.add(idempotency_key)
@@ -388,8 +426,12 @@ async def create_order(
 
 
 async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None) -> OrderOut:
+    tag = (purchase_claims.request_tag(idempotency_key, payload.model_dump_json())
+           if idempotency_key else None)
     existing = store.find_by_idempotency(idempotency_key)
     if existing is not None:
+        if tag != store.view(existing.id).create_request_tag:
+            raise _error(409, ErrorCode.IDEMPOTENCY_CONFLICT, "此幂等键已绑定不同的订单请求")
         return _to_out(existing)
 
     try:
@@ -503,6 +545,18 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             "跨区充值需要完整 Session（缺少 sessionToken），请重新导出整段 session JSON",
         )
 
+    claim_dir = load_settings().data_dir if idempotency_key else None
+    if claim_dir is not None:
+        try:
+            first = await asyncio.to_thread(purchase_claims.reserve, claim_dir, idempotency_key,
+                                            order.id, includes_payment=bool(payload.payment_method_token))
+        except purchase_claims.ClaimUnavailable:
+            raise _error(503, ErrorCode.IDEMPOTENCY_CONFLICT, "暂时无法确认原订单，请勿重新提交付款") from None
+        if not first:
+            # A restarted/other worker cannot authenticate a replay from this key
+            # alone: never return someone else's receipt or create another charge.
+            raise _error(409, ErrorCode.IDEMPOTENCY_CONFLICT, "已有原订单记录，请核对原付款，勿重复提交")
+
     def remember(snapshot: str, ua: str, device_id: str) -> OrderSecrets:
         # Commit the snapshot in RAM before closing the refreshing client, deriving
         # checkout metadata or invoking an adapter. No public credential handle.
@@ -514,6 +568,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         vault.put(order.id, item)
         store.create_order(order, idempotency_key)
         view = store.view(order.id)
+        view.create_request_tag = tag
         view.session_reissued_for_country = session_reissued
         view.exit_country = exit_country
         return item
@@ -630,7 +685,23 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     )
 
     if payload.payment_method_token:
-        return await pay_order(order.id, OrderPayRequest(payment_method_token=payload.payment_method_token))
+        assert claim_dir is not None  # validated at the public entry point
+        try:
+            dispatch = await asyncio.to_thread(purchase_claims.begin_payment, claim_dir, order.id)
+        except purchase_claims.ClaimUnavailable:
+            raise _error(503, ErrorCode.IDEMPOTENCY_CONFLICT, "暂时无法确认原订单，请勿重新提交付款") from None
+        if not dispatch:
+            raise _error(409, ErrorCode.IDEMPOTENCY_CONFLICT, "请查询原付款，不要重复确认")
+        try:
+            return await pay_order(order.id, OrderPayRequest(payment_method_token=payload.payment_method_token))
+        finally:
+            observed = ("unknown" if order.status is OrderStatus.UNKNOWN else store.view(order.id).payment_status)
+            if observed in {"processing", "unknown", "succeeded", "failed"}:
+                try:
+                    await asyncio.to_thread(purchase_claims.record_observation, claim_dir, order.id, observed)
+                except purchase_claims.ClaimUnavailable:
+                    # A lost ledger update must not invalidate an already paid receipt.
+                    logger.warning("purchase_observation_unavailable order=%s", order.id)
     return _to_out(store.get_order(order.id))  # type: ignore[arg-type]
 
 
@@ -639,8 +710,15 @@ async def _mark_delivered(order_id: str) -> None:
     current = store.get_order(order_id)
     if current is None or current.status is not OrderStatus.ACTIVE:
         raise DomainError(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, "权益尚未核验，不能交付")
-    store.update_status(order_id, OrderStatus.DELIVERED)
     view = store.view(order_id)
+    if view.payment_status != "succeeded" or (current.plan is Plan.TEAM and (
+        not view.subscription or not _plan_matches(current, view.subscription, view)
+        or not receipt_matches_order(view.receipt_evidence, checkout_id=view.checkout_session_id,
+                                     amount=view.amount, currency=view.currency,
+                                     payment_id=view.observed_payment_id)
+    )):
+        raise DomainError(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, "付款或本单权益尚未核验")
+    store.update_status(order_id, OrderStatus.DELIVERED)
     view.last_error = None
     view.next_action = None
     view.delivery_status = "delivered"
@@ -659,6 +737,14 @@ def _team_client(secrets: OrderSecrets, country: str = "") -> ChatGPTClient:
     """
     client = ChatGPTClient.from_raw_session(secrets.session, proxy=secrets.proxy or None)
     client.timeout = ORDER_HTTP_TIMEOUT_S
+    return client
+
+
+def _leased_team_client(order_id, secrets, *args):
+    if vault.get(order_id) is not secrets:
+        raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
+    client = _team_client(secrets, *args)
+    client.credentials_current = lambda: vault.get(order_id) is secrets
     return client
 
 
@@ -692,7 +778,7 @@ async def quote_team(order_id: str, payload: TeamQuoteRequest) -> OrderOut:
             if not is_supported(billing["country"]):
                 raise HTTPException(400, "不支持的支付账单国家")
         started = time.monotonic()
-        client = _team_client(secrets)
+        client = _leased_team_client(order_id, secrets)
         try:
             quote = await asyncio.to_thread(TeamHostedClient(client).quote,
                 session_id=secrets.checkout_session_id, key=secrets.publishable_key,
@@ -739,7 +825,7 @@ async def prepare_team(order_id: str, payload: TeamPrepareRequest) -> dict:
                 "passive_captcha": {}}
         else:
             started = time.monotonic()
-            client = _team_client(secrets)
+            client = _leased_team_client(order_id, secrets)
             try:
                 context = await asyncio.to_thread(TeamHostedClient(client).prepare,
                     session_id=secrets.checkout_session_id, key=secrets.publishable_key, billing=billing,
@@ -773,56 +859,89 @@ async def prepare_team(order_id: str, payload: TeamPrepareRequest) -> dict:
 @router.post("/orders/{order_id}/team/poll", response_model=OrderOut)
 async def poll_team(order_id: str) -> OrderOut:
     async with _team_locks.setdefault(order_id, asyncio.Lock()):
-        order = store.get_order(order_id)
-        if order is None or order.plan is not Plan.TEAM:
-            raise HTTPException(404, "Team 订单不存在")
-        if order.status in {OrderStatus.DELIVERED, OrderStatus.FAILED, OrderStatus.REJECTED}:
-            return _to_out(order)
-        view = store.view(order_id)
-        secrets = vault.get(order_id)
-        if view.payment_status == "succeeded":
-            await _verify_after_payment(order, secrets, view)
-            return _to_out(order)
-        if use_fake_adapters():
-            return _to_out(order)
-        if secrets is None:
-            if order.status is OrderStatus.UNKNOWN:
-                return _to_out(order)
-            raise _error(401, ErrorCode.SESSION_EXPIRED, "session 已过期")
-        client = _team_client(secrets)
-        try:
-            payload = await asyncio.to_thread(TeamHostedClient(client).poll,
-                session_id=secrets.checkout_session_id, key=secrets.publishable_key)
-        except Exception as exc:
-            if order.status is OrderStatus.UNKNOWN:
-                logger.warning("team_recheck_unavailable id=%s type=%s", order_id, type(exc).__name__)
-                return _to_out(order)
-            if isinstance(exc, DomainError):
-                raise _from_domain(exc)
-            raise _error(502, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "暂时无法查询原付款，请稍后查询") from None
-        finally:
-            client.close()
-        result = hosted_payment_result(payload, secrets.checkout_session_id, view.checkout_url or "")
-        # Poll only observes payment; it must never submit a challenge or confirm a charge.
-        if result.status is PaymentStatus.SUCCEEDED:
-            _set_payment_status(order_id, "succeeded", intent_id=result.provider_ref,
-                                amount=view.amount, currency=view.currency, plan_type=str(order.plan))
-            await _verify_after_payment(order, secrets, view)
-        elif result.status is PaymentStatus.DECLINED:
-            store.update_status(order_id, OrderStatus.FAILED)
-            view.last_error = redact_sensitive(result.message) if result.message else None
-            view.next_action = None
-            _set_payment_status(order_id, "failed", summary=view.last_error)
-            await notify_order_update(order_id, OrderStatus.FAILED, {"payment_status": "failed"})
-        elif result.status is PaymentStatus.REQUIRES_ACTION:
-            if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.UNKNOWN}:
-                store.update_status(order_id, OrderStatus.PAYING)
-            store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
-            view.next_action = result.next_action
-            _set_payment_status(order_id, "processing")
-            view.last_error = redact_sensitive(result.message) if result.message else None
-        # Pending poll responses must not erase an earlier challenge/client_secret.
+        return await _observe_team_locked(order_id)
+
+
+async def _observe_team_locked(order_id: str) -> OrderOut:
+    """The caller owns the order lock; observing the hosted checkout never submits it."""
+    order = store.get_order(order_id)
+    if order is None or order.plan is not Plan.TEAM:
+        raise HTTPException(404, "Team 订单不存在")
+    if order.status in {OrderStatus.DELIVERED, OrderStatus.FAILED, OrderStatus.REJECTED}:
         return _to_out(order)
+    view = store.view(order_id)
+    secrets = vault.get(order_id)
+    paid = view.payment_status == "succeeded"
+    if secrets is None:
+        if paid or view.payment_status == "processing" or order.status is OrderStatus.UNKNOWN:
+            return _to_out(order)  # retain the last observation; no authenticated I/O
+        raise _error(401, ErrorCode.SESSION_EXPIRED, "session 已过期")
+    if paid and (use_fake_adapters() or getattr(view.receipt_evidence, "workspace_id", None)):
+        await _verify_after_payment(order, view)
+        return _to_out(order)
+    if use_fake_adapters():
+        return _to_out(order)
+    client = _leased_team_client(order_id, secrets)
+    def read_original():
+        if vault.get(order_id) is not secrets:
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
+        return TeamHostedClient(client).poll(session_id=secrets.checkout_session_id, key=secrets.publishable_key)
+
+    try:
+        payload = await asyncio.to_thread(read_original)
+    except Exception as exc:
+        if paid or view.payment_status == "processing" or order.status is OrderStatus.UNKNOWN:
+            logger.warning("team_recheck_unavailable id=%s type=%s", order_id, type(exc).__name__)
+            return _to_out(order)
+        if isinstance(exc, DomainError):
+            raise _from_domain(exc)
+        raise _error(502, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "暂时无法查询原付款，请稍后查询") from None
+    finally:
+        client.close()
+    result = hosted_payment_result(payload, secrets.checkout_session_id, view.checkout_url or "")
+    # Poll only observes payment; it must never submit a challenge or confirm a charge.
+    if paid:
+        # Missing workspace linkage may arrive later; a stale poll must not undo settled money.
+        if result.status is PaymentStatus.SUCCEEDED and _accept_receipt(order, result.receipt_evidence):
+            await _verify_after_payment(order, view)
+        return _to_out(order)
+    if result.status is PaymentStatus.SUCCEEDED:
+        if not _accept_receipt(order, result.receipt_evidence):
+            await _mark_payment_unknown(order)
+            return _to_out(order)
+        await _verify_after_payment(order, view)
+    elif result.hosted_open_unpaid:
+        # Only explicit untouched checkout evidence can leave a new order payable.
+        return _to_out(order)
+    elif result.status is PaymentStatus.ERROR:
+        await _mark_payment_unknown(order)
+    elif (result.provider_ref and result.provider_ref.startswith("pi_") and view.observed_payment_id
+          and result.provider_ref != view.observed_payment_id):
+        await _mark_payment_unknown(order)
+    elif result.status is PaymentStatus.DECLINED:
+        store.update_status(order_id, OrderStatus.FAILED)
+        view.last_error = redact_sensitive(result.message) if result.message else None
+        view.next_action = None
+        _set_payment_status(order_id, "failed", summary=view.last_error)
+        await notify_order_update(order_id, OrderStatus.FAILED, {"payment_status": "failed"})
+    elif result.status is PaymentStatus.REQUIRES_ACTION:
+        if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.UNKNOWN}:
+            store.update_status(order_id, OrderStatus.PAYING)
+        store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
+        view.next_action = result.next_action
+        _set_payment_status(order_id, "processing")
+        view.last_error = redact_sensitive(result.message) if result.message else None
+    else:
+        if order.status is OrderStatus.AWAITING_PAYMENT:
+            store.update_status(order_id, OrderStatus.PAYING)
+        if view.payment_status != "processing":
+            _set_payment_status(order_id, "processing")
+    if (result.status in {PaymentStatus.PROCESSING, PaymentStatus.REQUIRES_ACTION}
+            and result.provider_ref and result.provider_ref.startswith("pi_")
+            and not view.observed_payment_id):
+        view.observed_payment_id = result.provider_ref
+    # An abandoned/challenged attempt is not a fresh checkout, even on a later open poll.
+    return _to_out(order)
 
 
 @router.post(
@@ -867,11 +986,16 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
                 and not payload.passive_captcha_token):
             raise HTTPException(400, "请先完成当前会话的 Stripe 验证")
 
+        if payload.card is not None and payload.payment_method_token:
+            raise HTTPException(400, "卡号与 payment_method 只能二选一")
+
+        observed = await _observe_team_locked(order_id)
+        if order.status is not OrderStatus.AWAITING_PAYMENT:
+            return observed  # The hosted page may have paid without first polling this API.
+
         if payload.card is not None:
-            if payload.payment_method_token:
-                raise HTTPException(400, "卡号与 payment_method 只能二选一")
             started = time.monotonic()
-            client = _team_client(secrets, address.get("country", ""))
+            client = _leased_team_client(order_id, secrets, address.get("country", ""))
             try:
                 pm_id = await asyncio.to_thread(
                     TeamHostedClient(client).tokenize,
@@ -912,6 +1036,8 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     view = store.view(order_id)
     if payload.billing is not None:
         view.billing = dict(secrets.billing)
+    if vault.get(order_id) is not secrets:
+        raise _error(401, ErrorCode.SESSION_EXPIRED, "付款尚未提交，订单凭证已过期")
     pipeline = build_pipeline()
     store.update_status(order_id, OrderStatus.PAYING)
     _set_payment_status(order_id, "processing")
@@ -921,6 +1047,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
             country=order.billing_country,
             mode=order.mode,
             payment_method_token=payload.payment_method_token,
+            credentials_current=lambda: vault.get(order_id) is secrets,
             session=secrets.session,
             checkout_session_id=view.checkout_session_id or secrets.checkout_session_id,
             publishable_key=view.publishable_key or secrets.publishable_key,
@@ -963,17 +1090,12 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         if payment.message and payment.status is not PaymentStatus.SUCCEEDED else None
     )
     if payment.status is PaymentStatus.SUCCEEDED:
-        _set_payment_status(
-            order_id,
-            "succeeded",
-            intent_id=payment.provider_ref,
-            amount=view.amount,
-            currency=view.currency,
-            tax_delta=view.tax_delta,
-            plan_type=str(order.plan),
-            summary=PAID_AWAITING_ENTITLEMENT,
-        )
+        if not _accept_receipt(order, payment.receipt_evidence):
+            await _mark_payment_unknown(order)
+            return _to_out(order)
     elif payment.status in {PaymentStatus.PROCESSING, PaymentStatus.REQUIRES_ACTION}:
+        if payment.provider_ref and payment.provider_ref.startswith("pi_"):
+            view.observed_payment_id = payment.provider_ref
         _set_payment_status(order_id, "processing", summary="支付处理中，请勿重复提交")
     elif payment.status is PaymentStatus.DECLINED:
         _set_payment_status(order_id, "failed", summary=view.last_error or "支付失败")
@@ -987,7 +1109,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     )
     
     if new_status is OrderStatus.VERIFYING:
-        await _verify_after_payment(order, secrets, view)
+        await _verify_after_payment(order, view)
     else:
         await notify_order_update(order_id, new_status, {"payment_status": view.payment_status})
     return _to_out(store.get_order(order_id))  # type: ignore[arg-type]
@@ -1019,9 +1141,14 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
     view = store.view(order_id)
     secrets = vault.get(order_id)
     if view.payment_status == "succeeded":
-        await _verify_after_payment(order, secrets, view)
+        await _verify_after_payment(order, view)
         return _to_out(order)
-    if order.status in {OrderStatus.UNKNOWN, OrderStatus.FAILED, OrderStatus.REJECTED} or order.plan is Plan.TEAM:
+    if (secrets and secrets.saved_card_context and secrets.saved_card_context.get("protocol_flow")
+            and order.status is not OrderStatus.UNKNOWN and view.payment_status == "processing"):
+        raise HTTPException(409, "请从原协议入口查询这笔付款")
+    if (view.payment_status == "processing" or order.status in {
+        OrderStatus.UNKNOWN, OrderStatus.FAILED, OrderStatus.REJECTED
+    } or order.plan is Plan.TEAM):
         # Generic subscription activity cannot resolve an unknown charge or an unpaid Team order.
         return _to_out(order)
     if secrets is None:
@@ -1034,53 +1161,22 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
             raise HTTPException(409, "请先完成保存卡片并刷新结账链接，再查询订阅")
         # A status query before payment must leave this checkout available.
         try:
-            refreshed_session, info = await asyncio.to_thread(_verify_saved_checkout, pipeline, secrets)
+            refreshed_session, info = await asyncio.to_thread(_verify_saved_checkout, pipeline, order_id, secrets)
             secrets.session = refreshed_session
         except DomainError as exc:
             if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED, ErrorCode.CHECKOUT_UPSTREAM_ERROR}:
                 raise _from_domain(exc)
             view.last_error = "订阅状态暂未读到，请稍后重新查询"
             return _to_out(order)
-        view.subscription = info
+        # Activity on the account alone cannot attest payment for this checkout.
         if info.active:
-            if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION}:
-                store.update_status(order_id, OrderStatus.PAYING)
-            if order.status is OrderStatus.PAYING:
-                store.update_status(order_id, OrderStatus.VERIFYING)
-            store.update_status(order_id, OrderStatus.ACTIVE)
-            assert_deliverable(OrderStatus.ACTIVE, info)
-            await _mark_delivered(order_id)
+            view.subscription = None
+            await _mark_payment_unknown(order)
         else:
-            view.last_error = "订阅尚未生效，请在新结账页面完成付款后重新查询"
-        return _to_out(order)
-    current = store.get_order(order_id)
-    if current is not None and current.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION}:
-        # 外部付款授权完成后的查询；未知扣款已在上方拦截。
-        store.update_status(order_id, OrderStatus.PAYING)
-    current = store.get_order(order_id)
-    if current is not None and current.status is OrderStatus.PAYING:
-        store.update_status(order_id, OrderStatus.VERIFYING)
-    try:
-        info = await pipeline.verify(session=secrets.session)
-    except DomainError as exc:
-        if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED}:
-            raise _from_domain(exc)
-        # 未扣款订单：保持当前状态返回，由前端稍后重查。
-        logger.warning("verify_failed id=%s error=%s", order_id, redact_sensitive(exc.message)[:200])
-        view.last_error = f"订阅状态查询失败，稍后会自动重试：{redact_sensitive(exc.message)[:120]}"
-        return _to_out(store.get_order(order_id))  # type: ignore[arg-type]
-    view.subscription = info
-    view.plan_type = info.raw_kind or view.plan_type
-    if info.active:
-        store.update_status(order_id, OrderStatus.ACTIVE)
-        assert_deliverable(OrderStatus.ACTIVE, info)
-        await _mark_delivered(order_id)
-    else:
-        view.last_error = "订阅尚未生效。若是 Team 长链,请先打开链接完成支付再查询。"
-        current_status = store.get_order(order_id)
-        if current_status:
-            await notify_order_update(order_id, current_status.status, {"subscription_active": False})
-    return _to_out(store.get_order(order_id))  # type: ignore[arg-type]
+            view.subscription = info
+            view.last_error = "尚未核实本单付款"
+    # An unpaid checkout or a client-supplied paid flag provides no settlement evidence.
+    return _to_out(order)
 
 
 @router.get(
@@ -1251,7 +1347,12 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         or bool(re.search(r"oaics_[A-Za-z0-9]+", checkout_url))
     )
 
+    def credentials_current() -> bool:
+        return vault.get(order_id) is secrets
+
     def _run() -> PaymentOutcome:
+        if not credentials_current():
+            raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
         har_checkout_id = str(getattr(view, "checkout_session_id", "") or "")
         if is_custom_checkout and not pm_id and not har_checkout_id.startswith("cs_"):
             # 协议模式：2026-10-29 HAR 逐请求复刻（指纹 + 遥测，设备每次随机）
@@ -1272,6 +1373,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 exit_country=getattr(secrets, "exit_country", "") or "",
                 pin_proxy=True,
             )
+            hp.credentials_current = credentials_current
+            hp.receipt_expected_minor = _minor(view.amount, currency) if view.amount is not None else None
             try:
                 return hp.pay_from_url()
             finally:
@@ -1286,6 +1389,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 user_agent=getattr(secrets, "user_agent", "") or "",
                 pin_proxy=True,
             )
+            pp.credentials_current = credentials_current
             pp.external_pm = pm_id
             try:
                 return pp.pay_from_url()
@@ -1305,11 +1409,20 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         sp.step_elements = payload.steps.elements
         sp.step_tax_region = payload.steps.tax_region
         # 浏览器已经换好 pm_ 时复用它，服务端不再提交卡号
+        sp.credentials_current = credentials_current
         sp.external_pm = pm_id
         try:
             return sp.pay_from_url(checkout_url)
         finally:
             sp.close()
+
+    if order.plan is Plan.TEAM and not use_fake_adapters():
+        await _observe_team_locked(order_id)
+        if order.status is not OrderStatus.AWAITING_PAYMENT:
+            state = ("paid" if view.delivery_status == "delivered" else
+                     "unknown" if order.status is OrderStatus.UNKNOWN else
+                     "card_declined" if view.payment_status == "failed" else "pending")
+            return _protocol_out(order_id, state=state, message=view.status_summary)
 
     store.update_status(order_id, OrderStatus.PAYING)
     _set_payment_status(order_id, "processing", summary="支付处理中，请勿重复提交")
@@ -1339,17 +1452,24 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         outcome.intent_status == "succeeded" and (outcome.intent_id or "").startswith("pi_")
     )
     if payment_succeeded:
-        _set_payment_status(
-            order_id,
-            "succeeded",
-            intent_id=outcome.intent_id or outcome.charge_id,
-            amount=view.amount,
-            currency=view.currency,
-            tax_delta=view.tax_delta,
-            plan_type=str(order.plan),
-            summary=PAID_AWAITING_ENTITLEMENT,
-        )
-        delivered = await _verify_after_payment(order, secrets, view)
+        # Older protocol adapters return a mix of observations. Never synthesize a receipt
+        # by combining a bare success flag with this order's quote or requested identity.
+        observed = []
+        for envelope in (outcome.raw.get("poll"), outcome.raw.get("confirm"), outcome.raw.get("checkout")):
+            if not isinstance(envelope, dict):
+                continue
+            body = envelope.get("body", envelope)
+            if not isinstance(body, dict):
+                continue
+            result = hosted_payment_result(body, view.checkout_session_id or "", view.checkout_url or "")
+            if result.receipt_evidence is not None:
+                observed.append(result.receipt_evidence)
+        if (not observed or any(item != observed[0] for item in observed)
+                or (outcome.intent_id and observed[0].payment_id != outcome.intent_id)
+                or not _accept_receipt(order, observed[0])):
+            await _mark_payment_unknown(order)
+            return _protocol_out(order_id, state="unknown", message=PAYMENT_UNCONFIRMED)
+        delivered = await _verify_after_payment(order, view)
         response_state = "paid" if delivered else "pending"
         message = view.status_summary
     elif outcome.state == "card_declined":

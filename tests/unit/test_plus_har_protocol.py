@@ -76,7 +76,9 @@ class FakeApp:
                                        f"stripe_session_id={CHECKOUT_ID}&processor_entity={PROCESSOR}&plan_type=plus"),
                 "status": self.page_status,
                 "payment_status": "paid" if self.page_status == "complete" else "unpaid",
-                "checkout_state": {"currency": "jpy", "total": {"total": {"minorUnitsAmount": 1499}}},
+                **({"amount_paid": 1363, "payment_intent": "pi_fixture"} if self.page_status == "complete" else {}),
+                "checkout_state": {"currency": "jpy", "total": {"total": {
+                    "minorUnitsAmount": 1363 if self.page_status == "complete" else 1499}}},
             })
         if route == "/backend-api/payments/checkout/taxes":
             return FakeResponse({"checkout_session": {
@@ -89,6 +91,7 @@ class FakeApp:
             return FakeResponse({
                 "status": "success",
                 "type": "payment_intent",
+                "payment_intent": {"id": "pi_fixture", "status": "requires_confirmation"},
                 "client_secret": "pi_fixture_secret_fixture",
                 "confirm_return_url": ("https://chatgpt.com/checkout/verify?"
                                        f"stripe_session_id={CHECKOUT_ID}&processor_entity={PROCESSOR}&plan_type=plus"),
@@ -433,7 +436,8 @@ def test_generic_processor_error_is_not_a_confirmed_decline(field):
 
 
 @pytest.mark.parametrize(("intent", "state"), [
-    ({"id": "pi_fixture", "status": "succeeded"}, "pending"),
+    ({"id": "pi_fixture", "status": "succeeded", "amount_received": 1363, "currency": "jpy"}, "pending"),
+    ({"id": "pi_fixture", "status": "succeeded"}, "unknown"),
     ({"id": "pi_fixture", "status": "requires_payment_method"}, "card_declined"),
     ({"id": "pi_unrelated", "status": "succeeded"}, "unknown"),
     ({}, "unknown"),
@@ -442,6 +446,7 @@ def test_read_only_known_payment_intent_evidence_keeps_payment_stage(monkeypatch
     engine = build_harness(read_only=True)
     engine.client = StubClient()
     engine.intent_id, engine.intent_secret = "pi_fixture", "fixture-secret"
+    engine.receipt_expected_minor = 1363
     monkeypatch.setattr(engine.client, "retrieve_stripe_intent", lambda **_: intent)
     result = engine._read_only_settle()
     assert (engine.stage, result.state) == ("payment", state)

@@ -48,6 +48,9 @@ class TeamHostedClient:
         # A Confirm whose response was lost is ambiguous and is never retried.
         attempts = 1 if submitted else 3
         for attempt in range(attempts):
+            lease = getattr(self.client, "credentials_current", None)
+            if lease is not None and not lease():
+                raise DomainError(ErrorCode.SESSION_EXPIRED, "付款凭证已过期，停止后续请求")
             started = time.monotonic()
             try:
                 response = getattr(self.http, method.lower())("https://api.stripe.com/v1/" + path,
