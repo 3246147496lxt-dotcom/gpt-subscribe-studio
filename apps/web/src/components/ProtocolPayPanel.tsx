@@ -18,6 +18,8 @@ import {
 import { IconAlertCircle, IconCheck, IconClock, IconX } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 
+import { CardExpiryInput } from "../card-payment/CardExpiryInput";
+import { expiryFormatHint, isValidCardExpiry } from "../card-payment/cardExpiry";
 import { FixedPayerBilling, verifiedPayerBilling } from "./FixedPayerBilling";
 import { CheckoutLinkCard } from "./CheckoutLinkCard";
 import { PlusProtocolPayPanel } from "./PlusProtocolPayPanel";
@@ -252,8 +254,7 @@ function LegacyProtocolPayPanel({
     const number = card.number.replace(/[\s-]/g, "");
     if (!/^\d{12,19}$/.test(number)) return setError("卡号格式不对（12–19 位数字）。");
     if (!/^\d{3,4}$/.test(card.cvc)) return setError("CVC 格式不对（3–4 位）。");
-    if (!/^\d{1,2}$/.test(card.exp_month)) return setError("到期月份填 MM。");
-    if (!/^\d{2}$|^\d{4}$/.test(card.exp_year)) return setError("到期年份填 YY 或 YYYY。");
+    if (!isValidCardExpiry(card)) return setError(expiryFormatHint);
 
     setBusy(true);
     try {
@@ -372,11 +373,10 @@ function LegacyProtocolPayPanel({
           <Stack gap="sm">
             <TextInput label="卡号" value={card.number} onChange={changeCard("number")}
               inputMode="numeric" autoComplete="off" disabled={busy || disabled} placeholder="4242424242424242" />
-            <SimpleGrid cols={{ base: 1, xs: 3 }}>
-              <TextInput label="到期月份" placeholder="MM" value={card.exp_month}
-                onChange={changeCard("exp_month")} inputMode="numeric" maxLength={2} disabled={busy || disabled} />
-              <TextInput label="到期年份" placeholder="YYYY" value={card.exp_year}
-                onChange={changeCard("exp_year")} inputMode="numeric" maxLength={4} disabled={busy || disabled} />
+            <SimpleGrid cols={{ base: 1, xs: 2 }}>
+              <CardExpiryInput month={card.exp_month} year={card.exp_year}
+                onChange={(expiry) => setCard((previous) => ({ ...previous, ...expiry }))}
+                disabled={busy || disabled} />
               <PasswordInput label="CVC" value={card.cvc} onChange={changeCard("cvc")}
                 inputMode="numeric" maxLength={4} disabled={busy || disabled} />
             </SimpleGrid>

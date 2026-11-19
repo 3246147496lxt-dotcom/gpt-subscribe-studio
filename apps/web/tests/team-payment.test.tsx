@@ -7,6 +7,7 @@ import { quoteTeam, prepareTeam, pollTeam, type Order, type TeamHostedContext } 
 import { loadHistory, normalizeHistoryError } from "../src/api/history";
 import { hostedCaptcha } from "../src/card-payment/hostedCaptcha";
 import { TeamPaymentPanel } from "../src/components/TeamPaymentPanel";
+import { isValidCardExpiry, parseCardExpiryInput } from "../src/card-payment/cardExpiry";
 import { emptyTeamCard } from "../src/card-payment/TeamCardForm";
 import { PlanPicker } from "../src/components/PlanPicker";
 import { OrderSummary } from "../src/components/OrderSummary";
@@ -40,6 +41,20 @@ test("Team card fields stay available regardless of checkout state", () => {
     assert.ok(!html.includes("尚未取得 Stripe 公钥"));
   }
   assert.ok(!panel(null).includes('data-testid="stripe-payment-element"'));
+});
+
+test("One expiry field accepts MM/YY and compact digits while preserving the existing month and year fields", () => {
+  const html = panel(blankOrder);
+  assert.ok(html.includes('placeholder="MM/YY"'));
+  assert.ok(!html.includes("到期月份") && !html.includes("到期年份"));
+  for (const text of ["11/28", "1128"]) {
+    assert.deepEqual(parseCardExpiryInput(text), { exp_month: "11", exp_year: "28" });
+  }
+  assert.deepEqual(parseCardExpiryInput("11/2028"), { exp_month: "11", exp_year: "2028" });
+  assert.deepEqual(parseCardExpiryInput("11/"), { exp_month: "11", exp_year: "" });
+  for (const text of ["00/28", "13/28", "11/2"]) {
+    assert.equal(isValidCardExpiry(parseCardExpiryInput(text)!), false);
+  }
 });
 
 test("Team card payload carries only the four card fields", () => {

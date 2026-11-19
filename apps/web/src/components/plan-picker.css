@@ -1,0 +1,82 @@
+.plan-picker {
+  container-type: inline-size;
+}
+
+.plan-picker .plan-picker__heading {
+  color: var(--studio-ink);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.plan-picker__options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+@container (min-width: 560px) {
+  .plan-picker__options {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.plan-picker__card {
+  position: relative;
+  display: grid;
+  align-content: center;
+  gap: 6px;
+  min-height: 78px;
+  padding: 14px;
+  color: var(--studio-ink);
+  text-align: start;
+  background: var(--studio-surface);
+  border: 1px solid var(--studio-line);
+  border-radius: 12px;
+  transition: border-color 160ms, background-color 160ms;
+}
+
+.plan-picker__card:hover:not(:disabled),
+.plan-picker__card[aria-checked="true"] {
+  border-color: var(--studio-brand);
+}
+
+.plan-picker__card[aria-checked="true"] {
+  color: var(--studio-brand);
+  background: var(--studio-tint);
+}
+
+.plan-picker__card:focus-visible {
+  outline: 2px solid var(--studio-brand);
+  outline-offset: 2px;
+}
+
+.plan-picker__card:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.plan-picker__name {
+  font-size: 17px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.plan-picker__hint {
+  color: var(--studio-muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.plan-picker__card[aria-checked="true"] .plan-picker__hint {
+  color: inherit;
+}
+
+.plan-picker__check {
+  position: absolute;
+  inset-block-start: 12px;
+  inset-inline-end: 12px;
+  padding: 2px;
+  border-radius: 5px;
+  background: var(--studio-surface);
+}

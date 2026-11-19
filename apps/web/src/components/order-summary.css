@@ -1,0 +1,121 @@
+.order-summary {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+}
+
+.order-summary-card {
+  min-width: 0;
+  padding: 24px;
+  border: 1px solid var(--studio-line);
+  border-radius: 20px;
+  background: var(--studio-surface);
+  color: var(--studio-ink);
+}
+
+.order-summary-card h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.order-summary-details {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+  margin: 18px 0 0;
+}
+
+.order-summary-details dt,
+.order-receipt-caption {
+  margin: 0;
+  color: var(--studio-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.order-summary-details dd {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 550;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.order-receipt {
+  border-top: 4px solid var(--studio-brand);
+}
+
+.order-receipt-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 24px;
+}
+
+.order-receipt-head > svg {
+  flex: none;
+  color: var(--studio-brand);
+}
+
+.order-receipt-head h2 {
+  font-size: 17px;
+}
+
+.order-receipt-stamp {
+  margin-left: auto;
+  padding: 3px 9px;
+  border: 1px solid var(--studio-line);
+  border-radius: 6px;
+  color: var(--studio-muted);
+  font-size: 11px;
+  transform: rotate(-5deg);
+}
+
+.order-receipt-stamp[data-tone="complete"] {
+  color: var(--mantine-color-green-text);
+  border-color: currentColor;
+}
+
+.order-receipt-stamp[data-tone="failed"],
+.order-receipt-error {
+  color: var(--mantine-color-red-text);
+}
+
+.order-receipt-amount {
+  margin: 4px 0 20px;
+  font-size: 30px;
+  line-height: 1.35;
+  font-weight: 600;
+  letter-spacing: -.04em;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.order-receipt-amount[data-placeholder] {
+  color: var(--studio-muted);
+  font-size: 23px;
+  letter-spacing: -.02em;
+}
+
+.order-receipt-note {
+  margin: 0 0 16px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.order-receipt-status {
+  margin: 0;
+  border-top: 1px dashed var(--studio-line);
+  padding-top: 16px;
+  color: var(--studio-body);
+  font-size: 13px;
+}
+
+.flow-error-link {
+  color: inherit;
+  text-underline-offset: 3px;
+  white-space: nowrap;
+}

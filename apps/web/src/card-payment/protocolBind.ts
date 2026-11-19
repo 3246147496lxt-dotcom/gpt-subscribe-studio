@@ -1,3 +1,4 @@
+import { expiryFormatHint, isValidCardExpiry } from "./cardExpiry";
 import type { BindAndPayProtocolResult, BillingInput, ProtocolPayResult, TeamCardPayload } from "../api/client";
 
 export const PROTOCOL_STAGE_LABELS = {
@@ -37,7 +38,6 @@ export function protocolBillingError(billing: BillingInput): string | null {
 export function protocolCardError(card: TeamCardPayload): string | null {
   if (!/^\d{12,19}$/.test(card.number.replace(/[\s-]/g, ""))) return "请填写有效卡号。";
   if (!/^\d{3,4}$/.test(card.cvc)) return "请填写 3 至 4 位 CVC。";
-  if (!/^\d{1,2}$/.test(card.exp_month) || Number(card.exp_month) < 1 || Number(card.exp_month) > 12) return "请填写 01 至 12 的到期月份。";
-  if (!/^(?:\d{2}|\d{4})$/.test(card.exp_year)) return "请填写两位或四位到期年份。";
+  if (!isValidCardExpiry(card)) return expiryFormatHint;
   return null;
 }

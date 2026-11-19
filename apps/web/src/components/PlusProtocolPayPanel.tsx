@@ -1,6 +1,7 @@
 import { Alert, Badge, Button, Checkbox, Code, Group, Paper, PasswordInput, SimpleGrid, Stack, Text, TextInput } from "@mantine/core";
 import { useEffect, useRef, useState } from "react";
 
+import { CardExpiryInput } from "../card-payment/CardExpiryInput";
 import {
   bindAndPayProtocol,
   formatAmount,
@@ -143,9 +144,10 @@ export function PlusProtocolPayPanel({
       <Paper withBorder p="md" radius="md">
         <Stack gap="sm">
           <TextInput label="卡号" value={card.number} onChange={changeCard("number")} inputMode="numeric" autoComplete="cc-number" disabled={fieldsDisabled} data-testid="protocol-card-number" />
-          <SimpleGrid cols={{ base: 1, xs: 3 }}>
-            <TextInput label="到期月份" value={card.exp_month} onChange={changeCard("exp_month")} inputMode="numeric" maxLength={2} autoComplete="cc-exp-month" disabled={fieldsDisabled} />
-            <TextInput label="到期年份" value={card.exp_year} onChange={changeCard("exp_year")} inputMode="numeric" maxLength={4} autoComplete="cc-exp-year" disabled={fieldsDisabled} />
+          <SimpleGrid cols={{ base: 1, xs: 2 }}>
+            <CardExpiryInput month={card.exp_month} year={card.exp_year}
+              onChange={(expiry) => setCard((previous) => ({ ...previous, ...expiry }))}
+              disabled={fieldsDisabled} autoComplete="cc-exp" />
             <PasswordInput label="CVC" value={card.cvc} onChange={changeCard("cvc")} inputMode="numeric" maxLength={4} autoComplete="cc-csc" disabled={fieldsDisabled} />
           </SimpleGrid>
         </Stack>

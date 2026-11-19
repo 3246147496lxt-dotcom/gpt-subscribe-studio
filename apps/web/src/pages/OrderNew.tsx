@@ -1,4 +1,4 @@
-import { Alert, Button, Group, Paper, SegmentedControl, Select, Stack, Stepper, Text } from "@mantine/core";
+import { Alert, Button, Group, Paper, SegmentedControl, Select, Stack, Text } from "@mantine/core";
 import { IconAlertCircle, IconCheck } from "@tabler/icons-react";
 import { useEffect, useRef, useState } from "react";
 
@@ -22,6 +22,8 @@ import { SUCCESS_STATUSES, isSettled } from "../api/history";
 import { subscribeOrderUpdates, type OrderUpdateEvent } from "../api/events";
 import { loadStripe, type StripeCardHandle } from "../card-payment/CardFields";
 import { OrderSummary } from "../components/OrderSummary";
+import { OrderProgress, type CheckoutClock, type ProgressActivity } from "../components/OrderProgress";
+import { getOrderFlow } from "../orderFlow";
 import { PlanPicker, type TeamValues } from "../components/PlanPicker";
 import { REGIONS } from "../plans";
 import { ResultPanel } from "../components/ResultPanel";
@@ -29,11 +31,20 @@ import { SessionField } from "../components/SessionField";
 import { verifiedPayerBilling } from "../components/FixedPayerBilling";
 import { ProtocolPayPanel } from "../components/ProtocolPayPanel";
 import { CheckoutLinkCard } from "../components/CheckoutLinkCard";
+import { isValidCardExpiry } from "../card-payment/cardExpiry";
 import { emptyTeamCard, type TeamCardDraft } from "../card-payment/TeamCardForm";
 
 interface Props {
   onRecord: (order: Order) => void;
 }
+
+const requestActivities = {
+  create: { label: "正在创建结账，等待建单回执" },
+  restore: { label: "正在读取原订单，不会重新建单" },
+  quote: { label: "正在读取应付金额", step: "quote" },
+  verify: { label: "正在查询订阅状态", step: "subscription" },
+  payment: { label: "正在处理付款请求", step: "payment" },
+} satisfies Record<string, ProgressActivity>;
 
 export function OrderNew({ onRecord }: Props) {
   const [plan, setPlan] = useState<Plan>("plus");
@@ -47,8 +58,25 @@ export function OrderNew({ onRecord }: Props) {
     interval: "month",
   });
   const [order, setOrder] = useState<Order | null>(null);
+  const [incompleteCheckout, setIncompleteCheckout] = useState<Order | null>(null);
   const currentOrderId = useRef<string | null>(null);
   currentOrderId.current = order?.id || null;
+
+  // Default the exit country to the proxy currently configured by the
+  // operator. Billing still comes from the server-side verified US profile.
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/settings/proxies")
+      .then((res) => res.json())
+      .then((data) => {
+        const region = String(data?.checkout?.region || "").toUpperCase();
+        if (!cancelled && /^[A-Z]{2}$/.test(region)) {
+          setExitCountry((current) => current || region);
+        }
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
   const [result, setResult] = useState<Order | null>(null);
   const [readOnlyOrderId, setReadOnlyOrderId] = useState<string | null>(null);
   const [card, setCard] = useState<StripeCardHandle | null>(null);
@@ -56,12 +84,14 @@ export function OrderNew({ onRecord }: Props) {
   const [teamBilling, setTeamBilling] = useState<BillingInput>({
     name: "", line1: "", city: "", state: "", postal_code: "", country: "US",
   });
+  const [clock, setClock] = useState<CheckoutClock | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [promo, setPromo] = useState<PromoEligibility | null>(null);
   const [promoCampaignId, setPromoCampaignId] = useState("");
   const [promoBusy, setPromoBusy] = useState(false);
   const [promoError, setPromoError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [request, setRequest] = useState<keyof typeof requestActivities | null>(null);
+  const busy = request !== null;
   const [protocolBusy, setProtocolBusy] = useState(false);
   // 共享支付容器；pmMode 决定协议提交或 Stripe 输入框。
   const payMode = "protocol" as const;
@@ -74,6 +104,22 @@ export function OrderNew({ onRecord }: Props) {
   // 没有公钥才退回「打开长链手动付款」。
   const linkOnly = Boolean(order && hosted && !order.publishable_key);
   const step = result ? 2 : order ? 1 : 0;
+  const displayOrder = order && result?.id === order.id ? result : order ?? incompleteCheckout;
+  const progress = getOrderFlow(displayOrder, clock !== null, error, plan);
+  const finished = progress.tone === "complete" || progress.tone === "failed"
+    || Boolean(displayOrder && isSettled(displayOrder.status)) || Boolean(incompleteCheckout && !order);
+  const workingStep = progress.steps.find(item => item.state === "active");
+  let activity: ProgressActivity | null = null;
+  if (clock && !finished) {
+    if (request) activity = requestActivities[request];
+    else if (workingStep) activity = { label: workingStep.status, step: workingStep.id };
+    else if (protocolBusy) activity = { label: "正在等待操作回执" };
+  }
+
+  useEffect(() => {
+    if (!clock || clock.finishedAt !== null || !finished) return;
+    setClock({ ...clock, finishedAt: Date.now() });
+  }, [clock, finished]);
 
   // Unknown or inaccessible storage must never look like permission to start a new purchase.
   let purchaseKind: "pending" | "order" | "unavailable" | undefined;
@@ -89,7 +135,7 @@ export function OrderNew({ onRecord }: Props) {
 
   async function recheckDelivery() {
     if (!result || busy) return;
-    setBusy(true);
+    setRequest("verify");
     setError(null);
     try {
       const next = await verifyOrder(result.id, true);
@@ -98,7 +144,7 @@ export function OrderNew({ onRecord }: Props) {
     } catch (err) {
       setError(err instanceof Error ? err.message : "核验失败，请稍后重试");
     } finally {
-      setBusy(false);
+      setRequest(null);
     }
   }
 
@@ -110,6 +156,8 @@ export function OrderNew({ onRecord }: Props) {
       catch { setError("无法重置当前标签页的购买标记，未开始新购买。"); return; }
     }
     setOrder(null);
+    setIncompleteCheckout(null);
+    setClock(null);
     setResult(null);
     setReadOnlyOrderId(null);
     setCard(null);
@@ -246,9 +294,11 @@ export function OrderNew({ onRecord }: Props) {
     event.preventDefault();
     if (busy || protocolBusy || order?.plan === "plus" || (order && order.id === readOnlyOrderId)) return;
     setError(null);
-    setBusy(true);
+    setRequest(!order ? (purchaseKind === "order" ? "restore" : "create") : linkOnly ? "verify" : "payment");
     try {
       if (!order) {
+        setIncompleteCheckout(null);
+        setClock(null);
         if (purchaseKind === "unavailable") {
           setError("当前标签页无法读取购买标记，请先核对原单；未提交建单。");
           return;
@@ -265,6 +315,7 @@ export function OrderNew({ onRecord }: Props) {
           setError("Team 需要填写席位，最少 2 人。");
           return;
         }
+        setClock({ startedAt: Date.now(), finishedAt: null });
         const create = (key: string) => createOrder({
           ...(plan === "team"
             ? { plan, billing_country: country, exit_country: exitCountry || country }
@@ -292,11 +343,14 @@ export function OrderNew({ onRecord }: Props) {
           }
         }
         if (created.plan !== "plus" && !created.publishable_key && !isHostedOrder(created)) {
+          // Keep the returned receipt visible even if the checkout form cannot open.
+          setIncompleteCheckout(created);
           throw new Error("结账已创建，但没有拿到 Stripe 公钥，无法加载安全输入框。");
         }
         setOrder(created);
         setSession("");
         if (plan === "team") {
+          setRequest("quote");
           try {
             // 只要拿到 cs_ 就能 init 报价，与有没有 publishable_key 无关。
             // 全协议模式不需要 pk，所以这里不能拿 pk 当条件。
@@ -329,8 +383,8 @@ export function OrderNew({ onRecord }: Props) {
       if (teamOrder) {
         const draft = teamCard;
         if (!/^\d{12,19}$/.test(draft.number.replace(/[\s-]/g, "")) || !/^\d{3,4}$/.test(draft.cvc)
-          || !/^\d{1,2}$/.test(draft.exp_month) || !/^\d{2}|\d{4}$/.test(draft.exp_year)) {
-          setError("请填写有效的卡号、到期月份、到期年份和 CVC。");
+          || !isValidCardExpiry(draft)) {
+          setError("请检查卡号、有效期（MM/YY）和 CVC。");
           return;
         }
       }
@@ -376,13 +430,13 @@ export function OrderNew({ onRecord }: Props) {
         if (latest) setOrder(latest);
       }
     } finally {
-      setBusy(false);
+      setRequest(null);
     }
   }
 
   const errorAlert = error && step < 2 ? (
     <Alert mt="md" color="red" variant="light" icon={<IconAlertCircle size={18} />} role="alert">
-      {error}
+      {error} <a className="flow-error-link" href="#order-progress">查看流程</a>
     </Alert>
   ) : null;
   // 全协议模式的出口：优先订单 exit_country，其次账单国
@@ -403,12 +457,10 @@ export function OrderNew({ onRecord }: Props) {
   return (
     <form onSubmit={submit}>
       <div className={`order-layout${step === 1 && order && payMode === "protocol" ? " order-layout--split" : ""}`}>
-        <Paper className="order-main" withBorder p="lg" radius="md">
-          <Stepper active={step} size="sm" mb="lg" allowNextStepsSelect={false}>
-            <Stepper.Step label="配置订单" description="session、套餐、地区" />
-            <Stepper.Step label={order?.plan === "plus" ? pmMode === "server" ? "协议支付" : "Stripe 输入框支付" : linkOnly ? "长链支付" : "填卡支付"} description={linkOnly ? "打开链接付款" : "地址与卡片"} />
-            <Stepper.Step label="结果" description="成功或失败" />
-          </Stepper>
+        <Paper className="order-main">
+          {step === 1 && (!protocolStep || (order?.plan !== "plus" && order?.checkout_url)) && (
+            <h2 className="payment-stage-title">订单结账</h2>
+          )}
 
           {order?.plan === "team" && order.checkout_url && order.id !== readOnlyOrderId && step >= 1 && (
             <CheckoutLinkCard url={order.checkout_url} />
@@ -424,7 +476,6 @@ export function OrderNew({ onRecord }: Props) {
                   <Button type="button" variant="subtle" size="xs" disabled={busy} onClick={reset}>开始另一笔购买</Button>
                 </Alert>
               )}
-              <SessionField value={session} onChange={setSession} team={plan === "team"} disabled={busy} />
               <PlanPicker
                 compact={teamOrder}
                 plan={plan}
@@ -448,14 +499,15 @@ export function OrderNew({ onRecord }: Props) {
                 label="出口国家（代理 / Session 重签发）"
                 description={plan === "team"
                   ? "默认跟随上面的地区。低价区示例：地区 US、出口 PH，代理与重签发走 PH，账单/税务走 US。"
-                  : "可不选，由服务端按已核验账单确定出口。选择出口不会更改账单；当前渠道不支持不一致的地区。"}
-                placeholder={plan === "team" ? "默认跟随地区" : "默认由服务端确定"}
+                  : "决定结算币种、代理出口与 Session 重签发；账单地址固定使用服务端已核验的美国免税地址，不随出口变化。"}
+                placeholder={plan === "team" ? "默认跟随地区" : "默认使用当前代理地区"}
                 searchable
                 data={REGIONS.map((item) => ({ value: item.code, label: `${item.label} (${item.code})` }))}
                 value={exitCountry || null}
                 onChange={(value) => setExitCountry(value ?? "")}
                 disabled={busy || Boolean(order)}
               />
+              <SessionField value={session} onChange={setSession} team={plan === "team"} disabled={busy} />
               <div>
                 <Text size="sm" fw={600} mb={6}>支付方式</Text>
                 <SegmentedControl
@@ -544,7 +596,7 @@ export function OrderNew({ onRecord }: Props) {
               </Alert>
               <Group>
                 <Button type="button" variant="light" loading={busy} onClick={async () => {
-                  setBusy(true);
+                  setRequest("verify");
                   setError(null);
                   try {
                     const checked = await verifyOrder(order.id);
@@ -554,7 +606,7 @@ export function OrderNew({ onRecord }: Props) {
                   } catch (err) {
                     setError(err instanceof Error ? err.message : "查询订阅失败");
                   } finally {
-                    setBusy(false);
+                    setRequest(null);
                   }
                 }}>
                   我已支付，查询订阅
@@ -614,7 +666,7 @@ export function OrderNew({ onRecord }: Props) {
                 onBusyChange={setProtocolBusy}
                 onRefreshQuote={!teamOrder ? undefined : async () => {
                   if (!order) return;
-                  setBusy(true);
+                  setRequest("quote");
                   setError(null);
                   try {
                     // 报价带账单地址才能算准税额；订单上已有就用它
@@ -626,7 +678,7 @@ export function OrderNew({ onRecord }: Props) {
                   } catch (err) {
                     setError(err instanceof Error ? err.message : "报价读取失败");
                   } finally {
-                    setBusy(false);
+                    setRequest(null);
                   }
                 }}
                 onDone={(out) => {
@@ -645,16 +697,16 @@ export function OrderNew({ onRecord }: Props) {
         )}
 
         <div className="order-side">
-          <OrderSummary plan={plan} country={plan === "team" ? country : "由已核验账单确定"} order={order} seats={team.seats} />
+          <OrderSummary plan={plan} country={plan === "team" ? country : "由已核验账单确定"} order={displayOrder} seats={team.seats} progress={progress} />
           {teamOrder && order && step < 2 && order.status === "awaiting_payment" && (
             <Button variant="light" fullWidth mt="xs" loading={busy} type="button" onClick={async () => {
-              setBusy(true); setError(null);
+              setRequest("quote"); setError(null);
               try {
                 const complete = Boolean(teamBilling.name.trim() && teamBilling.line1.trim()
                   && teamBilling.city.trim() && teamBilling.postal_code.trim());
                 setOrder(await quoteTeam(order.id, complete ? teamBilling : undefined));
               } catch (err) { setError(err instanceof Error ? err.message : "报价读取失败"); }
-              finally { setBusy(false); }
+              finally { setRequest(null); }
             }}>刷新应付金额</Button>
           )}
           {order && step < 2 && (
@@ -665,6 +717,7 @@ export function OrderNew({ onRecord }: Props) {
           )}
         </div>
       </div>
+      <OrderProgress progress={progress} clock={clock} activity={activity} />
     </form>
   );
 }

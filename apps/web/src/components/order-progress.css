@@ -1,0 +1,156 @@
+.order-progress {
+  margin-top: 24px;
+  padding: 22px 24px 24px;
+  border: 1px solid var(--studio-line);
+  border-radius: 20px;
+  background: var(--studio-surface);
+  color: var(--studio-ink);
+  scroll-margin-top: 84px;
+}
+
+.order-progress__heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px 18px;
+  margin-bottom: 16px;
+}
+
+.order-progress__heading h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.order-progress__elapsed {
+  color: var(--studio-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.order-progress__elapsed strong { color: var(--studio-ink); font-weight: 600; }
+
+.order-progress__spinner {
+  display: inline-block;
+  flex: none;
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--studio-line);
+  border-top-color: var(--studio-brand);
+  border-radius: 50%;
+  animation: order-progress-spin .8s linear infinite;
+}
+
+@keyframes order-progress-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .order-progress__spinner { animation: none; }
+}
+
+.order-progress__status {
+  grid-column: 1 / -1;
+  min-width: 0;
+  color: var(--studio-body);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.order-progress__status strong { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
+.order-progress__status p { margin: 4px 0 0; line-height: 1.6; }
+
+.order-progress__steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.order-progress__steps li {
+  --step-color: var(--studio-muted);
+  min-width: 0;
+  padding: 13px 14px;
+  border: 1px solid var(--studio-line);
+  border-radius: 12px;
+  overflow-wrap: anywhere;
+}
+
+.order-progress__step-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 7px;
+}
+
+.order-progress__step-heading h3 {
+  margin: 0;
+  color: var(--studio-ink);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.order-progress__marker {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--studio-line);
+  border-radius: 50%;
+  color: var(--step-color);
+  font-size: 11px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.order-progress__step-status {
+  margin-left: auto;
+  color: var(--step-color);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.order-progress__steps li[data-state="active"] { --step-color: var(--studio-brand-ink); }
+.order-progress__steps li[data-state="complete"] { --step-color: var(--studio-green); }
+.order-progress__steps li[data-state="attention"] { --step-color: light-dark(#845111, #f0c38e); }
+.order-progress__steps li[data-state="failed"] { --step-color: var(--mantine-color-red-text); }
+.order-progress__steps li[aria-current="step"] {
+  border-color: var(--step-color);
+  background: color-mix(in srgb, var(--step-color) 4%, var(--studio-surface));
+}
+.order-progress__steps li[aria-current="step"] .order-progress__marker { border-color: currentColor; }
+.order-progress__status[data-tone="failed"] { color: var(--mantine-color-red-text); }
+.order-progress__status[data-tone="attention"] { color: light-dark(#845111, #f0c38e); }
+.order-progress__status[data-tone="complete"] { color: var(--studio-green); }
+
+.order-progress__description,
+.order-progress__evidence {
+  margin: 7px 0 0;
+  color: var(--studio-body);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.order-progress__evidence {
+  padding-top: 6px;
+  border-top: 1px dashed var(--studio-line);
+  color: var(--step-color);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 980px) {
+  .order-progress__steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 640px) {
+  .order-progress {
+    margin-top: 20px;
+    padding: 16px;
+    scroll-margin-top: 110px;
+  }
+  .order-progress__heading { gap: 6px 8px; margin-bottom: 12px; }
+  .order-progress__steps { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .order-progress__steps li { padding: 10px 12px; }
+}

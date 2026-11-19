@@ -11,9 +11,11 @@ import {
   TextInput,
   Paper,
 } from "@mantine/core";
+import { IconCheck } from "@tabler/icons-react";
 
 import type { Plan } from "../api/client";
 import { FAMILIES, PRO_TIERS, REGIONS, SEAT_PRESETS, familyOf, isProFamily } from "../plans";
+import "./plan-picker.css";
 
 export interface TeamValues {
   seats: number;
@@ -46,24 +48,22 @@ export function PlanPicker({ plan, onPlan, country, onCountry, team, onTeam, dis
 
   return (
     <Stack gap={compact ? "sm" : "md"}>
-      <Radio.Group label="套餐" value={family} onChange={pickFamily}>
-        <SimpleGrid cols={{ base: 2, sm: 4 }} spacing="xs" mt="xs">
+      <Radio.Group
+        className="plan-picker"
+        classNames={{ label: "plan-picker__heading" }}
+        label="选一个套餐"
+        value={family}
+        onChange={pickFamily}
+      >
+        <div className="plan-picker__options">
           {FAMILIES.map((item) => (
-            <Radio.Card key={item.id} value={item.id} radius="md" p="sm" disabled={disabled}>
-              <Group wrap="nowrap" align="flex-start" gap="xs">
-                <Radio.Indicator />
-                <div>
-                  <Text fw={600} size="sm" lh={1.2}>
-                    {item.label}
-                  </Text>
-                  <Text size="xs" c="dimmed">
-                    {item.hint}
-                  </Text>
-                </div>
-              </Group>
+            <Radio.Card key={item.id} value={item.id} className="plan-picker__card" disabled={disabled}>
+              <span className="plan-picker__name">{item.label}</span>
+              <span className="plan-picker__hint">{item.hint}</span>
+              {family === item.id && <IconCheck className="plan-picker__check" size={17} aria-hidden />}
             </Radio.Card>
           ))}
-        </SimpleGrid>
+        </div>
       </Radio.Group>
 
       {family === "pro" && (

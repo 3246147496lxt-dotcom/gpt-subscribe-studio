@@ -1,5 +1,7 @@
 import { PasswordInput, SimpleGrid, Stack, Text, TextInput } from "@mantine/core";
 
+import { CardExpiryInput } from "./CardExpiryInput";
+
 export interface TeamCardDraft {
   number: string;
   exp_month: string;
@@ -27,11 +29,10 @@ export function TeamCardForm({ value, onChange, disabled }: Props) {
       <Text size="xs" c="dimmed">卡号只用于本次向 Stripe 换取支付标识，不写入订单记录。</Text>
       <TextInput label="卡号" value={value.number} onChange={change("number")}
         inputMode="numeric" autoComplete="off" disabled={disabled} data-testid="team-card-number" />
-      <SimpleGrid cols={{ base: 1, xs: 3 }}>
-        <TextInput label="到期月份" placeholder="MM" value={value.exp_month} onChange={change("exp_month")}
-          inputMode="numeric" autoComplete="off" maxLength={2} disabled={disabled} />
-        <TextInput label="到期年份" placeholder="YYYY" value={value.exp_year} onChange={change("exp_year")}
-          inputMode="numeric" autoComplete="off" maxLength={4} disabled={disabled} />
+      <SimpleGrid cols={{ base: 1, xs: 2 }}>
+        <CardExpiryInput month={value.exp_month} year={value.exp_year}
+          onChange={(expiry) => onChange({ ...value, ...expiry })}
+          disabled={disabled} autoComplete="off" />
         <PasswordInput label="CVC" value={value.cvc} onChange={change("cvc")}
           inputMode="numeric" autoComplete="off" maxLength={4} disabled={disabled} />
       </SimpleGrid>

@@ -1,97 +1,169 @@
-.order-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: var(--mantine-spacing-lg);
-  align-items: start;
-}
-.order-main,
-.order-payment,
-.order-side {
-  min-width: 0;
-}
-@media (min-width: 62em) {
-  .order-layout {
-    grid-template-columns: minmax(0, 1fr) 320px;
-  }
-  .order-side {
-    position: sticky;
-    top: var(--mantine-spacing-lg);
-  }
+:root {
+  --studio-page: #f3f8fc;
+  --studio-surface: #fff;
+  --studio-ink: #243442;
+  --studio-body: #405466;
+  --studio-muted: #647687;
+  --studio-line: #dae6ef;
+  --studio-brand: #246be8;
+  --studio-brand-ink: #1b55bd;
+  --studio-tint: #eaf1ff;
+  --studio-green: #187654;
 }
 
-/* Team: AT and order settings | card and billing | order summary. */
-@media (min-width: 48em) {
-  .studio-container:has(.order-layout--team) {
-    max-width: 1440px;
-  }
-  .order-layout--team {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: var(--mantine-spacing-md);
-  }
-  .order-layout--team .order-side {
-    grid-column: 1 / -1;
-    position: static;
-  }
-  .order-layout--team .mantine-Stepper-stepDescription {
-    display: none;
-  }
-  .order-layout--team .mantine-Stepper-stepBody {
-    margin-inline-start: 6px;
-  }
-  .order-layout--team .mantine-Stepper-stepIcon {
-    width: 28px;
-    height: 28px;
-    min-width: 28px;
-    font-size: 12px;
-  }
-  .order-layout--team .mantine-Stepper-stepLabel {
-    font-size: 12px;
-  }
-  .order-layout--team .mantine-Stepper-separator {
-    margin-inline: 6px;
-  }
-}
-@media (min-width: 75em) {
-  .order-layout--team {
-    grid-template-columns: minmax(350px, 1fr) minmax(390px, 1.15fr) 260px;
-  }
-  .order-layout--team .order-side {
-    grid-column: auto;
-    position: sticky;
-    top: var(--mantine-spacing-lg);
-  }
+:root[data-mantine-color-scheme="dark"] {
+  --studio-page: #101922;
+  --studio-surface: #182330;
+  --studio-ink: #e3edf6;
+  --studio-body: #c0d0df;
+  --studio-muted: #9cb0c2;
+  --studio-line: #354657;
+  --studio-brand: #81aeff;
+  --studio-brand-ink: #a8c7ff;
+  --studio-tint: #20334f;
+  --studio-green: #8cdbbb;
 }
 
-@media (max-width: 36em) {
-  .mantine-Stepper-stepDescription {
-    display: none;
-  }
-  .mantine-Stepper-separator {
-    margin-inline: 4px;
-  }
+body { margin: 0; background: var(--studio-page); color: var(--studio-ink); }
+.studio-app { min-height: 100dvh; display: flex; flex-direction: column; }
+.studio-width { width: min(1120px, calc(100% - 64px)); margin-inline: auto; }
+.studio-main { flex: 1; min-width: 0; padding-bottom: 56px; }
+.studio-header { position: sticky; z-index: 20; top: 0; background: var(--studio-surface); border-bottom: 1px solid var(--studio-line); }
+.header-inner, .header-nav, .header-tools, .studio-brand, .logout-button, .footer-inner, .studio-footer a { display: flex; align-items: center; }
+.header-inner { height: 63px; gap: 40px; }
+.studio-brand, .header-nav button, .logout-button {
+  color: inherit; background: transparent; border: 0; font: inherit; cursor: pointer;
 }
+.studio-brand { flex: none; padding: 0; gap: 10px; font-size: 20px; font-weight: 650; letter-spacing: -.7px; }
+.brand-mark {
+  width: 34px; height: 34px; display: grid; place-items: center; color: #fff; background: #246be8;
+  border-radius: 11px; transform: rotate(-5deg);
+}
+.brand-mark svg { transform: rotate(5deg); }
+.header-nav { align-self: stretch; align-items: stretch; gap: 12px; }
+.header-nav button, .header-nav a {
+  display: inline-flex; align-items: center; justify-content: center; position: relative;
+  padding-inline: 14px; color: var(--studio-body); font-size: 14px; font-weight: 550; text-decoration: none;
+}
+.header-nav > :is(:hover, [aria-current="page"]), .studio-footer a:hover { color: var(--studio-brand-ink); }
+.header-nav [aria-current="page"]::after {
+  content: ""; position: absolute; bottom: 0; width: 16px; height: 3px; border-radius: 2px; background: var(--studio-brand);
+}
+.header-tools { gap: 12px; margin-left: auto; }
+.header-tools .theme-toggle, .logout-button {
+  border: 1px solid var(--studio-line); color: var(--studio-body); background: var(--studio-surface); border-radius: 10px;
+}
+.header-tools .theme-toggle { width: 38px; height: 38px; }
+.logout-button { height: 38px; padding-inline: 12px; gap: 6px; font-size: 13px; font-weight: 550; }
+.header-tools .theme-toggle:hover, .logout-button:hover { border-color: var(--studio-brand); background: var(--studio-tint); }
+.studio-app :is(button, a, summary):focus-visible { outline: 2px solid var(--studio-brand); outline-offset: 3px; }
 
-/* 提链后：配置 | 协议支付 | 摘要 三栏并列，避免往下滚动。
-   中间栏只在订单已生成、协议面板出现时存在。 */
-@media (min-width: 62em) {
-  .order-layout--split {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 300px;
-  }
-  .studio-container:has(.order-layout--split) {
-    max-width: 1560px;
-  }
+.studio-hero { padding: 48px 0 32px; }
+.studio-hero h1 { margin: 0; font-size: 36px; font-weight: 650; line-height: 1.35; letter-spacing: -1.3px; }
+.studio-hero p { margin: 14px 0 0; color: var(--studio-body); font-size: 15px; line-height: 1.8; }
+.hero-features { display: flex; flex-wrap: wrap; gap: 10px 24px; padding: 0; margin: 18px 0 0; list-style: none; }
+.hero-features li { display: inline-flex; align-items: center; gap: 7px; color: var(--studio-body); font-size: 13px; line-height: 22px; }
+.hero-features svg { width: 18px; height: 18px; color: var(--studio-brand); stroke-width: 1.7; }
+.studio-notice {
+  display: flex; align-items: center; gap: 18px; min-height: 48px; margin-bottom: 24px; padding: 10px 18px;
+  border: 1px solid var(--studio-line); border-radius: 12px; background: var(--studio-tint);
 }
-/* 中等宽度放不下三栏时，中间那栏换到下一行左侧，摘要仍靠右 */
-@media (min-width: 62em) and (max-width: 87.5em) {
-  .order-layout--split {
-    grid-template-columns: minmax(0, 1fr) 300px;
-  }
-  .order-layout--split .order-payment {
-    grid-column: 1 / 2;
-    grid-row: 2;
-  }
-  .order-layout--split .order-side {
-    grid-column: 2 / 3;
-    grid-row: 1 / span 2;
-  }
+.studio-notice span { display: inline-flex; align-items: center; gap: 8px; flex: none; color: var(--studio-brand-ink); font-size: 13px; font-weight: 600; }
+.studio-notice p { margin: 0; color: var(--studio-body); font-size: 13px; line-height: 1.65; }
+
+.workspace-tabs .workspace-list {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px;
+}
+.workspace-list::before { display: none; }
+.workspace-tabs .workspace-tab {
+  height: 66px; min-width: 0; margin: 0; padding: 12px 16px; color: var(--studio-ink);
+  background: var(--studio-surface); border: 1px solid var(--studio-line); border-radius: 15px;
+  transition: border-color .16s, background .16s;
+}
+.workspace-tabs .workspace-tab:hover { border-color: var(--studio-brand); }
+.workspace-tabs .workspace-tab[data-active] { border-color: var(--studio-brand); color: var(--studio-brand-ink); background: var(--studio-tint); }
+.workspace-tab-label { width: 100%; display: flex; align-items: center; gap: 10px; }
+.workspace-tab-label strong { font-size: 17px; font-weight: 600; }
+.workspace-icon { width: 25px; height: 25px; color: var(--studio-ink); flex: none; stroke-width: 1.7; }
+.history-icon { color: #bd704d; }
+.workspace-arrow, .workspace-note { margin-left: auto; color: var(--studio-muted); }
+.workspace-note { font-size: 11px; font-weight: 600; }
+.workspace-tab[data-active] .workspace-note { color: var(--studio-green); }
+
+.order-layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 32px; align-items: start; }
+.order-main, .order-payment, .order-side { min-width: 0; }
+.order-side { position: sticky; top: 88px; }
+.studio-app .order-main, .workspace-panel {
+  padding: 32px; border: 1px solid var(--studio-line); border-radius: 20px; background: var(--studio-surface); color: var(--studio-ink);
+}
+.studio-app .mantine-Paper-root { --mantine-color-default-border: var(--studio-line); --mantine-color-body: var(--studio-surface); }
+.studio-app .mantine-InputWrapper-label { color: var(--studio-ink); font-weight: 600; }
+.studio-app .mantine-InputWrapper-description { color: var(--studio-muted); line-height: 1.6; }
+.studio-app .mantine-Input-input {
+  --input-bd: var(--studio-line); --input-bg: var(--studio-surface); --input-color: var(--studio-ink); --input-radius: 12px;
+}
+.studio-app .mantine-Input-input:not(textarea) { min-height: 44px; }
+.studio-app .mantine-Input-input:focus-within { border-color: var(--studio-brand); }
+.studio-app .mantine-InputWrapper-description + .mantine-Input-wrapper { margin-top: 7px; }
+.studio-app .mantine-SegmentedControl-label { white-space: normal; overflow-wrap: anywhere; }
+.studio-app .mantine-Button-root { border-radius: 10px; }
+.workspace-panel > h2, .payment-stage-title { margin: 0 0 20px; font-size: 18px; font-weight: 600; }
+.workspace-panel { min-width: 0; }
+.order-layout--split .order-payment { grid-column: 1; grid-row: 2; }
+.order-layout--split .order-side { grid-column: 2; grid-row: 1 / span 2; }
+/* When checkout has no separate setup content, the payment panel occupies the first row. */
+.order-main:empty { display: none; }
+.order-main:empty + .order-payment { grid-row: 1; }
+
+.studio-help {
+  display: grid; grid-template-columns: 1fr 2fr; gap: 48px; margin-top: 48px; padding-top: 32px;
+  border-top: 1px solid var(--studio-line); scroll-margin-top: 84px;
+}
+.studio-help h2 { margin: 0; font-size: 18px; font-weight: 600; }
+.help-items details { border-bottom: 1px solid var(--studio-line); }
+.help-items summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 0; list-style: none; color: var(--studio-body); font-size: 14px; cursor: pointer; }
+.help-items details:first-child summary { padding-top: 0; }
+.help-items summary::-webkit-details-marker { display: none; }
+.help-items summary::after { content: "+"; font-size: 18px; line-height: 1; color: var(--studio-muted); }
+.help-items details[open] summary::after { content: "−"; }
+.help-items details p { margin: 0 0 18px; font-size: 13px; line-height: 1.8; color: var(--studio-muted); }
+.studio-footer { border-top: 1px solid var(--studio-line); background: var(--studio-surface); }
+.footer-inner { justify-content: space-between; min-height: 72px; color: var(--studio-muted); font-size: 12px; }
+.studio-footer a { gap: 6px; color: inherit; text-decoration: none; }
+
+@media (max-width: 1040px) {
+  .order-layout { grid-template-columns: minmax(0, 1fr) minmax(265px, 32%); gap: 24px; }
+  .studio-app .order-main { padding: 24px; }
+}
+@media (max-width: 760px) {
+  .studio-width { width: calc(100% - 40px); }
+  .header-inner { flex-wrap: wrap; gap: 0; height: auto; padding-top: 10px; }
+  .studio-brand { font-size: 17px; }
+  .brand-mark { width: 30px; height: 30px; border-radius: 9px; }
+  .header-nav { order: 1; flex-basis: 100%; gap: 4px; margin-top: 6px; }
+  .header-nav a, .header-nav button { min-height: 40px; padding-inline: 10px; font-size: 13px; }
+  .header-tools { gap: 8px; }
+  .header-tools .theme-toggle, .logout-button { height: 34px; }
+  .header-tools .theme-toggle { width: 34px; }
+  .studio-hero { padding: 32px 0 24px; }
+  .studio-hero h1 { font-size: 28px; letter-spacing: -.8px; }
+  .studio-hero p { font-size: 14px; margin-top: 12px; }
+  .hero-features { gap: 8px 14px; margin-top: 16px; }
+  .hero-features li { gap: 4px; font-size: 12px; }
+  .hero-features svg { width: 15px; height: 15px; }
+  .studio-notice { gap: 12px; padding: 10px 12px; margin-bottom: 18px; }
+  .studio-notice p { font-size: 12px; }
+  .workspace-tabs .workspace-list { gap: 8px; margin-bottom: 20px; }
+  .workspace-tabs .workspace-tab { height: 82px; padding: 8px 4px; border-radius: 13px; }
+  .workspace-tab-label { flex-direction: column; justify-content: center; gap: 3px; }
+  .workspace-icon { width: 20px; height: 20px; }
+  .workspace-tab-label strong { font-size: 14px; }
+  .workspace-note, .workspace-arrow { margin-left: 0; font-size: 10px; }
+  .workspace-arrow { height: 12px; }
+  .order-layout { grid-template-columns: minmax(0, 1fr); gap: 20px; }
+  .order-side { position: static; }
+  .order-layout--split .order-payment, .order-layout--split .order-side { grid-row: auto; grid-column: auto; }
+  .studio-app .order-main, .workspace-panel { padding: 24px 20px; }
+  .studio-help { grid-template-columns: 1fr; gap: 22px; margin-top: 32px; padding-top: 24px; scroll-margin-top: 110px; }
+  .studio-main { padding-bottom: 36px; }
 }
