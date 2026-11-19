@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -232,3 +235,56 @@ def test_ph_exit_with_us_tax_free_billing(monkeypatch, tmp_path):
     assert proxy_exit_region(request.checkout_proxy) == "PH"
     vault.drop(body["id"])
     store.clear()
+
+
+@pytest.mark.parametrize("stage", ["checkout", "pay"])
+@pytest.mark.parametrize("reissued", [False, True])
+def test_failure_reports_session_state_without_credentials(monkeypatch, stage, reissued):
+    from gss_contracts.errors import DomainError, ErrorCode
+
+    monkeypatch.setenv("GSS_USE_FAKE", "1")
+    _fake_reauth(monkeypatch)
+    store.clear()
+    client = TestClient(create_app())
+    pipeline = build_pipeline()
+    monkeypatch.setattr(orders_router, "build_pipeline", lambda: pipeline)
+    order = {"plan": "plus", "billing_country": "PH", "session": _session("US" if reissued else "PH")}
+    order_id = None
+
+    token, cookie = "fixture-access-value", "fixture-cookie-value"
+    diagnostic = f"upstream: {{'accessToken': '{token}'}}; __Secure-next-auth.session-token.0={cookie}"
+    if reissued:
+        diagnostic += " opaque-fixture-credential"
+    code = ErrorCode.CHECKOUT_UPSTREAM_ERROR if stage == "checkout" else ErrorCode.PAYMENT_DECLINED
+    monkeypatch.setattr(pipeline, "create_checkout" if stage == "checkout" else "pay",
+                        AsyncMock(side_effect=DomainError(code, diagnostic)))
+    notify, log = AsyncMock(), Mock()
+    monkeypatch.setattr(orders_router, "notify_order_update", notify)
+    monkeypatch.setattr(orders_router.logger, "info", log)
+
+    try:
+        response = client.post("/api/orders", json=order)
+        if stage == "pay":
+            assert response.status_code == 201
+            order_id = response.json()["id"]
+            response = client.post(f"/api/orders/{order_id}/pay", json={"payment_method_token": "pm_fake"})
+        else:
+            order_id, = store.orders
+
+        assert response.status_code == 400
+        error = response.json()["detail"]
+        assert error["code"] == code.value
+        assert error["detail"] == ({"session_reissued_for_country": True} if reissued else None)
+        view = store.view(order_id)
+        assert view.last_error == error["message"]
+        public_order = client.get(f"/api/orders/{order_id}")
+        assert public_order.status_code == 200
+        if stage == "pay":
+            assert notify.await_args.args[2] == {"error": view.last_error}
+        for channel in (response.text, public_order.text, str(log.call_args_list), str(notify.await_args_list)):
+            for secret in (token, cookie, "opaque-fixture-credential", "new-access-token", "core-session-token"):
+                assert secret not in channel
+    finally:
+        if order_id:
+            vault.drop(order_id)
+        store.clear()

@@ -198,7 +198,7 @@ def _set_payment_status(
         view.tax_delta = str(tax_delta)
     if plan_type:
         view.plan_type = plan_type
-    view.status_summary = summary or _default_status_summary(status, view.delivery_status)
+    view.status_summary = redact_sensitive(summary) if summary else _default_status_summary(status, view.delivery_status)
     order = store.get_order(order_id)
     if order is not None:
         view.receipt = _receipt_for(order, view)
@@ -305,18 +305,24 @@ def _to_out(order: Order) -> OrderOut:
     )
 
 
-def _error(status_code: int, code: ErrorCode, message: str) -> HTTPException:
+def _error(status_code: int, code: ErrorCode, message: str, *, session_reissued: bool = False) -> HTTPException:
     return HTTPException(
         status_code=status_code,
-        detail=ErrorOut(code=str(code), message=message).model_dump(),
+        detail=ErrorOut(
+            code=str(code),
+            message=redact_sensitive(message),
+            detail={"session_reissued_for_country": True} if session_reissued else None,
+        ).model_dump(),
     )
 
 
-def _from_domain(exc: DomainError) -> HTTPException:
+def _from_domain(exc: DomainError, *, session_reissued: bool = False) -> HTTPException:
     status_code = status.HTTP_400_BAD_REQUEST
     if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED}:
         status_code = status.HTTP_401_UNAUTHORIZED
-    return _error(status_code, exc.code, exc.message)
+    # 只报告已发生的重签发；不代表凭证已持久化，或仍可恢复。
+    message = "会话已重新签发，本次操作未完成。" if session_reissued else exc.message
+    return _error(status_code, exc.code, message, session_reissued=session_reissued)
 
 
 _PROXY_ERR_HINTS = (
@@ -660,15 +666,16 @@ async def create_order(
         )
     except DomainError as exc:
         store.update_status(order.id, OrderStatus.REJECTED)
-        store.view(order.id).last_error = exc.message
+        error = _from_domain(exc, session_reissued=session_reissued)
+        store.view(order.id).last_error = error.detail["message"]
         logger.info(
-            "checkout_failed id=%s plan=%s country=%s error=%s",
+            "checkout_failed id=%s plan=%s country=%s code=%s",
             order.id,
             plan,
             country,
-            exc.message,
+            exc.code.value,
         )
-        raise _from_domain(exc)
+        raise error
 
     # 建单最终生效的出口：重试可能换过 SID，支付必须复用
     _s = vault.get(order.id)
@@ -797,7 +804,7 @@ async def quote_team(order_id: str, payload: TeamQuoteRequest) -> OrderOut:
             logger.info("team_quote_ok id=%s amount=%s currency=%s elapsed=%.2f",
                         order_id, view.amount, view.currency, time.monotonic() - started)
         except DomainError as exc:
-            view.quote_error = exc.message
+            view.quote_error = redact_sensitive(exc.message)
             logger.warning("team_quote_failed id=%s code=%s elapsed=%.2f error=%s", order_id,
                            exc.code.value, time.monotonic() - started, redact_sensitive(exc.message)[:160])
         except Exception as exc:
@@ -845,7 +852,7 @@ async def prepare_team(order_id: str, payload: TeamPrepareRequest) -> dict:
                             order_id, store.view(order_id).amount, store.view(order_id).currency,
                             time.monotonic() - started)
             except DomainError as exc:
-                store.view(order_id).last_error = exc.message
+                store.view(order_id).last_error = redact_sensitive(exc.message)
                 logger.warning("team_prepare_failed id=%s code=%s elapsed=%.2f confirm_submitted=False error=%s",
                                order_id, exc.code.value, time.monotonic() - started,
                                redact_sensitive(exc.message)[:160])
@@ -957,7 +964,7 @@ async def poll_team(order_id: str) -> OrderOut:
             await _mark_delivered(order_id)
         elif result.status.value == "declined":
             store.update_status(order_id, OrderStatus.FAILED)
-            view.last_error = result.message
+            view.last_error = redact_sensitive(result.message) if result.message else None
             view.next_action = None
             await notify_order_update(order_id, OrderStatus.FAILED)
         elif result.status.value == "requires_action":
@@ -965,7 +972,7 @@ async def poll_team(order_id: str) -> OrderOut:
                 store.update_status(order_id, OrderStatus.PAYING)
             store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
             view.next_action = result.next_action
-            view.last_error = result.message
+            view.last_error = redact_sensitive(result.message) if result.message else None
         # Pending poll responses must not erase an earlier challenge/client_secret.
         return _to_out(order)
 
@@ -1081,22 +1088,27 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         uncertain = order.plan is Plan.TEAM and exc.code is ErrorCode.PAYMENT_UNKNOWN_STATE
         failed_status = OrderStatus.UNKNOWN if uncertain else OrderStatus.FAILED
         store.update_status(order_id, failed_status)
-        _set_payment_status(order_id, "failed", summary=f"支付失败：{redact_sensitive(exc.message)[:120]}")
-        view.last_error = exc.message
+        error = _from_domain(exc, session_reissued=view.session_reissued_for_country)
+        message = error.detail["message"]
+        _set_payment_status(order_id, "failed", summary=f"支付失败：{message[:120]}")
+        view.last_error = message
         logger.info(
-            "pay_failed id=%s country=%s error=%s",
+            "pay_failed id=%s country=%s code=%s",
             order_id,
             order.billing_country,
-            exc.message,
+            exc.code.value,
         )
         # SSE 通知：支付失败
-        await notify_order_update(order_id, failed_status, {"error": exc.message})
-        raise _from_domain(exc)
+        await notify_order_update(order_id, failed_status, {"error": message})
+        raise error
 
     new_status = apply_payment_result(OrderStatus.PAYING, payment.status)
     store.update_status(order_id, new_status)
     view.next_action = payment.next_action
-    view.last_error = None if payment.status.value == "succeeded" else payment.message
+    view.last_error = (
+        redact_sensitive(payment.message)
+        if payment.message and payment.status is not PaymentStatus.SUCCEEDED else None
+    )
     if payment.status is PaymentStatus.SUCCEEDED:
         _set_payment_status(
             order_id,
@@ -1111,7 +1123,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     elif payment.status in {PaymentStatus.PROCESSING, PaymentStatus.REQUIRES_ACTION}:
         _set_payment_status(order_id, "processing", summary="支付处理中，请勿重复提交")
     elif payment.status in {PaymentStatus.DECLINED, PaymentStatus.ERROR}:
-        _set_payment_status(order_id, "failed", summary=payment.message or "支付失败")
+        _set_payment_status(order_id, "failed", summary=view.last_error or "支付失败")
     logger.info(
         "pay_finished id=%s country=%s payment=%s order=%s error=%s",
         order_id,
@@ -1216,7 +1228,7 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
             raise _from_domain(exc)
         # 未扣款订单：保持当前状态返回，由前端稍后重查。
         logger.warning("verify_failed id=%s error=%s", order_id, redact_sensitive(exc.message)[:200])
-        view.last_error = f"订阅状态查询失败，稍后会自动重试：{exc.message[:120]}"
+        view.last_error = f"订阅状态查询失败，稍后会自动重试：{redact_sensitive(exc.message)[:120]}"
         return _to_out(store.get_order(order_id))  # type: ignore[arg-type]
     view.subscription = info
     view.plan_type = info.raw_kind or view.plan_type
@@ -1315,7 +1327,7 @@ def _protocol_out(order_id: str, *, state: str, message: Optional[str] = None, *
     summary = view.status_summary or _default_status_summary(view.payment_status, view.delivery_status)
     return ProtocolPayOut(
         state=state,
-        message=message if message is not None else summary,
+        message=redact_sensitive(message) if message is not None else summary,
         payment_status=view.payment_status,
         delivery_status=view.delivery_status,
         payment_intent_id=view.payment_intent_id,
@@ -1470,10 +1482,11 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     try:
         outcome = await asyncio.to_thread(_run)
     except DomainError as exc:
-        raise _from_domain(exc)
+        raise _from_domain(exc, session_reissued=view.session_reissued_for_country)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("protocol_pay_failed id=%s error=%s", order_id, str(exc)[:200])
-        raise _error(status.HTTP_502_BAD_GATEWAY, ErrorCode.CHECKOUT_UPSTREAM_ERROR, str(exc)[:200])
+        logger.warning("protocol_pay_failed id=%s type=%s", order_id, type(exc).__name__)
+        raise _error(status.HTTP_502_BAD_GATEWAY, ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                     "支付请求异常，请先核对订单状态。", session_reissued=view.session_reissued_for_country)
 
     logger.info(
         "protocol_pay id=%s state=%s decline=%s code=%s intent=%s",
