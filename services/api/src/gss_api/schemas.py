@@ -166,3 +166,33 @@ class ErrorOut(BaseModel):
     code: str
     message: str
     detail: Optional[Dict[str, Any]] = None
+
+
+class QuickPayRequest(AddressedRequest):
+    """One-call quick-pay input. The card is request-memory only."""
+
+    plan: str
+    billing_country: Optional[str] = None
+    exit_country: Optional[str] = None
+    session: str = Field(repr=False)
+    card: CardIn = Field(repr=False)
+    billing: BillingIn
+    mode: ModeIn = Field(default_factory=ModeIn)
+    promo_code: str = ""
+    promo_campaign_id: str = ""
+    workspace_name: str = ""
+    seat_quantity: Optional[int] = None
+    price_interval: str = "month"
+    debug_checkout_only: bool = False
+
+
+class QuickPayJobOut(BaseModel):
+    job_id: str
+    status: str
+    stage: str
+    order_id: Optional[str] = None
+    purchase_attempt_id: Optional[str] = None
+    amount: Optional[str] = None
+    currency: Optional[str] = None
+    failure_code: Optional[str] = None
+    message: Optional[str] = None

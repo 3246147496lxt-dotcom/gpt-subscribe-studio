@@ -10,7 +10,7 @@ import random
 import re
 import time
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel, Field
@@ -466,6 +466,14 @@ def _env_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _mark(progress: Callable[[str], None] | None, stage: str) -> None:
+    if progress is not None:
+        try:
+            progress(stage)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _safe_exc_summary(exc: BaseException, limit: int = 240) -> str:
     try:
         return redact_sensitive(str(exc))[:limit]
@@ -549,7 +557,8 @@ async def create_order(
         _creating_keys.discard(idempotency_key)
 
 
-async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None) -> OrderOut:
+async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None,
+                        progress: Callable[[str], None] | None = None) -> OrderOut:
     # Preserve signatures for callers that did not previously send a billing claim.
     non_team = payload.plan != str(Plan.TEAM)
     if non_team and any(field in payload.model_fields_set and not (getattr(payload, field) or "").strip()
@@ -737,6 +746,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     browser_context: BrowserContext | None = None
     access_token = bundle.access_token
     stage_started = time.perf_counter()
+    _mark(progress, "reissuing" if cross_country else "session_refresh")
     if bundle.session_token and (cross_country or not access_token):
         try:
             await _guard_refresh_egress(exit_proxy, exit_country)
@@ -786,6 +796,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         finally:
             client.close()
             logger.info("stage_timing stage=reissue duration_ms=%.1f", (time.perf_counter() - stage_started) * 1000)
+            _mark(progress, "reissued" if cross_country else "session_refreshed")
     else:
         if not access_token:
             raise _error(401, ErrorCode.INVALID_SESSION, "JSON 中没有 accessToken")
@@ -834,6 +845,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                 item.purchase_attempt_id = order.purchase_attempt_id
                 vault.put(order.id, item)
         logger.info("stage_timing stage=browser_decode duration_ms=%.1f", (time.perf_counter() - decode_started) * 1000)
+        _mark(progress, "browser_decoded" if browser_context is not None else "browser_decode_skipped")
     store.add_job(Job(order_id=order.id, stage="checkout"))
     item.profile = profile_from_session_ua(item.user_agent) or _pick_profile(item.device_id)
     if verified is not None:
@@ -845,6 +857,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     if pipeline is None:
         pipeline = build_pipeline()
     checkout_started = time.perf_counter()
+    _mark(progress, "creating_checkout")
     try:
         if verified is not None:
             require_verified_billing(order_billing=verified, verification_id=verified.verification_id,
@@ -888,6 +901,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         raise error
 
     logger.info("stage_timing stage=create_checkout duration_ms=%.1f", (time.perf_counter() - checkout_started) * 1000)
+    _mark(progress, "checkout_created")
     if verified is not None:
         # Adapters must return the exact billing they used. A missing/mismatched
         # response or revoked payer profile is never turned into an accepted order.

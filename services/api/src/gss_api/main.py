@@ -16,7 +16,7 @@ from gss_core.config import load_settings, missing_upstreams, use_fake_adapters
 from gss_core.proxies import GatewayStore, configured_proxy
 
 from .store import store
-from .routers import events, orders, promo, proxies, saved_cards, protocol_cards
+from .routers import events, orders, promo, proxies, quick_pay, saved_cards, protocol_cards
 
 __version__ = "0.1.0"
 
@@ -82,6 +82,7 @@ def create_app() -> FastAPI:
         return await request_validation_exception_handler(request, exc)
 
     app.include_router(orders.router)
+    app.include_router(quick_pay.router)
     app.include_router(saved_cards.router)
     app.include_router(protocol_cards.router)
     app.include_router(promo.router)
