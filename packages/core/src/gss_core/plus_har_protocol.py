@@ -1343,18 +1343,25 @@ class PlusHarProtocol:
                 or self.confirmed.get("status") in {"complete", "completed", "processing", "succeeded", "requires_action"}):
             self.raw["intent"] = observed
             self.read_only = True
-            return self._settle()
+            return self._timed_settle()
         self._sentinel("checkout_session_approval")
         self._require_credentials()
         self._intent_confirm()
         self._flush(PHASE_CONFIRM)
 
-        out = self._settle()
+        out = self._timed_settle()
         logger.info("plus_har_result state=%s intent=%s decline=%s",
                     out.state, out.intent_status, out.decline_code)
         if self.mode != "off" and self.telemetry is not None:
             self.telemetry.beat(2)
         return out
+
+    def _timed_settle(self) -> PaymentOutcome:
+        started = time.monotonic()
+        try:
+            return self._settle()
+        finally:
+            logger.info("plus_har_settle_elapsed elapsed=%.2f", time.monotonic() - started)
 
     def _quote_guard(self) -> Optional[PaymentOutcome]:
         """有明确订单金额时，任何报价变化都需先确认，不以变化后的金额作为原收据依据。
