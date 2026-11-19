@@ -26,6 +26,9 @@ class BrowserContext:
     expires_at: float | None = None
 
     def headers(self) -> dict[str, str]:
+        # Only browser environment headers. Never Cookie/Authorization/Host or
+        # HTTP/2 pseudo-headers: curl_cffi owns those and duplicate values break
+        # the request (or can overwrite the freshly reissued Authorization).
         out: dict[str, str] = {}
         if self.user_agent:
             out["User-Agent"] = self.user_agent
@@ -35,7 +38,7 @@ class BrowserContext:
             out["sec-ch-ua-platform"] = f'"{self.sec_ch_ua_platform}"'
         if self.locale:
             out["Accept-Language"] = f"{self.locale},{self.locale.split('-')[0]};q=0.9,en;q=0.8"
-        return out
+        return {k: v for k, v in out.items() if not k.startswith(":")}
 
     def merged_cookies(self, base: Dict[str, str] | None = None) -> Dict[str, str]:
         result = dict(base or {})

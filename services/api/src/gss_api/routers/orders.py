@@ -466,6 +466,13 @@ def _env_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _safe_exc_summary(exc: BaseException, limit: int = 240) -> str:
+    try:
+        return redact_sensitive(str(exc))[:limit]
+    except Exception:  # noqa: BLE001
+        return type(exc).__name__
+
+
 def _release_create_failure(claim_dir, order_id: str, idempotency_key: str | None) -> None:
     if idempotency_key:
         store.forget_idempotency(idempotency_key)
@@ -495,9 +502,19 @@ async def _create_checkout_once(pipeline, *, proxy: str, **kwargs):
     # Do not resend it, even on the same connection.
     try:
         return await pipeline.create_checkout(proxy=proxy, pin_proxy=True, **kwargs)
-    except DomainError:
+    except DomainError as exc:
+        logger.warning(
+            "create_checkout_domain_error type=%s code=%s detail=%s",
+            type(exc).__name__, str(exc.code), _safe_exc_summary(exc),
+        )
         raise
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        logger.warning(
+            "create_checkout_exception type=%s status=%s detail=%s",
+            type(exc).__name__, status_code if status_code is not None else "-",
+            _safe_exc_summary(exc),
+        )
         raise DomainError(
             ErrorCode.CHECKOUT_UPSTREAM_ERROR, "建单请求未获确认，已停止且不自动重试。",
         ) from None
@@ -719,6 +736,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     route_plan = route_plan_from_env()
     browser_context: BrowserContext | None = None
     access_token = bundle.access_token
+    stage_started = time.perf_counter()
     if bundle.session_token and (cross_country or not access_token):
         try:
             await _guard_refresh_egress(exit_proxy, exit_country)
@@ -767,6 +785,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                 vault.put(order.id, item)
         finally:
             client.close()
+            logger.info("stage_timing stage=reissue duration_ms=%.1f", (time.perf_counter() - stage_started) * 1000)
     else:
         if not access_token:
             raise _error(401, ErrorCode.INVALID_SESSION, "JSON 中没有 accessToken")
@@ -775,6 +794,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     view = store.view(order.id)
     view.route_profile = str(route_plan.profile)
     if route_plan.use_browser_context:
+        decode_started = time.perf_counter()
         if not browser_decode_enabled():
             if not browser_decode_fallback_a():
                 store.update_status(order.id, OrderStatus.REJECTED)
@@ -813,6 +833,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                 item.browser_context = browser_context.vault_dict()
                 item.purchase_attempt_id = order.purchase_attempt_id
                 vault.put(order.id, item)
+        logger.info("stage_timing stage=browser_decode duration_ms=%.1f", (time.perf_counter() - decode_started) * 1000)
     store.add_job(Job(order_id=order.id, stage="checkout"))
     item.profile = profile_from_session_ua(item.user_agent) or _pick_profile(item.device_id)
     if verified is not None:
@@ -823,6 +844,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
 
     if pipeline is None:
         pipeline = build_pipeline()
+    checkout_started = time.perf_counter()
     try:
         if verified is not None:
             require_verified_billing(order_billing=verified, verification_id=verified.verification_id,
@@ -849,6 +871,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         store.update_status(order.id, OrderStatus.REJECTED)
         raise
     except DomainError as exc:
+        logger.info("stage_timing stage=create_checkout duration_ms=%.1f", (time.perf_counter() - checkout_started) * 1000)
         store.update_status(order.id, OrderStatus.REJECTED)
         store.view(order.id).failure_code = str(
             classify_upstream_failure(exc=exc, stage="checkout").code
@@ -864,6 +887,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         )
         raise error
 
+    logger.info("stage_timing stage=create_checkout duration_ms=%.1f", (time.perf_counter() - checkout_started) * 1000)
     if verified is not None:
         # Adapters must return the exact billing they used. A missing/mismatched
         # response or revoked payer profile is never turned into an accepted order.

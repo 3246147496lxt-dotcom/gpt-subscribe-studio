@@ -85,14 +85,18 @@ class PlaywrightBrowserDecoder:
                 viewport={"width": 1440, "height": 900},
             )
             page = await context.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            await page.goto(url, wait_until="commit", timeout=timeout)
             try:
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(800)
             except Exception:  # noqa: BLE001
                 pass
             data = await page.evaluate(_brands_js())
             ua = str(data.get("ua") or "")
             sec = str(data.get("sec_ch_ua") or "")
+            if "HeadlessChrome" in ua:
+                ua = ua.replace("HeadlessChrome", "Chrome")
+            if "HeadlessChrome" in sec:
+                sec = sec.replace("HeadlessChrome", "Google Chrome")
             # Playwright's unbranded Chromium reports only Chromium in the
             # client hints while the UA says Chrome/<major>. Align the pair.
             match = re.search(r"Chrome/(\d+)", ua)
