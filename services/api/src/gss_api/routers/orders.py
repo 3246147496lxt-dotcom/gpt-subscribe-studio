@@ -329,7 +329,8 @@ def _is_proxy_error(exc: Exception) -> bool:
     return any(k in str(exc) for k in _PROXY_ERR_HINTS)
 
 
-async def _create_checkout_with_retry(pipeline, *, proxy: str, pin_proxy: bool = False, **kwargs):
+async def _create_checkout_with_retry(pipeline, *, proxy: str, pin_proxy: bool = False,
+                                     hard_pin: bool = False, **kwargs):
     """出口代理断连时换 SID 重试建单。
 
     返回 (checkout, 实际使用的 proxy)。调用方必须把返回的 proxy 存进 vault，
@@ -339,6 +340,18 @@ async def _create_checkout_with_retry(pipeline, *, proxy: str, pin_proxy: bool =
 
     current = proxy
     last: Exception | None = None
+    if hard_pin:
+        # 重签发已拿到新 Token：出口 SID 进入硬锁定，连接断开直接中止，
+        # 绝不换 SID，避免 IP 跳变触发 token_revoked。
+        try:
+            return await pipeline.create_checkout(proxy=current, **kwargs), current
+        except DomainError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise DomainError(
+                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                f"重签发后出口连接中断，已中止且不切换 SID：{redact_sensitive(str(exc))[:160]}",
+            ) from exc
     for attempt in range(3):
         try:
             checkout = await pipeline.create_checkout(proxy=current, **kwargs)
@@ -471,11 +484,32 @@ async def create_order(
         )
         # PH 住宅节点会偶发 TLS reset / CONNECT 404；换 SID 重试，
         # 避免一次代理抖动就把可用的 sessionToken 判死。
-        from gss_core.proxies import rotate_proxy_sid
+        # 但每次重签发前必须先做粘性/国家预检，未测通绝不消耗 Session。
+        from gss_core.proxies import preflight_proxy, rotate_proxy_sid
 
         last_exc: Exception | None = None
         client = None
         for attempt in range(3):
+            if not use_fake_adapters():
+                ok, reason = await asyncio.to_thread(
+                    preflight_proxy, exit_proxy or "", exit_country
+                )
+                logger.info(
+                    "proxy_preflight exit_country=%s attempt=%s ok=%s ip=%s reason=%s",
+                    exit_country, attempt + 1, ok,
+                    reason if ok else "-", "-" if ok else redact_sensitive(reason)[:160],
+                )
+                if not ok:
+                    if attempt == 2:
+                        raise _error(
+                            status.HTTP_401_UNAUTHORIZED,
+                            ErrorCode.INVALID_SESSION,
+                            f"PH 代理预检失败（{redact_sensitive(reason)[:120]}），未消耗 Session；请更换粘性 PH 节点后重试",
+                        )
+                    if exit_proxy:
+                        exit_proxy = rotate_proxy_sid(exit_proxy)
+                    await asyncio.sleep(1)
+                    continue
             try:
                 client = await asyncio.to_thread(
                     ChatGPTClient.reauthorize_for_country,
@@ -611,6 +645,7 @@ async def create_order(
             pipeline,
             proxy=exit_proxy or "",
             pin_proxy=True,
+            hard_pin=session_reissued,
             session_reissued=session_reissued,
             session=raw_session,
             plan=plan,

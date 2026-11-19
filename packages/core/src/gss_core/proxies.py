@@ -255,6 +255,66 @@ def exit_country_for(session_country: str = "", billing_country: str = "") -> st
     return ""
 
 
+def preflight_proxy(
+    proxy: str,
+    expected_country: str,
+    *,
+    probes: int = 2,
+    interval_s: float = 1.0,
+    timeout_s: float = 10.0,
+) -> tuple[bool, str]:
+    """Verify a proxy is sticky and exits in the expected country.
+
+    Two IP echoes one second apart must return the same IP, and the IP's
+    country must match ``expected_country``. This runs *before* any session
+    token is spent on reauthorization.
+    """
+    expected = normalize_region(expected_country)
+    if not proxy:
+        return False, "未配置代理"
+    if not _COUNTRY_CODE.match(expected):
+        return False, f"目标国家无效: {expected_country!r}"
+
+    import httpx
+    from urllib.parse import quote
+
+    ip_url = os.environ.get(
+        "GSS_PROXY_PREFLIGHT_IP_URL", "https://api.ipify.org?format=json"
+    )
+    country_url = os.environ.get(
+        "GSS_PROXY_PREFLIGHT_COUNTRY_URL", "https://api.country.is/{ip}"
+    )
+    seen: list[str] = []
+    try:
+        with httpx.Client(proxy=proxy, timeout=timeout_s, follow_redirects=True) as client:
+            for index in range(max(1, probes)):
+                if index:
+                    import time
+                    time.sleep(max(0.0, interval_s))
+                response = client.get(ip_url)
+                response.raise_for_status()
+                payload = response.json()
+                ip = str(payload.get("ip") if isinstance(payload, dict) else "").strip()
+                if not ip:
+                    return False, "IP 探测未返回 ip"
+                if seen and ip != seen[0]:
+                    return False, f"出口 IP 不粘: {seen[0]} -> {ip}"
+                seen.append(ip)
+                country_response = client.get(country_url.format(ip=quote(ip, safe="")))
+                country_response.raise_for_status()
+                country_payload = country_response.json()
+                country = str(
+                    country_payload.get("country")
+                    if isinstance(country_payload, dict)
+                    else country_payload
+                ).strip().upper()
+                if country != expected:
+                    return False, f"出口国家不匹配: {country or 'unknown'} != {expected}"
+        return True, seen[0] if seen else ""
+    except Exception as exc:  # noqa: BLE001
+        return False, f"预检请求失败: {type(exc).__name__}: {str(exc)[:120]}"
+
+
 def session_proxy(role: str, region: str) -> str | None:
     """本次开通专用出口：选定地区 + 随机 SID。"""
     base = configured_proxy(role)
@@ -316,6 +376,7 @@ __all__ = [
     "new_proxy_sid",
     "rewrite_proxy_exit",
     "rotate_proxy_sid",
+    "preflight_proxy",
     "session_proxy",
     "session_proxy_for",
     "checkout_proxy_for",
