@@ -14,6 +14,8 @@ from gss_contracts import (
 )
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.chatgpt import ChatGPTClient
+from gss_core.config import ORDER_HTTP_TIMEOUT_S
+from gss_core.session_token import parse_session
 from gss_core.proxies import configured_proxy
 
 _ACTIVE_PLANS = {
@@ -55,16 +57,14 @@ class AccountAdapterBase:
 
 @dataclass
 class UpstreamAccountAdapter(AccountAdapterBase):
-    timeout: int = 30
+    timeout: float = ORDER_HTTP_TIMEOUT_S
 
     async def subscription_status(self, session: str) -> SubscriptionInfo:
-        if not session:
+        if not session or not parse_session(session):
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法查询订阅")
         client = ChatGPTClient.from_raw_session(session, proxy=configured_proxy("checkout"))
         client.timeout = float(self.timeout)
         try:
-            # 付款后 accessToken 经常在订阅查询前过期；先刷新一次再读。
-            client.refresh_session()
             payload = client.subscription_payload()
         finally:
             client.close()
@@ -98,7 +98,7 @@ class UpstreamAccountAdapter(AccountAdapterBase):
         )
 
     async def promo_eligibility(self, session: str) -> PromoEligibility:
-        if not session:
+        if not session or not parse_session(session):
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法查询优惠资格")
         client = ChatGPTClient.from_raw_session(session, proxy=configured_proxy("checkout"))
         client.timeout = float(self.timeout)

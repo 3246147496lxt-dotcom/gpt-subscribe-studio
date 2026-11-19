@@ -9,10 +9,13 @@ import re
 import secrets
 import string
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import RLock
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
+
+from gss_core.config import ORDER_HTTP_TIMEOUT_S
 
 ROLES = ("checkout", "approve")
 # 供应商写法不一：-region-US / _country_us、-sid-abc / -session-abc。替换时保留原来的键名与大小写。
@@ -255,70 +258,82 @@ def exit_country_for(session_country: str = "", billing_country: str = "") -> st
     return ""
 
 
-def preflight_proxy(
+class ProxyPreflightError(Exception):
+    """A safe-to-publish preflight failure. Never attach a response body or proxy URL."""
+
+    def __init__(self, message: str, status_code: int = 503) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def verify_refresh_egress(
     proxy: str,
     expected_country: str,
     *,
     probes: int = 2,
     interval_s: float = 1.0,
     step_delay_s: float = 0.4,
-    timeout_s: float = 10.0,
-) -> tuple[bool, str]:
-    """Verify a proxy is sticky and exits in the expected country.
-
-    Two IP echoes one second apart must return the same IP, and the IP's
-    country must match ``expected_country``. This runs *before* any session
-    token is spent on reauthorization.
-    """
-    expected = normalize_region(expected_country)
-    if not proxy:
-        return False, "未配置代理"
-    if not _COUNTRY_CODE.match(expected):
-        return False, f"目标国家无效: {expected_country!r}"
-
+    timeout_s: float = ORDER_HTTP_TIMEOUT_S,
+) -> str:
+    """Check the one selected exit and anonymously HEAD the public site before sending credentials."""
     import httpx
-    from urllib.parse import quote
 
-    ip_url = os.environ.get(
-        "GSS_PROXY_PREFLIGHT_IP_URL", "https://api.ipify.org?format=json"
-    )
-    country_url = os.environ.get(
-        "GSS_PROXY_PREFLIGHT_COUNTRY_URL", "https://api.country.is/{ip}"
-    )
-    seen: list[str] = []
+    expected = normalize_region(expected_country)
+    if not proxy or not _COUNTRY_CODE.fullmatch(expected):
+        raise ProxyPreflightError("未配置有效的预检出口")
+    ip_url = os.environ.get("GSS_PROXY_PREFLIGHT_IP_URL", "https://api.ipify.org?format=json")
+    country_url = os.environ.get("GSS_PROXY_PREFLIGHT_COUNTRY_URL", "https://api.country.is/{ip}")
+
+    def check(client: httpx.Client, method: str, url: str) -> httpx.Response:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None:
+            raise ProxyPreflightError("预检地址必须是不含凭证的 HTTPS 地址")
+        # A separate, uncredentialed client; none of the probes may inherit cookies
+        # from an earlier echo service (including a misconfigured same-origin one).
+        client.cookies.clear()
+        response = client.request(method, url)
+        if response.status_code == 429:
+            raise ProxyPreflightError("上游限流，请稍后再试", 429)
+        if response.status_code == 403:
+            raise ProxyPreflightError("上游拒绝匿名预检，已停止", 403)
+        if not 200 <= response.status_code < 300:
+            raise ProxyPreflightError("预检未获得成功响应")
+        return response
+
+    first_ip = ""
     try:
-        with httpx.Client(proxy=proxy, timeout=timeout_s, follow_redirects=True) as client:
+        with httpx.Client(proxy=proxy, timeout=timeout_s, verify=True,
+                          follow_redirects=False, trust_env=False) as client:
             for index in range(max(1, probes)):
-                if index:
-                    import time
-                    time.sleep(max(0.0, interval_s))
-                response = client.get(ip_url)
-                response.raise_for_status()
-                payload = response.json()
-                ip = str(payload.get("ip") if isinstance(payload, dict) else "").strip()
-                if not ip:
-                    return False, "IP 探测未返回 ip"
-                if seen and ip != seen[0]:
-                    return False, f"出口 IP 不粘: {seen[0]} -> {ip}"
-                seen.append(ip)
-                # 供应商对连续 CONNECT 很敏感；IP 探测后稍等再查国家，
-                # 否则第二个请求常被网关直接回 404。
+                if index and interval_s > 0:
+                    time.sleep(interval_s)
+                payload = check(client, "GET", ip_url).json()
+                ip = str(ipaddress.ip_address(str(payload["ip"])))
+                if first_ip and first_ip != ip:
+                    raise ProxyPreflightError("预检期间出口 IP 发生变化")
+                first_ip = ip
                 if step_delay_s > 0:
-                    import time
                     time.sleep(step_delay_s)
-                country_response = client.get(country_url.format(ip=quote(ip, safe="")))
-                country_response.raise_for_status()
-                country_payload = country_response.json()
-                country = str(
-                    country_payload.get("country")
-                    if isinstance(country_payload, dict)
-                    else country_payload
-                ).strip().upper()
-                if country != expected:
-                    return False, f"出口国家不匹配: {country or 'unknown'} != {expected}"
-        return True, seen[0] if seen else ""
-    except Exception as exc:  # noqa: BLE001
-        return False, f"预检请求失败: {type(exc).__name__}: {str(exc)[:120]}"
+                data = check(client, "GET", country_url.format(ip=quote(ip, safe=""))).json()
+                country = data.get("country") if isinstance(data, dict) else data
+                if str(country).strip().upper() != expected:
+                    raise ProxyPreflightError("出口国家与订单不匹配")
+            check(client, "HEAD", "https://chatgpt.com/")
+            return first_ip
+    except ProxyPreflightError:
+        raise
+    except Exception:
+        # Includes TLS/connect timeouts and malformed echo responses. Do not log
+        # str(exc): transport exceptions may contain credentials or gateway URLs.
+        raise ProxyPreflightError("匿名连通性预检失败") from None
+
+
+def preflight_proxy(proxy: str, expected_country: str, **options) -> tuple[bool, str]:
+    """Compatibility wrapper for callers that only inspect success and a diagnostic."""
+    try:
+        return True, verify_refresh_egress(proxy, expected_country, **options)
+    except ProxyPreflightError as exc:
+        return False, str(exc)
 
 
 def session_proxy(role: str, region: str) -> str | None:
@@ -383,6 +398,8 @@ __all__ = [
     "rewrite_proxy_exit",
     "rotate_proxy_sid",
     "preflight_proxy",
+    "ProxyPreflightError",
+    "verify_refresh_egress",
     "session_proxy",
     "session_proxy_for",
     "checkout_proxy_for",

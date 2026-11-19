@@ -58,7 +58,6 @@ def create_app() -> FastAPI:
 
     # ── 出口代理连接失败 → 503（而不是裸 500）────────────────────
     # 住宅动态代理偶发 TLS 中断：BoringSSL SSL_connect: Connection closed abruptly。
-    # 这类错误对用户意味着「换个出口重试」，不是服务端 bug。
     try:
         from curl_cffi.requests.exceptions import RequestException as _CurlErr
     except Exception:  # noqa: BLE001
@@ -86,7 +85,7 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 status_code=503,
                 content={"detail": "出口代理连接 chatgpt.com 失败（住宅代理断连），"
-                                   "请重试；连续失败请更换代理 SID 或线路。"},
+                                   "请求结果未确认，请先核对订单状态，不要重复提交。"},
             )
         raise exc
 

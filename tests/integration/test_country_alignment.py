@@ -59,6 +59,7 @@ def _fake_reauth(monkeypatch):
             close=lambda: None,
         )
 
+    monkeypatch.setattr(orders_router, "_guard_refresh_egress", AsyncMock())
     monkeypatch.setattr(ChatGPTClient, "reauthorize_for_country", classmethod(fake))
     return calls
 

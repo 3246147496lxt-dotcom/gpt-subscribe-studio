@@ -28,7 +28,8 @@ from gss_core.chatgpt import (
     submission_state,
     _processor_from_checkout_url,
 )
-from gss_core.config import load_settings
+from gss_core.config import ORDER_HTTP_TIMEOUT_S, load_settings
+from gss_core.session_token import parse_session
 from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.proxies import (
     align_proxy_region,
@@ -73,7 +74,7 @@ def _approval_retryable(confirmed: Dict[str, Any]) -> bool:
 
 @dataclass
 class UpstreamPaymentAdapter(PaymentAdapterBase):
-    timeout: int = 120
+    timeout: float = ORDER_HTTP_TIMEOUT_S
 
     async def pay(self, req: PaymentRequest) -> PaymentResult:
         if not req.payment_method_token and not req.card_id:
@@ -81,7 +82,7 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                 ErrorCode.PAYMENT_DECLINED,
                 "缺少支付方式：需要浏览器端 payment_method_token",
             )
-        if not req.session:
+        if not req.session or not parse_session(req.session):
             raise DomainError(ErrorCode.INVALID_SESSION, "支付阶段缺少 session")
         checkout_id = req.checkout_session_id or ""
         if not checkout_id:
@@ -114,10 +115,6 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
             finally:
                 client.close()
         page_url = req.checkout_url if str(req.checkout_url or "").startswith(APP_BASE) else f"{APP_BASE}/"
-        # 重签发过的 session 已经绑定目标国家出口；再次刷新可能被旧 statsig
-        # 覆盖设备/UA，所以只在普通订单上刷新。
-        if not req.session_reissued:
-            client.refresh_session()
         client.warmup(page_url=page_url)
         pk = req.publishable_key or ""
         if not pk:

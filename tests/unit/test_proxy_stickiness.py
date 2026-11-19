@@ -6,7 +6,8 @@ import asyncio
 
 import pytest
 
-from gss_api.routers.orders import _create_checkout_with_retry
+from gss_api.routers.orders import _create_checkout_once
+from gss_contracts.errors import DomainError
 
 
 class _DeadPipeline:
@@ -18,34 +19,9 @@ class _DeadPipeline:
         raise RuntimeError("SSL: UNEXPECTED_EOF_WHILE_READING")
 
 
-def test_pinned_proxy_never_rotates_sid(monkeypatch):
-    async def no_sleep(_):
-        return None
-
-    monkeypatch.setattr("gss_api.routers.orders.asyncio.sleep", no_sleep)
+def test_ambiguous_checkout_is_never_repeated_or_rerouted():
     pipeline = _DeadPipeline()
-    proxy = "http://u-region-PH-sid-PINNED01:pw@gw.example.com:3010"
-    with pytest.raises(RuntimeError):
-        asyncio.run(
-            _create_checkout_with_retry(
-                pipeline, proxy=proxy, pin_proxy=True, session="x"
-            )
-        )
-    assert pipeline.proxies == [proxy, proxy, proxy]
-
-
-def test_unpinned_proxy_rotates_sid(monkeypatch):
-    async def no_sleep(_):
-        return None
-
-    monkeypatch.setenv("GSS_PROXY_SID", "ROTATED1")
-    monkeypatch.setattr("gss_api.routers.orders.asyncio.sleep", no_sleep)
-    pipeline = _DeadPipeline()
-    proxy = "http://u-region-PH-sid-PINNED01:pw@gw.example.com:3010"
-    with pytest.raises(RuntimeError):
-        asyncio.run(
-            _create_checkout_with_retry(
-                pipeline, proxy=proxy, pin_proxy=False, session="x"
-            )
-        )
-    assert len(set(pipeline.proxies)) > 1
+    proxy = "http://proxy.example.invalid:3128"
+    with pytest.raises(DomainError, match="不自动重试"):
+        asyncio.run(_create_checkout_once(pipeline, proxy=proxy, session="fixture"))
+    assert pipeline.proxies == [proxy]
