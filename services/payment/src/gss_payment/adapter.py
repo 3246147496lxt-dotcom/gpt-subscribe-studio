@@ -15,9 +15,8 @@ from gss_core.chatgpt import (
     APP_BASE,
     ChatGPTClient,
     checkout_confirm_blocked,
-    checkout_confirm_blocked_advice,
     checkout_confirm_message,
-    checkout_requires_approval,
+    _intent_object,
     decline_message,
     nested_intent_status,
     payment_intent_from_confirm,
@@ -50,26 +49,27 @@ class PaymentAdapterBase:
                 "proxy_roles": ["checkout", "approve"],
             },
             failure_modes={
-            "payment_declined": "卡片被拒或 ChatGPT 风控 blocked → 换卡 / 整段 session 后重试",
+            "payment_declined": "上游明确拒付 → 显示拒付状态",
             "requires_action": "3DS → 在浏览器完成验证",
-            "payment_unknown_state": "终态不确定 → 先查订阅，避免重复扣款",
+            "payment_unknown_state": "扣款结果不确定 → 只读核对原付款，不重复支付",
             },
         )
 
 
 logger = logging.getLogger("gss.payment")
 
-_APPROVAL_RETRIES = 1
+def _check_approval_result(payload: Dict[str, Any]) -> None:
+    if "checkout_approval_internal_error" in submission_failure_detail(payload):
+        # Absence of a PaymentIntent in an error envelope is not proof of non-payment.
+        raise DomainError(ErrorCode.PAYMENT_UNKNOWN_STATE, "扣款结果未知，请核对账单，不要重复支付")
 
 
-def _approval_retryable(confirmed: Dict[str, Any]) -> bool:
-    """ChatGPT 审批内部错误且没有 PaymentIntent（不可能已扣款）时才允许重试一次。"""
-    if submission_state(confirmed) != "failed":
-        return False
-    if "checkout_approval_internal_error" not in submission_failure_detail(confirmed):
-        return False
-    intent_id, _, _ = payment_intent_from_confirm(confirmed)
-    return not intent_id
+def _setup_only(payload: Dict[str, Any], intent: Dict[str, Any], intent_id: str) -> bool:
+    return (
+        payload.get("mode") == "setup" or intent.get("object") == "setup_intent"
+        or intent_id.startswith("seti_")
+        or (bool(intent) and intent is payload.get("setup_intent"))
+    )
 
 
 @dataclass
@@ -126,34 +126,28 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
         billing = dict(req.billing or address_for(req.country))
         checkout_id = public_checkout_id(checkout_id)
         stripe_custom = checkout_id.startswith("cs_")
-        for attempt in range(_APPROVAL_RETRIES + 1):
-            confirm_token = _confirmation_token(client, publishable_key=pk, token=req.payment_method_token or "")
-            confirmed = client.confirm_checkout(
-                checkout_session_id=checkout_id, confirm_token=confirm_token, checkout_url=page_url,
-                billing=billing, currency=currency_for(req.country), publishable_key=pk,
+        confirm_token = _confirmation_token(client, publishable_key=pk, token=req.payment_method_token or "")
+        confirmed = client.confirm_checkout(
+            checkout_session_id=checkout_id, confirm_token=confirm_token, checkout_url=page_url,
+            billing=billing, currency=currency_for(req.country), publishable_key=pk,
+        )
+        _check_approval_result(confirmed)
+        if stripe_custom:
+            confirmed = client.finalize_stripe_custom_checkout(
+                checkout_session_id=checkout_id, publishable_key=pk, checkout_url=page_url,
+                processor_entity=_processor_from_checkout_url(page_url), confirmed=confirmed,
             )
-            if stripe_custom:
-                confirmed = client.finalize_stripe_custom_checkout(
-                    checkout_session_id=checkout_id, publishable_key=pk, checkout_url=page_url,
-                    processor_entity=_processor_from_checkout_url(page_url), confirmed=confirmed,
-                )
-            if attempt < _APPROVAL_RETRIES and _approval_retryable(confirmed):
-                logger.warning("checkout_approval_internal_error 无 PaymentIntent，重试 %s/%s", attempt + 1, _APPROVAL_RETRIES)
-                continue
-            break
+            _check_approval_result(confirmed)
         intent_id, intent_secret, return_url = payment_intent_from_confirm(confirmed)
         chatgpt_status = str(confirmed.get("status") or confirmed.get("result") or "")
         kind = str(confirmed.get("type") or "")
         if checkout_confirm_blocked(confirmed):
-            extra = checkout_confirm_message(confirmed)
-            advice = checkout_confirm_blocked_advice(
-                req.country, upstream_reason=extra, upstream_status=chatgpt_status,
-            )
-            return PaymentResult(
-                status=PaymentStatus.DECLINED,
-                provider_ref=intent_id or checkout_id,
-                message=advice,
-            )
+            # Application rejection alone says nothing about the original charge.
+            evidence = hosted_payment_result(confirmed, checkout_id)
+            if evidence.status in {PaymentStatus.SUCCEEDED, PaymentStatus.DECLINED}:
+                return evidence
+            return PaymentResult(status=PaymentStatus.ERROR, provider_ref=intent_id or checkout_id,
+                                 message="扣款结果待核对，请勿重复支付")
         state = submission_state(confirmed)
         if state in {"failed", "declined", "canceled", "cancelled"}:
             extra = checkout_confirm_message(confirmed) or state
@@ -165,9 +159,11 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                 provider_ref=intent_id or checkout_id,
                 message=f"Stripe 未完成确认: {extra}",
             )
+        nested = _intent_object(confirmed)
+        if _setup_only(confirmed, nested, intent_id):
+            return PaymentResult(status=PaymentStatus.PROCESSING, provider_ref=checkout_id,
+                                 message="尚无扣款确认，请核对账单")
         pi_status = nested_intent_status(confirmed)
-        nested = confirmed.get("payment_intent")
-        nested = nested if isinstance(nested, dict) else {}
         if pi_status in {"requires_payment_method", "canceled", "cancelled"} or nested.get("last_payment_error"):
             return _result_from_intent(nested or {"status": pi_status or "requires_payment_method"}, intent_id)
         if intent_secret.startswith("pi_") or kind == "payment_intent" or intent_id.startswith("pi_"):
@@ -188,7 +184,7 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                     intent_id,
                     intent_secret,
                 )
-            if intent_secret:
+            if intent_secret and pi_status == "requires_confirmation":
                 if not return_url:
                     return_url = stripe_verify_url(
                         checkout_id,
@@ -203,11 +199,7 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                     return_url=return_url,
                 )
                 return _result_from_intent(final, intent_id, intent_secret)
-        if chatgpt_status in {"succeeded", "success", "complete", "completed"} or state in {
-            "succeeded",
-            "complete",
-            "completed",
-        }:
+        if confirmed.get("payment_status") == "paid":
             return PaymentResult(
                 status=PaymentStatus.SUCCEEDED,
                 provider_ref=intent_id or checkout_id,
@@ -237,8 +229,7 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                                    passive_captcha_token=req.passive_captcha_token or "",
                                    rv_timestamp=req.rv_timestamp or "")
         result = hosted_payment_result(confirmed, context["session_id"], req.checkout_url)
-        # Solving takes 30-120s, longer than the gateway allows. Hand the challenge
-        # back now and let the order poll endpoint complete it in the background.
+        # Hand the challenge back to the caller. Polling only observes the original payment.
         if result.status is PaymentStatus.REQUIRES_ACTION:
             pending = self._challenge_payload(confirmed)
             if pending:
@@ -297,14 +288,17 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
 
 
 def hosted_payment_result(payload: dict, session_id: str, checkout_url: str = ""):
-    from gss_contracts import PaymentResult, PaymentStatus
-    from gss_core.chatgpt import _intent_object, payment_intent_from_confirm
     object_status = str(payload.get("payment_object_status") or "").lower()
     state = str(payload.get("state") or "").lower()
     status = str(payload.get("status") or "").lower()
     intent = _intent_object(payload)
     intent_id, secret, _ = payment_intent_from_confirm(payload)
-    if object_status == "succeeded" or state == "succeeded" or intent.get("status") == "succeeded" or payload.get("payment_status") == "paid":
+    if _setup_only(payload, intent, intent_id):
+        return PaymentResult(status=PaymentStatus.PROCESSING, provider_ref=session_id,
+                             message="尚无扣款确认，请核对账单")
+    # Completing a Checkout or successfully setting up a payment method is not a charge.
+    payment_intent = intent_id.startswith("pi_") or intent.get("object") == "payment_intent"
+    if payload.get("payment_status") == "paid" or (payment_intent and intent.get("status") == "succeeded"):
         return PaymentResult(status=PaymentStatus.SUCCEEDED, provider_ref=intent_id or session_id, message="支付成功")
     if intent.get("status") == "requires_action":
         next_action = intent.get("next_action") or {}
@@ -314,15 +308,19 @@ def hosted_payment_result(payload: dict, session_id: str, checkout_url: str = ""
         action = dict(result.next_action or {})
         action["challenge_type"] = kind
         action["checkout_url"] = checkout_url
-        # Needed later by the poll endpoint to solve and verify the challenge.
+        # Preserve the action for the original payment; polling never performs it.
         action["payment_intent_id"] = intent_id
         action["client_secret"] = secret or action.get("client_secret")
         return PaymentResult(status=PaymentStatus.REQUIRES_ACTION, provider_ref=intent_id or session_id,
                              next_action=action, message="需要完成 Stripe 验证" if kind == "intent_confirmation_challenge" else "需要完成支付验证")
-    if object_status in {"failed", "canceled", "expired"} or state in {"failed", "canceled", "expired"} or status == "expired":
-        return PaymentResult(status=PaymentStatus.DECLINED, provider_ref=intent_id or session_id, message="Hosted Checkout 支付未完成")
-    if intent.get("status") in {"requires_payment_method", "canceled"} or intent.get("last_payment_error"):
+    if payment_intent and (intent.get("status") in {"requires_payment_method", "canceled", "cancelled"}
+                           or intent.get("last_payment_error")):
         return _result_from_intent(intent, intent_id, secret)
+    if payment_intent and object_status in {"failed", "canceled"}:
+        return PaymentResult(status=PaymentStatus.DECLINED, provider_ref=intent_id, message="付款未完成")
+    if {state, status, object_status} & {"failed", "canceled", "expired"}:
+        return PaymentResult(status=PaymentStatus.ERROR, provider_ref=intent_id or session_id,
+                             message="扣款结果待核对，请勿重复支付")
     return PaymentResult(status=PaymentStatus.PROCESSING, provider_ref=intent_id or session_id, message="Stripe 正在处理，请等待状态确认")
 
 
@@ -358,7 +356,8 @@ def _result_from_intent(payload: Dict[str, Any], intent_id: str, client_secret: 
     if status in {"processing", "pending"}:
         return PaymentResult(status=PaymentStatus.PROCESSING, provider_ref=intent_id, message="支付处理中")
     error = payload.get("last_payment_error") if isinstance(payload.get("last_payment_error"), dict) else {}
-    if status in {"requires_payment_method", "canceled", "cancelled"} or error:
+    if (status in {"requires_payment_method", "canceled", "cancelled"} or error.get("decline_code")
+            or error.get("code") in {"card_declined", "expired_card", "incorrect_cvc", "incorrect_number"}):
         detail = str(error.get("decline_code") or error.get("code") or error.get("message") or status)
         return PaymentResult(
             status=PaymentStatus.DECLINED,

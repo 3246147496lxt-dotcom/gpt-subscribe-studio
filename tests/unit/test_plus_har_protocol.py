@@ -419,6 +419,36 @@ def test_settle_reads_live_decline_body():
     assert (result.payment_method_id or "").startswith("pm_")
 
 
+@pytest.mark.parametrize("field", ["intent.error", "last_error"])
+def test_generic_processor_error_is_not_a_confirmed_decline(field):
+    engine = build_harness()
+    error = {"type": "api_error", "code": "processing_error", "message": "未扣款"}
+    if field == "intent.error":
+        engine.raw["intent"] = {"error": error}
+    else:
+        engine.last_error = error
+    result = engine._settle()
+    assert result.state == "unknown"
+    assert result.intent_status is None
+
+
+@pytest.mark.parametrize(("intent", "state"), [
+    ({"id": "pi_fixture", "status": "succeeded"}, "pending"),
+    ({"id": "pi_fixture", "status": "requires_payment_method"}, "card_declined"),
+    ({"id": "pi_unrelated", "status": "succeeded"}, "unknown"),
+    ({}, "unknown"),
+])
+def test_read_only_known_payment_intent_evidence_keeps_payment_stage(monkeypatch, intent, state):
+    engine = build_harness(read_only=True)
+    engine.client = StubClient()
+    engine.intent_id, engine.intent_secret = "pi_fixture", "fixture-secret"
+    monkeypatch.setattr(engine.client, "retrieve_stripe_intent", lambda **_: intent)
+    result = engine._read_only_settle()
+    assert (engine.stage, result.state) == ("payment", state)
+    assert result.intent_status == (intent.get("status") if state != "unknown" else None)
+    assert not engine.app.calls and not engine.stripe.calls
+
+
 def test_settle_flags_amount_mismatch():
     engine = build_harness()
     engine.amount_minor = 1363

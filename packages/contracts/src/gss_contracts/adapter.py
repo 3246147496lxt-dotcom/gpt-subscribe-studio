@@ -139,6 +139,9 @@ class PaymentAdapter(Protocol):
 # --------------------------------------------------------------------------- #
 # account
 # --------------------------------------------------------------------------- #
+TEAM_PLAN_KINDS = frozenset({"team", "chatgptteamplan"})
+
+
 @dataclass(frozen=True)
 class SubscriptionInfo:
     """订阅校验结果。交付前必须调用（宪法第 VI 条 / FR-006）。"""

@@ -934,17 +934,6 @@ def test_payment_checkout_body_matches_har_and_headers_carry_codex_identity() ->
     assert "originator" not in client._route_headers("/backend-api/sentinel/req")
 
 
-def test_approval_retry_only_without_payment_intent() -> None:
-    from gss_payment.adapter import _approval_retryable
-
-    failed = {"submission_attempt": {"state": "failed", "error": {"code": "checkout_approval_internal_error"}}}
-    assert _approval_retryable(failed) is True
-    with_pi = {**failed, "payment_intent": {"id": "pi_123", "status": "requires_payment_method"}}
-    assert _approval_retryable(with_pi) is False
-    other = {"submission_attempt": {"state": "failed", "error": {"code": "card_declined"}}}
-    assert _approval_retryable(other) is False
-
-
 def test_stripe_custom_confirm_syncs_billing_tax_first(monkeypatch) -> None:
     from gss_core.chatgpt import ChatGPTClient
 

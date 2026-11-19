@@ -1,6 +1,8 @@
 """Team prepare -> pm -> confirm -> challenge -> server GET poll, without network."""
 import json
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,7 @@ from fastapi.testclient import TestClient
 from gss_api.main import create_app
 from gss_api.store import store
 from gss_core.vault import vault
-from gss_contracts import OrderStatus
+from gss_contracts import OrderStatus, PaymentResult, PaymentStatus, SubscriptionInfo
 
 FIXTURE = json.loads((Path(__file__).parents[1] / "fixtures/team_hosted_success.json").read_text())
 BILLING = {"name": "Fixture", "line1": "Fixture Street", "city": "Fixture City", "state": "OR", "postal_code": "00000", "country": "US"}
@@ -39,7 +41,7 @@ def setup_team(monkeypatch):
                     "guid": "fixture-guid", "muid": "fixture-muid", "sid": "fixture-sid", "passive_captcha": {}}
         def poll(self, **kw):
             calls.append(("GET-poll", kw))
-            return FIXTURE["poll"]["record"]["response"]["fields"]
+            return {**FIXTURE["poll"]["record"]["response"]["fields"], "payment_status": "paid"}
     monkeypatch.setattr("gss_api.routers.orders._team_client", lambda *a: FakeClient())
     monkeypatch.setattr("gss_api.routers.orders.TeamHostedClient", Hosted)
     return client, order_id, calls
@@ -58,12 +60,16 @@ def test_prepare_requotes_before_pm_and_keeps_egp(setup_team):
     assert store.get_order(order_id).status is OrderStatus.AWAITING_PAYMENT
 
 
-def test_poll_top_level_success_delivers_and_clears_secrets(setup_team):
+def test_verified_team_entitlement_delivers_and_clears_secrets(setup_team, monkeypatch):
     client, order_id, calls = setup_team
+    verify = AsyncMock(return_value=SubscriptionInfo(active=True, raw_kind="team"))
+    monkeypatch.setattr("gss_api.routers.orders.build_pipeline", lambda: SimpleNamespace(verify=verify))
     store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
     r = client.post(f"/api/orders/{order_id}/team/poll")
     assert r.status_code == 200, r.text
-    assert r.json()["status"] == "delivered"
+    assert r.json()["payment_status"] == "succeeded"
+    assert client.post(f"/api/orders/{order_id}/verify").json()["status"] == "delivered"
+    assert verify.await_count > 0
     assert vault.get(order_id) is None
     assert calls[0][0] == "GET-poll"
     # Duplicate poll after delivery must not require secrets or issue another upstream call.
@@ -104,20 +110,19 @@ def test_duplicate_confirm_is_rejected_after_submission(setup_team):
     assert r.status_code == 409
 
 
-def test_team_successful_confirm_is_idempotent_and_does_not_verify_subscription(setup_team, monkeypatch):
-    from gss_contracts import PaymentResult, PaymentStatus
-    from gss_api.runtime import build_pipeline
+def test_team_successful_confirm_is_idempotent_after_entitlement_verification(setup_team, monkeypatch):
     client, order_id, _ = setup_team
     client.post(f"/api/orders/{order_id}/team/prepare", json={"billing": BILLING})
-    # Use a captured-result stub only for the mutation; subscription must not be queried for Team success.
+    confirms = []
     class Payment:
         async def pay(self, request):
             assert request.team_context["checkout_config_id"] == "fixture-config-updated"
             assert request.passive_captcha_token == "fixture-captcha"
+            confirms.append(request)
             return PaymentResult(status=PaymentStatus.SUCCEEDED, provider_ref="cs_test_fixture")
     class Account:
         async def subscription_status(self, session):
-            pytest.fail("Team charge success must not wait on ChatGPT subscription")
+            return SubscriptionInfo(active=True, raw_kind="team")
     from gss_orchestrator.pipeline import OrderPipeline, PipelineDeps
     pipeline = OrderPipeline(PipelineDeps(checkout=None, payment=Payment(), account=Account()))
     monkeypatch.setattr("gss_api.routers.orders.build_pipeline", lambda: pipeline)
@@ -125,8 +130,10 @@ def test_team_successful_confirm_is_idempotent_and_does_not_verify_subscription(
             "passive_captcha_token": "fixture-captcha"}
     r = client.post(f"/api/orders/{order_id}/pay", json=body)
     assert r.status_code == 200, r.text
-    assert r.json()["status"] == "delivered"
+    assert r.json()["payment_status"] == "succeeded"
+    assert client.post(f"/api/orders/{order_id}/verify").json()["status"] == "delivered"
     assert client.post(f"/api/orders/{order_id}/pay", json=body).json()["status"] == "delivered"
+    assert len(confirms) == 1
 
 
 def test_team_challenge_then_pending_poll_preserves_secret(setup_team, monkeypatch):
@@ -187,7 +194,6 @@ def test_partial_prepare_quote_survives_later_error(setup_team, monkeypatch):
 
 
 def test_server_side_card_is_tokenized_then_confirmed(setup_team, monkeypatch):
-    from gss_contracts import PaymentResult, PaymentStatus
     from gss_orchestrator.pipeline import OrderPipeline, PipelineDeps
     client, order_id, calls = setup_team
     assert client.post(f"/api/orders/{order_id}/team/prepare", json={"billing": BILLING}).status_code == 200
@@ -206,7 +212,7 @@ def test_server_side_card_is_tokenized_then_confirmed(setup_team, monkeypatch):
 
     class Account:
         async def subscription_status(self, session):
-            raise AssertionError("Team success must not wait on subscription")
+            return SubscriptionInfo(active=True, raw_kind="team")
 
     monkeypatch.setattr("gss_api.routers.orders.TeamHostedClient", Hosted)
     monkeypatch.setattr("gss_api.routers.orders.build_pipeline",
@@ -245,3 +251,76 @@ def test_server_card_decline_keeps_order_awaiting_payment(setup_team, monkeypatc
     r = client.post(f"/api/orders/{order_id}/pay", json=body)
     assert r.status_code >= 400
     assert store.get_order(order_id).status is not OrderStatus.PAYING
+
+
+@pytest.mark.parametrize("entry", ["pay", "team/poll"])
+def test_team_paid_is_not_delivered_without_verified_team_entitlement(setup_team, monkeypatch, entry):
+    client, order_id, _ = setup_team
+    url = f"/api/orders/{order_id}"
+    pay = AsyncMock(return_value=PaymentResult(status=PaymentStatus.SUCCEEDED, provider_ref="pi_fixture"))
+    verify = AsyncMock(return_value=SubscriptionInfo(active=True, raw_kind="plus"))
+    monkeypatch.setattr("gss_api.routers.orders.build_pipeline",
+                        lambda: SimpleNamespace(pay=pay, verify=verify))
+    try:
+        if entry == "pay":
+            assert client.post(f"{url}/team/prepare", json={"billing": BILLING}).status_code == 200
+            body = {"payment_method_token": "pm_fixture", "team_context_id": "fixture-context", "billing": BILLING}
+            first = client.post(f"{url}/pay", json=body)
+        else:
+            store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
+            first = client.post(f"{url}/team/poll")
+        assert first.status_code == 200, first.text
+
+        def assert_waiting(result):
+            # An active unrelated subscription is not evidence of a Team entitlement.
+            assert result["status"] == "verifying"
+            assert result["subscription"] is None
+            assert result["plan_type"] == "team"
+            assert result["payment_status"] == result["receipt"]["payment_status"] == "succeeded"
+            assert result["delivery_status"] == result["receipt"]["delivery_status"] == "verify_delayed"
+            assert result["status_summary"] == "已扣款，待核验"
+            assert vault.get(order_id) is not None
+
+        assert_waiting(first.json())
+        assert_waiting(client.get(url).json())
+        assert_waiting(client.post(f"{url}/verify").json())
+        assert_waiting(client.post(f"{url}/team/poll").json())
+        verify.return_value = SubscriptionInfo(active=True, raw_kind="team")
+        last = client.post(f"{url}/verify")
+        assert last.status_code == 200, last.text
+        assert last.json()["status"] == last.json()["delivery_status"] == "delivered"
+        assert last.json()["payment_status"] == "succeeded"
+        assert vault.get(order_id) is None
+        assert pay.await_count == (1 if entry == "pay" else 0)
+    finally:
+        vault.drop(order_id)
+
+
+def test_paid_team_survives_verification_timeout_and_vault_expiry(setup_team, monkeypatch):
+    client, order_id, _ = setup_team
+    url = f"/api/orders/{order_id}"
+    verify = AsyncMock(side_effect=TimeoutError("private-timeout-diagnostic"))
+    pay = AsyncMock(side_effect=AssertionError("a status query must not submit another payment"))
+    monkeypatch.setattr("gss_api.routers.orders.build_pipeline", lambda: SimpleNamespace(verify=verify, pay=pay))
+    try:
+        def assert_waiting(response):
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["payment_status"] == body["receipt"]["payment_status"] == "succeeded"
+            assert body["status"] != "delivered" and body["delivery_status"] != "delivered"
+            assert body["status_summary"] == "已扣款，待核验"
+            assert "private-timeout-diagnostic" not in response.text
+
+        assert_waiting(client.post(f"{url}/team/poll"))
+        assert_waiting(client.post(f"{url}/verify"))
+        assert verify.await_count >= 1
+        assert vault.get(order_id) is not None
+        vault.drop(order_id)  # mimic idle expiry with the order and receipt still in RAM
+        checks = verify.await_count
+        assert_waiting(client.post(f"{url}/verify"))
+        assert_waiting(client.post(f"{url}/team/poll"))
+        assert_waiting(client.get(url))
+        assert verify.await_count == checks
+        pay.assert_not_awaited()
+    finally:
+        vault.drop(order_id)

@@ -85,6 +85,15 @@ from gss_core.stripe_protocol import PaymentOutcome
 
 logger = logging.getLogger("gss.plus_har")
 
+_DECLINED_INTENT_STATES = {"requires_payment_method", "canceled", "cancelled"}
+_CARD_REJECTION_CODES = {"card_declined", "expired_card", "incorrect_cvc", "incorrect_number"}
+
+
+def _confirmed_decline(out: PaymentOutcome) -> bool:
+    return bool(out.decline_code or out.code in _CARD_REJECTION_CODES
+                or ((out.intent_id or "").startswith("pi_") and out.intent_status in _DECLINED_INTENT_STATES))
+
+
 _SESSION = re.compile(r"(oaics_[A-Za-z0-9]+|cs_(?:live|test)_[A-Za-z0-9]+)")
 _ATTRIBUTION = {
     "merchant_integration_source": "elements",
@@ -868,13 +877,18 @@ class PlusHarProtocol:
         if not error and isinstance(intent_payload.get("error"), dict):
             error = intent_payload["error"]
         pi_obj = error.get("payment_intent") if isinstance(error.get("payment_intent"), dict) else {}
+        reported_id = str((pi_obj or intent_payload).get("id") or "")
+        if reported_id and self.intent_id and reported_id != self.intent_id:
+            out.message = "无法将回执关联到原付款，请核对原结果"
+            return out
         if pi_obj:
             intent_status = str(pi_obj.get("status") or intent_status)
+            out.intent_id = reported_id or out.intent_id
         if error:
             out.code = str(error.get("code") or "")
             out.decline_code = str(error.get("decline_code") or "")
             out.message = redact_sensitive(str(error.get("message") or "Stripe 拒绝本次付款"))[:240]
-            out.intent_status = intent_status or "requires_payment_method"
+            out.intent_status = intent_status or None
             last_error = pi_obj.get("last_payment_error") if isinstance(pi_obj.get("last_payment_error"), dict) else {}
             charge = str(error.get("charge") or last_error.get("charge") or "")
             if charge:
@@ -889,14 +903,14 @@ class PlusHarProtocol:
                 out.state = "unknown"
                 out.message = f"Intent 金额 {amount} 与结账应付额 {self.amount_minor} 不一致；{out.message}"
                 return out
-            out.state = "card_declined"
+            out.state = "card_declined" if _confirmed_decline(out) else "unknown"
             return out
         if self.last_error:
             out.code = self.last_error.get("code") or ""
             out.decline_code = self.last_error.get("decline_code") or ""
             out.message = self.last_error.get("message") or ""
             out.intent_status = intent_status or None
-            out.state = "card_declined" if out.code or out.decline_code else "unknown"
+            out.state = "card_declined" if _confirmed_decline(out) else "unknown"
             return out
 
         page: Dict[str, Any] = {}
@@ -1040,28 +1054,36 @@ class PlusHarProtocol:
         status = str(page.get("status") or "")
         payment_status = str(page.get("payment_status") or "")
         if status == "complete" and payment_status in {"paid", "no_payment_required"}:
+            self.stage = "payment"
             out.state = "paid" if self._subscription_active() else "pending"
             out.intent_status = "succeeded"
             out.message = "原结账已完成" if out.state == "paid" else "付款已确认，等待订阅生效"
             return out
         if self.intent_id and self.intent_secret:
+            self.stage = "payment"
+            out.intent_id = self.intent_id
             try:
                 intent = self.client.retrieve_stripe_intent(
                     intent_id=self.intent_id, client_secret=self.intent_secret,
                     publishable_key=self.publishable_key)
             except Exception:  # noqa: BLE001
                 intent = {}
-            state = str(intent.get("status") or "")
+            matches = self.intent_id.startswith("pi_") and intent.get("id") == self.intent_id
+            state = str(intent.get("status") or "") if matches else ""
             if state == "succeeded":
                 out.state = "pending"
                 out.intent_status = state
                 out.message = "付款已确认，等待结账状态更新"
                 return out
-            if state in {"requires_payment_method", "canceled", "cancelled"}:
+            if state in _DECLINED_INTENT_STATES:
                 out.state = "card_declined"
                 out.intent_status = state
                 out.message = "Stripe 未完成本次付款"
                 return out
+            out.state = "pending" if state in {"processing", "requires_capture"} else "unknown"
+            out.intent_status = state or None
+            out.message = "原付款结果待核对，请勿重复支付"
+            return out
         out.state = "pending"
         out.message = "原结账尚未提交付款"
         return out

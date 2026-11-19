@@ -12,6 +12,7 @@ from gss_contracts import (
     PromoEligibility,
     SubscriptionInfo,
 )
+from gss_contracts.adapter import TEAM_PLAN_KINDS
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.chatgpt import ChatGPTClient
 from gss_core.config import ORDER_HTTP_TIMEOUT_S
@@ -79,17 +80,25 @@ class UpstreamAccountAdapter(AccountAdapterBase):
             or payload.get("status")
             or ""
         ).lower()
-        is_active = plan_type in _ACTIVE_PLANS or status in {"active", "trialing", "paid"}
         expires_at = None
-        expires_raw = (
-            (payload.get("subscription") or {}).get("expires_at")
-            or payload.get("expires_at")
-        )
+        expires_raw = (payload.get("subscription") or {}).get("expires_at")
+        if expires_raw is None:
+            expires_raw = payload.get("expires_at")
         if isinstance(expires_raw, str) and expires_raw:
             try:
                 expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
             except ValueError:
                 expires_at = None
+        if plan_type in TEAM_PLAN_KINDS:
+            # A Team product name or a payment status does not prove entitlement.
+            # If an expiry is supplied but ambiguous, leave delivery unverified.
+            current = expires_raw is None or (
+                expires_at is not None and expires_at.tzinfo is not None
+                and expires_at > datetime.now(timezone.utc)
+            )
+            is_active = status in {"active", "trialing"} and current
+        else:
+            is_active = plan_type in _ACTIVE_PLANS or status in {"active", "trialing", "paid"}
         return SubscriptionInfo(
             active=is_active,
             expires_at=expires_at,

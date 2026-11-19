@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -128,7 +128,8 @@ def test_team_hosted_checkout_requires_seats_and_returns_link() -> None:
 
     verified = client.post(f"/api/orders/{body['id']}/verify")
     assert verified.status_code == 200, verified.text
-    assert verified.json()["status"] == "delivered"
+    assert verified.json()["status"] == "awaiting_payment"
+    assert verified.json()["payment_status"] == "unpaid"
 
 
 @pytest.mark.parametrize("payment_country,state", [("US", "OR"), ("JP", "Tokyo")])
@@ -159,7 +160,9 @@ def test_team_egypt_checkout_aligns_payment_billing_to_order(monkeypatch, paymen
                        json={"payment_method_token": "pm_fake", "billing": address})
     assert paid.status_code == 200, paid.text
     result = paid.json()
-    assert result["status"] == "delivered"
+    # The generic fake account does not establish a Team entitlement.
+    assert result["status"] == "verifying"
+    assert result["payment_status"] == "succeeded"
     assert result["billing_country"] == "EG"
     assert result["currency"] == "EGP"
     assert result["billing"]["country"] == "EG"
@@ -364,3 +367,98 @@ def test_plus_input_payment_aligns_billing_to_checkout_country(monkeypatch, chec
     request = pipeline.deps.payment.calls[0]
     assert request.country == checkout_country
     assert request.billing["country"] == checkout_country
+
+
+@pytest.mark.parametrize("plan", ["plus", "team"])
+@pytest.mark.parametrize("failure", ["domain", "transport", "unclassified"])
+def test_unknown_payment_is_not_a_failure_and_cannot_be_resubmitted(monkeypatch, plan, failure):
+    """A lost confirmation reply proves neither failure nor a safe second charge."""
+    from gss_api.routers import orders
+    from gss_contracts.errors import DomainError, ErrorCode
+
+    store.clear()
+    monkeypatch.setenv("GSS_USE_FAKE", "1")
+    client = TestClient(create_app())
+    created = client.post("/api/orders", json={
+        "plan": plan, "billing_country": "US", "seat_quantity": 2,
+        "session": '{"accessToken":"fake-session"}',
+    })
+    assert created.status_code == 201, created.text
+    order_id = created.json()["id"]
+    path = f"/api/orders/{order_id}"
+    try:
+        pipeline = orders.build_pipeline()
+        from gss_contracts import PaymentResult, PaymentStatus
+        if failure == "unclassified":
+            pay = AsyncMock(return_value=PaymentResult(status=PaymentStatus.ERROR))
+        else:
+            exc = (DomainError(ErrorCode.PAYMENT_UNKNOWN_STATE, "确认响应丢失")
+                   if failure == "domain" else TimeoutError())
+            pay = AsyncMock(side_effect=exc)
+        verify = AsyncMock()
+        monkeypatch.setattr(pipeline, "verify", verify)
+        notify = AsyncMock()
+        monkeypatch.setattr(pipeline, "pay", pay)
+        monkeypatch.setattr(orders, "build_pipeline", lambda: pipeline)
+        monkeypatch.setattr(orders, "notify_order_update", notify)
+        request = {"payment_method_token": "pm_fake"}
+        response = client.post(f"{path}/pay", json=request)
+        repeated = client.post(f"{path}/pay", json=request)
+        pay.assert_awaited_once()
+        assert repeated.status_code == 409
+
+        result = client.get(path)
+        assert result.status_code == 200
+        order = result.json()
+        assert order["status"] == "unknown"
+        assert order["payment_status"] in {"unknown", "processing"}
+        assert order["receipt"]["payment_status"] == order["payment_status"]
+        assert "支付失败" not in order["status_summary"] and "未扣款" not in order["status_summary"]
+        assert response.status_code in {200, 202}
+        assert response.json()["status"] == order["status"]
+        assert response.json()["payment_status"] == order["payment_status"]
+        assert notify.await_args.args[1].value == order["status"]
+        reread = client.post(f"{path}/verify?paid=true")
+        assert reread.status_code == 200
+        assert reread.json()["status"] == "unknown"
+        verify.assert_not_awaited()
+        pay.assert_awaited_once()
+    finally:
+        vault.drop(order_id)
+        store.clear()
+
+@pytest.mark.parametrize("outcome", ["timeout", "ambiguous"])
+def test_protocol_payment_unknown_blocks_all_further_confirmation(monkeypatch, outcome):
+    """The second payment endpoint shares the same no-replay rule as /pay."""
+    from gss_api.routers import orders
+    from gss_core.stripe_protocol import PaymentOutcome
+
+    monkeypatch.setenv("GSS_USE_FAKE", "1")
+    store.clear()
+    client = TestClient(create_app())
+    created = client.post("/api/orders", json={
+        "plan": "plus", "billing_country": "US", "session": "fake-session",
+    })
+    assert created.status_code == 201
+    oid = created.json()["id"]
+    path = f"/api/orders/{oid}"
+    try:
+        protocol = Mock()
+        if outcome == "timeout":
+            protocol.pay_from_url.side_effect = TimeoutError("private transport detail")
+        else:
+            protocol.pay_from_url.return_value = PaymentOutcome(state="unknown", message="未扣款")
+        monkeypatch.setattr(orders, "PlusProtocol", lambda **kwargs: protocol)
+        store.view(oid).checkout_kind = "custom"
+        body = {"payment_method_id": "pm_fixture", "billing": created.json()["billing"]}
+        resp = client.post(f"{path}/pay-protocol", json=body)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["state"] == "unknown"
+        assert resp.json()["receipt"]["summary"] == "扣款结果待核对，请勿重复支付"
+        assert client.post(f"{path}/pay-protocol", json=body).status_code == 409
+        assert client.post(f"{path}/pay", json={"payment_method_token": "pm_fixture"}).status_code == 409
+        assert client.post(f"{path}/verify").json()["status"] == "unknown"
+        protocol.pay_from_url.assert_called_once()
+    finally:
+        vault.drop(oid)
+        store.clear()

@@ -38,7 +38,6 @@ from gss_core.chatgpt import (
     decline_message,
     checkout_confirm_blocked,
     checkout_confirm_message,
-    nested_intent_status,
     payment_intent_from_confirm,
     public_checkout_id,
     redact_sensitive,
@@ -435,19 +434,9 @@ class PlusProtocol:
         return ""
 
     def _confirm_with_ctoken(self, pm: str) -> tuple[Dict[str, Any], str]:
-        """ctoken 的 setup_future_usage 与 confirm 的保存选择必须一致。
-
-        覆盖上游两种措辞：
-            Card save choice does not match confirmation token
-            new_card_save_choice_required
-        """
-        combos: list[tuple[Optional[str], Optional[bool]]] = [
-            ("off_session", True),    # 必须匹配 PI 上的值，否则 400
-            (None, None),
-        ]
-        last: Optional[DomainError] = None
-        _tok_cached = self._hcaptcha_token() if not pm else ""
-        if not pm and not _tok_cached:
+        """Confirm once; response text must never authorize another submission."""
+        token = self._hcaptcha_token() if not pm else ""
+        if not pm and not token:
             # 没有 token 就不提交：带上无效/缺失 token 的请求会被 ChatGPT 侧
             # 直接判 blocked，给出误导性的「拒绝确认」，掩盖真实原因。
             raise DomainError(
@@ -455,27 +444,13 @@ class PlusProtocol:
                 "未能获取 hCaptcha 令牌，已终止（未提交任何支付请求）。"
                 "请检查求解器服务是否可用。",
             )
-        for setup, save in combos:
-            _tok = _tok_cached
-            ctoken = self.client.create_confirmation_token(
-                publishable_key=self.publishable_key,
-                payment_method=pm,
-                setup_future_usage=setup,
-                card=(None if pm else self.card),
-                billing=(None if pm else self.billing),
-                radar_token=_tok,
-                time_on_page_ms=int((__import__("time").time() - (self._t0 or 0)) * 1000),
-                currency=self.currency,
-            )
-            log(f"   ctoken {ctoken[:14]}… (setup_future_usage={setup}, save={save})")
-            try:
-                return self._confirm(ctoken, save), ctoken
-            except DomainError as exc:
-                if "save choice" not in str(exc).lower():
-                    raise
-                last = exc
-                log("   保存选择不匹配，换下一组")
-        raise last if last else DomainError(ErrorCode.PAYMENT_DECLINED, "保存选择重试失败")
+        ctoken = self.client.create_confirmation_token(
+            publishable_key=self.publishable_key, payment_method=pm, setup_future_usage="off_session",
+            card=(None if pm else self.card), billing=(None if pm else self.billing),
+            radar_token=token, time_on_page_ms=int((__import__("time").time() - (self._t0 or 0)) * 1000),
+            currency=self.currency,
+        )
+        return self._confirm(ctoken, True), ctoken
 
     # ── 主流程 ────────────────────────────────────────────
     def pay(self) -> PaymentOutcome:
@@ -520,16 +495,13 @@ class PlusProtocol:
         # 状态由本方法自己判（hosted 流程的状态机不适用于 custom）。
         if self.is_stripe_custom:
             log("④b finalize custom checkout → PaymentIntent")
-            try:
-                confirmed = self.client.finalize_stripe_custom_checkout(
-                    checkout_session_id=self.checkout_id,
-                    publishable_key=self.publishable_key,
-                    checkout_url=self.checkout_url,
-                    processor_entity=_processor_from_checkout_url(self.checkout_url),
-                    confirmed=confirmed,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log(f"   finalize 失败：{str(exc)[:110]}")
+            confirmed = self.client.finalize_stripe_custom_checkout(
+                checkout_session_id=self.checkout_id,
+                publishable_key=self.publishable_key,
+                checkout_url=self.checkout_url,
+                processor_entity=_processor_from_checkout_url(self.checkout_url),
+                confirmed=confirmed,
+            )
 
         _pi = confirmed.get("payment_intent")
         _pi = _pi if isinstance(_pi, dict) else {}
@@ -547,36 +519,25 @@ class PlusProtocol:
 
         # 被风控/资格拦截
         if checkout_confirm_blocked(confirmed):
-            import json as _json
-            log(f"   原始响应：{_json.dumps(confirmed, ensure_ascii=False)[:900]}")
-            out.state = "card_declined"
-            out.message = checkout_confirm_message(confirmed) or "ChatGPT 侧拒绝确认"
-            log(f"   被拦截：{out.message[:100]}")
+            out.state = "card_declined" if scanned.declined else "unknown"
+            out.message = checkout_confirm_message(confirmed) or "未取得扣款确认"
             return out
 
         state = submission_state(confirmed)
         if state in {"failed", "declined", "canceled", "cancelled"}:
-            out.state = "card_declined"
+            out.state = "card_declined" if scanned.declined else "unknown"
             out.message = out.message or f"ChatGPT 未完成确认: {state}"
             log(f"   确认失败：{state}")
             return out
 
         intent_id, intent_secret, return_url = payment_intent_from_confirm(confirmed)
-        pi_status = nested_intent_status(confirmed)
+        out.intent_id = intent_id or None
+        pi_status = scanned.intent_status
         nested = confirmed.get("payment_intent")
         nested = nested if isinstance(nested, dict) else {}
 
-        # 卡被拒
-        if pi_status in {"requires_payment_method", "canceled", "cancelled"} or nested.get(
-            "last_payment_error"
-        ):
-            out.state = "card_declined"
-            log(f"   拒卡 status={pi_status} decline={out.decline_code}")
-            return out
-
-        # 已经成功
-        if pi_status == "succeeded":
-            out.state = "paid"
+        if scanned.state in {"paid", "card_declined", "pending"}:
+            out.state = scanned.state
             return out
 
         # 3DS：纯协议无法完成
@@ -590,11 +551,11 @@ class PlusProtocol:
                     )
                     live_status = str(live.get("status") or "")
                     out.intent_status = live_status or pi_status
-                    if live_status == "succeeded":
+                    if intent_id.startswith("pi_") and live_status == "succeeded":
                         out.state = "paid"
                         return out
                     if live_status == "requires_payment_method":
-                        out.state = "card_declined"
+                        out.state = StripeProtocol.classify({"body": live}, None).state
                         return out
                 except Exception as exc:  # noqa: BLE001
                     log(f"   读取 intent 失败：{str(exc)[:80]}")
@@ -612,7 +573,7 @@ class PlusProtocol:
             return out
 
         # 还差一次 Stripe 侧确认
-        if intent_id and intent_secret:
+        if intent_id.startswith("pi_") and intent_secret and pi_status == "requires_confirmation":
             if not return_url:
                 return_url = stripe_verify_url(self.checkout_id)
             log("⑤ Stripe payment_intents/confirm")
@@ -649,7 +610,7 @@ class PlusProtocol:
                 # 只表示「确认请求被接受」，不是扣款结果）。
                 out.intent_status = str(final.get("status") or "") or None
                 out.raw["final"] = final
-                if http_status == 402 or code == "card_declined" or decline:
+                if code == "card_declined" or decline:
                     out.state = "card_declined"
                     out.message = decline_message(redact_sensitive(decline or code or msg))
                     log(f"   拒卡 {code}/{decline}：{msg[:90]}")
@@ -673,7 +634,7 @@ class PlusProtocol:
             if final_status == "succeeded":
                 out.state = "paid"
             elif final_status in {"requires_payment_method", "canceled", "cancelled"}:
-                out.state = "card_declined"
+                out.state = "card_declined" if final_scanned.declined else "unknown"
             elif final_status == "requires_action":
                 out.state = "challenge_required"
                 out.message = out.message or "需要 3DS 验证，纯协议无法完成"
@@ -683,33 +644,11 @@ class PlusProtocol:
                 out.state = "unknown"
             return out
 
-        # ChatGPT 侧说成功但没给 intent
-        if str(confirmed.get("status") or "") in {"succeeded", "success", "complete", "completed"}:
-            out.state = "paid"
-            return out
-
         out.state = "unknown"
         out.message = out.message or f"未预期的确认结果：{state or pi_status or '空'}"
         return out
 
     # ── 便捷入口 ──────────────────────────────────────────
     def pay_from_url(self, retries: int = 3) -> PaymentOutcome:
-        """遇到代理故障（SSL/EOF/连接错误）时轮换 SID 重试。"""
-        last_exc: Optional[Exception] = None
-        for attempt in range(retries):
-            try:
-                return self.pay()
-            except DomainError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                msg = str(exc)
-                if not any(k in msg for k in ("SSL", "EOF", "ConnectError", "TLS")):
-                    raise
-                if attempt == retries - 1 or self.pin_proxy:
-                    raise
-                log(f"   代理故障（第 {attempt + 1}/{retries} 次），轮换重试")
-                self.rotate_proxy_sid()
-        raise last_exc if last_exc else DomainError(
-            ErrorCode.CHECKOUT_UPSTREAM_ERROR, "协议支付重试失败"
-        )
+        """A transport error can occur after submission; never replay the payment."""
+        return self.pay()

@@ -99,3 +99,83 @@ def test_custom_cs_approve_rejected_still_raises(monkeypatch: pytest.MonkeyPatch
 
 
 # Dedicated Hosted pipeline and missing context tests are in test_hosted_protocol.py.
+
+
+def test_application_block_does_not_prove_the_card_was_declined(monkeypatch):
+    client = _StubChatGPTClient()
+    _stub_factory(monkeypatch, client)
+    blocked = {"status": "blocked", "message": "本次扣款尚未确认"}
+    monkeypatch.setattr(client, "confirm_checkout", lambda **_: blocked)
+    monkeypatch.setattr(client, "finalize_stripe_custom_checkout", lambda **_: blocked)
+    assert _pay(plan="plus").status is PaymentStatus.ERROR
+
+
+@pytest.mark.parametrize("error, expected", [
+    ({"code": "api_error", "type": "api_error", "message": "未扣款"}, PaymentStatus.ERROR),
+    ({"code": "card_declined", "decline_code": "insufficient_funds"}, PaymentStatus.DECLINED),
+])
+def test_only_financial_error_evidence_can_decline_the_intent(error, expected):
+    from gss_payment.adapter import hosted_payment_result
+
+    payload = {"payment_intent": {"id": "pi_fixture", "last_payment_error": error}}
+    assert hosted_payment_result(payload, "cs_fixture").status is expected
+
+
+@pytest.mark.parametrize("field", ["state", "status", "payment_object_status"])
+def test_expired_checkout_without_payment_evidence_is_inconclusive(field):
+    from gss_payment.adapter import hosted_payment_result
+
+    assert hosted_payment_result({field: "expired"}, "cs_fixture").status is PaymentStatus.ERROR
+
+
+
+def test_internal_approval_error_does_not_repeat_confirmation(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    client = _StubChatGPTClient()
+    _stub_factory(monkeypatch, client)
+    payload = {"submission_attempt": {"state": "failed", "error": {"code": "checkout_approval_internal_error"}}}
+    confirm = Mock(return_value=payload)
+    finalize = Mock(return_value=payload)
+    monkeypatch.setattr(client, "confirm_checkout", confirm)
+    monkeypatch.setattr(client, "finalize_stripe_custom_checkout", finalize)
+    try:
+        with pytest.raises(DomainError) as error:
+            _pay(plan="plus")
+    finally:
+        # A missing intent in a truncated response is not proof that no money moved.
+        confirm.assert_called_once()
+    assert error.value.code is ErrorCode.PAYMENT_UNKNOWN_STATE
+    finalize.assert_not_called()
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"mode": "setup", "state": "succeeded", "payment_object_status": "succeeded",
+      "setup_intent": {"id": "seti_fixture", "status": "succeeded"}}, PaymentStatus.PROCESSING),
+    ({"setup_intent": {"id": "seti_fixture", "status": "succeeded"}}, PaymentStatus.PROCESSING),
+    ({"status": "complete", "payment_status": "unpaid"}, PaymentStatus.PROCESSING),
+    ({"payment_status": "paid", "mode": "subscription"}, PaymentStatus.SUCCEEDED),
+    ({"payment_intent": {"id": "pi_fixture", "status": "succeeded"}}, PaymentStatus.SUCCEEDED),
+])
+def test_hosted_success_requires_payment_evidence(payload, expected) -> None:
+    from gss_payment.adapter import hosted_payment_result
+
+    assert hosted_payment_result(payload, "cs_test_fixture").status is expected
+
+
+@pytest.mark.parametrize("payload", [
+    {"status": "complete", "submission_attempt": {"state": "succeeded"}},
+    {"status": "success", "payment_intent": {"id": "pi_1", "client_secret": "pi_1_secret_x"}},
+])
+def test_custom_confirmation_without_payment_evidence_is_not_resubmitted(monkeypatch, payload) -> None:
+    from unittest.mock import Mock
+
+    client = _StubChatGPTClient()
+    _stub_factory(monkeypatch, client)
+    monkeypatch.setattr(client, "confirm_checkout", lambda **_: payload)
+    monkeypatch.setattr(client, "finalize_stripe_custom_checkout", lambda **_: payload)
+    repeat = Mock(return_value={"status": "succeeded"})
+    monkeypatch.setattr(client, "confirm_stripe_intent", repeat, raising=False)
+    result = _pay(plan="plus")
+    repeat.assert_not_called()
+    assert result.status in {PaymentStatus.PROCESSING, PaymentStatus.ERROR}

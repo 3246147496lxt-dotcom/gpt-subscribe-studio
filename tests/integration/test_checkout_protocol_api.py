@@ -255,6 +255,25 @@ def test_unknown_financial_response_is_read_only_and_not_replayed(flow, lost):
     assert before == {n: names(flow).count(n) for n in before}
 
 
+@pytest.mark.parametrize("message", ["subscription_limit", "部分系统报告未扣款"])
+def test_ambiguous_payment_message_is_not_a_decline_or_permission_to_retry(flow, monkeypatch, message):
+    calls = []
+    def observe(*args, read_only=False, **kwargs):
+        calls.append(read_only)
+        if read_only:
+            # A stale pre-payment snapshot cannot reopen the order.
+            return {"state": "pending", "stage": "checkout", "message": "等待确认"}
+        return {"state": "unknown", "stage": "payment", "message": message}
+
+    monkeypatch.setattr("gss_api.routers.protocol_cards._run", observe)
+    for result in [post(flow), get(flow), post(flow)]:
+        assert result["order"]["status"] == "unknown"
+        assert result["order"]["payment_status"] == "processing"
+        assert result["state"] == "unknown"
+        assert result["message"] == result["order"]["status_summary"] == "扣款结果待核对，请勿重复支付"
+    assert calls.count(False) == 1
+
+
 @pytest.mark.parametrize("status,state", [(400, "integration_error"), (403, "integration_error"), (402, "card_declined"), (500, "unknown")])
 def test_real_token_rejection_is_exposed_and_never_replayed(flow, status, state):
     flow.state.update(token_http=status, token_error={"code": "card_declined", "decline_code": "insufficient_funds",
@@ -272,7 +291,9 @@ def test_pi_status_never_becomes_fake_success(flow, status, state):
     result = post(flow)
     assert result["state"] == state
     assert result["order"]["status"] != "delivered"
-    if status == "requires_payment_method": assert result["decline_code"] == "insufficient_funds"
+    if status == "requires_payment_method":
+        assert result["decline_code"] == "insufficient_funds"
+        assert result["order"]["payment_status"] == result["order"]["status"] == "failed"
     if status == "requires_action": assert result["next_action"] == {"type": "use_stripe_sdk"}
     before = names(flow).count("pi_confirm")
     get(flow)

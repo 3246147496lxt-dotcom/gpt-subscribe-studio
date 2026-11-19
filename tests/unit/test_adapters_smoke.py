@@ -136,3 +136,25 @@ def test_fake_account_reports_inactive_when_configured() -> None:
     assert info.active is False
     assert info.expires_at is None
     assert fake.sessions_seen == ["s"]
+
+
+@pytest.mark.parametrize(("status", "expiry", "expected"), [
+    (None, None, False),
+    ("canceled", None, False),
+    ("paid", None, False),  # payment alone is not an activated subscription
+    ("active", "2001-01-01T00:00:00Z", False),
+    ("active", "unknown", False),
+    ("active", None, True),
+    ("trialing", "2099-01-01T00:00:00Z", True),
+])
+def test_team_entitlement_needs_current_active_status(monkeypatch, status, expiry, expected):
+    from types import SimpleNamespace
+    from gss_account import adapter
+
+    subscription = {"plan": "team", "status": status, "expires_at": expiry}
+    client = SimpleNamespace(subscription_payload=lambda: {"subscription": subscription}, close=lambda: None)
+    monkeypatch.setattr(adapter, "configured_proxy", lambda *args: None)
+    monkeypatch.setattr(adapter.ChatGPTClient, "from_raw_session", lambda *args, **kwargs: client)
+    info = asyncio.run(UpstreamAccountAdapter().subscription_status("fixture"))
+    assert info.raw_kind == "team"
+    assert info.active is expected

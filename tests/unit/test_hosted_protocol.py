@@ -92,9 +92,9 @@ def test_hosted_confirm_exact_fields_then_get_poll():
     assert http.calls[-1][0] == "GET" and http.calls[-1][2] == {"key": "pk_test_fixture"}
 
 
-def test_recorded_top_level_success_without_payment_intent_is_success():
+def test_hosted_session_completion_without_evidence_of_payment_remains_pending():
     result = hosted_payment_result(fields("poll"), "cs_test_fixture")
-    assert result.status is PaymentStatus.SUCCEEDED
+    assert result.status is PaymentStatus.PROCESSING
 
 
 def test_recorded_challenge_is_stripe_verification_not_bank_3ds():

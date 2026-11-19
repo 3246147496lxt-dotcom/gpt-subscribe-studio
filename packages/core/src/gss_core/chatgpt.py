@@ -1450,36 +1450,13 @@ class ChatGPTClient:
         if save_choice is not None:
             confirm_body["save_payment_method_for_reuse"] = "true" if save_choice else "false"
 
-        def _post_confirm() -> Any:
-            return self.http.post(
-                f"{APP_BASE}/backend-api/payments/checkout/confirm",
-                json=confirm_body,
-                headers=self._route_headers("/backend-api/payments/checkout/confirm", page_url=page_url),
-                timeout=self.timeout,
-            )
-
-        response = _post_confirm()
-        # 会话可能要求新卡显式给出保存选择（官方前端抓包带 save_payment_method_for_reuse）。
-        # 上游有两种措辞：
-        #   new_card_save_choice_required  —— 缺字段
-        #   Card save choice does not match —— 值不对
-        # 普通会话带这个字段反而会被拒，所以只在上游明确要求时补发。
-        # 400 校验失败发生在扣款之前，重发是安全的。
-        def _needs_save_choice(resp: Any) -> bool:
-            if int(getattr(resp, "status_code", 0) or 0) != 400:
-                return False
-            text = str(getattr(resp, "text", "") or "").lower()
-            return "save_choice" in text or "save choice" in text
-
-        if _needs_save_choice(response) and save_choice is None:
-            for choice in (True, False):
-                logger.info(
-                    "checkout_confirm 要求保存选择，save_payment_method_for_reuse=%s 重试", choice
-                )
-                confirm_body["save_payment_method_for_reuse"] = "true" if choice else "false"
-                response = _post_confirm()
-                if not _needs_save_choice(response):
-                    break
+        # A validation message is not evidence that the submitted request had no effect.
+        response = self.http.post(
+            f"{APP_BASE}/backend-api/payments/checkout/confirm",
+            json=confirm_body,
+            headers=self._route_headers("/backend-api/payments/checkout/confirm", page_url=page_url),
+            timeout=self.timeout,
+        )
         if int(getattr(response, "status_code", 0) or 0) >= 400:
             self._raise(ErrorCode.PAYMENT_UNKNOWN_STATE, response, "确认结账")
         payload = _json(response)
@@ -2429,7 +2406,7 @@ def _raise_stripe(payload: Dict[str, Any], status: int) -> None:
             ErrorCode.PAYMENT_UNKNOWN_STATE,
             "Stripe 确认缺少应付金额。请重新创建结账后再确认。",
         )
-    if status == 402 or code == "card_declined" or decline:
+    if code == "card_declined" or decline:
         detail = decline or code or message
         raise DomainError(ErrorCode.PAYMENT_DECLINED, decline_message(redact_sensitive(detail)))
     raise DomainError(ErrorCode.PAYMENT_UNKNOWN_STATE, redact_sensitive(message))

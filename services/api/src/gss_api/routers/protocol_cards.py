@@ -25,6 +25,7 @@ from ..schemas import BillingIn, CardIn
 from ..store import store
 from .events import notify_order_update
 from .orders import (
+    PAID_AWAITING_ENTITLEMENT, PAYMENT_UNCONFIRMED,
     _error, _mark_delivered, _receipt_for, _set_delivery_status,
     _set_payment_status, _team_locks, _to_out,
 )
@@ -133,6 +134,11 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
         })
         view.protocol_saved_result = result
         return {**result, "order": _to_out(order)}
+    if (order.status is OrderStatus.UNKNOWN and not payment_succeeded
+            and (result["stage"], result["state"]) != ("payment", "card_declined")):
+        # A stale/incomplete observation cannot re-open an ambiguous financial attempt.
+        result.update(stage="payment", state="unknown", message=PAYMENT_UNCONFIRMED)
+        result.pop("next_action", None)
     if result["stage"] == "checkout" and result["state"] == "pending":
         store.update_status(order.id, OrderStatus.AWAITING_PAYMENT)
     if payment_succeeded:
@@ -160,7 +166,7 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
             if order.status in {OrderStatus.AWAITING_PAYMENT, OrderStatus.REQUIRES_ACTION, OrderStatus.UNKNOWN}:
                 store.update_status(order.id, OrderStatus.PAYING)
             store.update_status(order.id, OrderStatus.VERIFYING)
-            _set_delivery_status(order.id, "verify_delayed", "扣款成功，订阅核验延迟，可点击重新核验")
+            _set_delivery_status(order.id, "verify_delayed", PAID_AWAITING_ENTITLEMENT)
             result["state"] = "pending"
             result["message"] = view.status_summary
     elif result["stage"] == "payment":
@@ -172,13 +178,9 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
             _set_payment_status(order.id, "processing", summary=result.get("message") or "支付需要继续验证")
             store.update_status(order.id, OrderStatus.REQUIRES_ACTION)
         elif state == "unknown":
-            message = str(result.get("message") or "")
-            if "subscription_limit" in message or "未扣款" in message:
-                _set_payment_status(order.id, "failed", summary=message or "未扣款")
-                store.update_status(order.id, OrderStatus.FAILED)
-            else:
-                _set_payment_status(order.id, "processing", summary="支付结果待核实，可点击重新核验")
-                store.update_status(order.id, OrderStatus.UNKNOWN)
+            result["message"] = PAYMENT_UNCONFIRMED
+            _set_payment_status(order.id, "processing", summary=PAYMENT_UNCONFIRMED)
+            store.update_status(order.id, OrderStatus.UNKNOWN)
         elif context.get("app_confirmation_started"):
             _set_payment_status(order.id, "processing")
             store.update_status(order.id, OrderStatus.PAYING)
@@ -210,11 +212,12 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
         # Validate the quote before creating or mutating a binding context.
         order = store.get_order(order_id)
         view = store.view(order_id)
-        if view.payment_status == "succeeded":
-            # 已扣款：禁止二次提交卡；只允许只读重读结账/订阅并返回回执。
+        if view.payment_status == "succeeded" or order.status is OrderStatus.UNKNOWN:
+            # 无论凭证/上下文是否仍在，只允许查询原付款，不再传入卡资料。
+            unknown = view.payment_status != "succeeded"
             secrets = vault.get(order_id)
             context = secrets.saved_card_context if secrets is not None else None
-            if secrets is not None and context:
+            if secrets is not None and context and context.get("protocol_kind") == "checkout_v2":
                 try:
                     result = await asyncio.to_thread(
                         _run, secrets, context, _spec(order, view, secrets), read_only=True
@@ -223,11 +226,11 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
                 except HTTPException:
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("bind_recheck_failed id=%s error=%s", order_id, str(exc)[:160])
+                    logger.warning("bind_recheck_failed id=%s type=%s", order_id, type(exc).__name__)
             return {
-                "state": "paid" if view.delivery_status == "delivered" else "pending",
+                "state": "unknown" if unknown else ("paid" if view.delivery_status == "delivered" else "pending"),
                 "stage": "payment",
-                "message": view.status_summary,
+                "message": PAYMENT_UNCONFIRMED if unknown else view.status_summary,
                 "payment_status": view.payment_status,
                 "delivery_status": view.delivery_status,
                 "payment_intent_id": view.payment_intent_id,
@@ -257,7 +260,14 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
         context["protocol_billing"] = billing
         secrets.billing = billing
         view.billing = dict(billing)
-        result = await asyncio.to_thread(_run, secrets, context, _spec(order, view, secrets, payload), card=card, billing=billing)
+        try:
+            result = await asyncio.to_thread(_run, secrets, context, _spec(order, view, secrets, payload), card=card, billing=billing)
+        except asyncio.CancelledError:
+            # The worker can still complete after the HTTP request is cancelled.
+            await _apply(order, secrets, view, context, {"stage": "payment", "state": "unknown"})
+            raise
+        except Exception:  # A missing response is not evidence that the worker did not charge.
+            result = {"stage": "payment", "state": "unknown"}
         return await _apply(order, secrets, view, context, result)
 
 

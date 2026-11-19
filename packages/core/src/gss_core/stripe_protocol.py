@@ -815,127 +815,61 @@ class StripeProtocol:
     def classify(confirm: dict[str, Any], poll: dict[str, Any] | None) -> PaymentOutcome:
         out = PaymentOutcome()
 
+        session_paid = False
+        setup_only = False
+
         def scan(obj: Any) -> None:
+            nonlocal session_paid, setup_only
             if not isinstance(obj, dict):
                 return
-            # verify_challenge / confirm 可能把 last_payment_error 放在顶层
-            top_err = obj.get("last_payment_error") or obj.get("last_setup_error") or {}
-            if top_err and isinstance(top_err, dict):
-                out.code = out.code or top_err.get("code")
-                out.decline_code = out.decline_code or top_err.get("decline_code")
-                out.message = out.message or str(top_err.get("message") or "")[:200]
-                if top_err.get("charge"):
-                    out.charge_id = out.charge_id or top_err["charge"]
-                tmpp = top_err.get("payment_method") or {}
-                if tmpp.get("id"):
-                    out.payment_method_id = out.payment_method_id or tmpp["id"]
-            if obj.get("status") and not out.intent_status:
-                out.intent_status = obj["status"]
-            for holder in ("payment_intent", "setup_intent"):
-                sub = obj.get(holder)
-                if isinstance(sub, dict):
-                    if sub.get("status"):
-                        out.intent_status = sub["status"]
-                    err = sub.get("last_payment_error") or sub.get("last_setup_error") or {}
-                    if err:
-                        out.code = err.get("code") or out.code
-                        out.decline_code = err.get("decline_code") or out.decline_code
-                        out.message = (err.get("message") or out.message or "")[:200]
-                        if err.get("charge"):
-                            out.charge_id = err["charge"]
-                        pm = err.get("payment_method") or {}
-                        if pm.get("id"):
-                            out.payment_method_id = pm["id"]
-            err = obj.get("error")
-            if isinstance(err, dict):
-                out.code = out.code or err.get("code")
-                out.decline_code = out.decline_code or err.get("decline_code")
-                out.message = out.message or str(err.get("message") or "")[:200]
-                if err.get("charge"):
-                    out.charge_id = out.charge_id or err["charge"]
-                pm = err.get("payment_method") or {}
-                if pm.get("id"):
-                    out.payment_method_id = out.payment_method_id or pm["id"]
+            if obj.get("mode") == "setup" or obj.get("object") == "setup_intent" or (
+                obj.get("setup_intent") and not obj.get("payment_intent")
+            ):
+                setup_only = True
+            if obj.get("payment_status") is not None:
+                session_paid = obj["payment_status"] == "paid"
+            intent = obj.get("payment_intent")
+            if obj.get("object") == "payment_intent" or str(obj.get("id") or "").startswith("pi_"):
+                intent = obj
+            if not isinstance(intent, dict):
+                intent = {}
+            if intent.get("status"):
+                out.intent_status = intent["status"]
+                out.intent_id = intent.get("id") or out.intent_id
+            for err in (obj.get("error"), obj.get("last_payment_error"), intent.get("last_payment_error")):
+                if not isinstance(err, dict):
+                    continue
+                out.code = err.get("code") or out.code
+                out.decline_code = err.get("decline_code") or out.decline_code
+                out.message = str(err.get("message") or out.message or "")[:200]
+                out.charge_id = err.get("charge") or out.charge_id
+                pm = err.get("payment_method")
+                if isinstance(pm, dict):
+                    out.payment_method_id = pm.get("id") or out.payment_method_id
 
-        scan(confirm.get("body") if confirm else None)
+        scan((confirm or {}).get("body"))
         scan(poll)
-
-        status = (out.intent_status or "").lower()
-        # confirm 阶段的参数级错误（缺邮箱、config 过期等）不是拒卡，
-        # 单列一个 state，否则会被误当成「已到发卡行」。
-        confirm_status = int((confirm or {}).get("status") or 0)
-        if status in ("succeeded", "requires_capture"):
+        status = out.intent_status
+        if not setup_only and (session_paid or status == "succeeded"):
             out.state = "paid"
-        elif out.code == "checkout_confirm_error" or confirm_status == 400:
+        elif out.decline_code or out.code == "card_declined":
+            out.state = "card_declined"
+        elif out.code == "checkout_confirm_error" or (confirm or {}).get("status") == 400:
             out.state = "confirm_error"
-        elif out.decline_code or out.code:
-            if "captcha" in (out.message or "").lower():
-                out.state = "captcha_rejected"
-            else:
-                out.state = "card_declined"
+        elif status in ("processing", "requires_capture"):
+            out.state = "pending"
         elif status == "requires_action":
             out.state = "challenge_required"
-        elif (poll or {}).get("state") in ("failed",):
-            out.state = "card_declined"
-        elif (poll or {}).get("state") == "succeeded":
-            out.state = "paid"
         out.raw = {"confirm": confirm, "poll": poll}
         return out
 
     # ── 主流程 ─────────────────────────────────────────────
-    def _create_new_order(self) -> str:
-        """通过 order_factory 创建新订单，返回新的 checkout_url。"""
-        if not self.order_factory:
-            return ""
-        try:
-            return self.order_factory() or ""
-        except Exception as e:
-            log(f"   建单失败: {str(e)[:80]}")
-            return ""
-
     def pay_from_url(self, checkout_url: str, retries: int = 0) -> PaymentOutcome:
-        """从 checkout URL 解析 cs_id 后支付。
-
-        retries > 0 时，遇到 captcha_rejected 会重新建单重试。
-        """
+        """Submit at most once. The legacy retries parameter does not replay payments."""
         m = re.search(r"(cs_(?:live|test)_[A-Za-z0-9]+)", checkout_url or "")
         if not m:
             raise ValueError(f"URL 里没有 cs_live_: {str(checkout_url)[:100]}")
-        cs_id = m.group(1)
-
-        # 首次执行，遇到代理故障自动轮换重试
-        last_exc = None
-        outcome = None
-        for proxy_try in range(3):
-            try:
-                outcome = self.pay(cs_id)
-                break
-            except Exception as e:
-                last_exc = e
-                msg = str(e)
-                if "SSL" in msg or "ConnectError" in msg or "EOF" in msg:
-                    if self.pin_proxy:
-                        raise
-                    self.rotate_proxy_sid()
-                    self._client = None
-                    time.sleep(2)
-                    continue
-                raise
-        if outcome is None:
-            raise last_exc if last_exc else RuntimeError("pay 失败")
-
-        for attempt in range(retries):
-            if outcome.state in ("paid", "card_declined"):
-                break
-            log(f"   重试 {attempt + 1}/{retries}（上次 {outcome.state}）")
-            new_url = self._create_new_order() if self.order_factory else ""
-            if new_url:
-                mm = re.search(r"(cs_(?:live|test)_[A-Za-z0-9]+)", new_url)
-                if mm:
-                    cs_id = mm.group(1)
-            time.sleep(random.uniform(5, 12))
-            outcome = self.pay(cs_id)
-        return outcome
+        return self.pay(m.group(1))
 
     def pay(self, cs_id: str) -> PaymentOutcome:
         """按真实浏览器的时间线执行。
