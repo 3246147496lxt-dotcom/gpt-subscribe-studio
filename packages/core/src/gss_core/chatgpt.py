@@ -827,10 +827,16 @@ class ChatGPTClient:
             endpoints += ((ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),)
         for path, params in endpoints:
             try:
+                # Do not rely on the HTTP session's cached headers: after a
+                # cross-country refresh they can still hold the previous
+                # Bearer/Cookie. Build the account request from the live
+                # client fields so /me always uses the just-issued credentials.
+                headers = self._route_headers(path)
+                headers.update(self._identity_headers())
                 response = self.http.get(
                     f"{APP_BASE}{path}",
                     params=params,
-                    headers=self._route_headers(path),
+                    headers=headers,
                     timeout=self.timeout,
                 )
             except Exception as exc:  # noqa: BLE001
