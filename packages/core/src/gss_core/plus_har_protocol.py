@@ -169,7 +169,7 @@ class PlusHarProtocol:
         billing: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
         currency: str = "USD",
-        timeout: float = 120.0,
+        timeout: float = 22.0,
         profile: Optional[Dict[str, Any]] = None,
         customer_session_client_secret: str = "",
         hcaptcha_token: str = "",
@@ -832,6 +832,27 @@ class PlusHarProtocol:
         return token
 
     # ── 5. confirm ─────────────────────────────────────────────────
+    def _reset_web_session(self) -> None:
+        """Drop a possibly half-dead checkout TCP/TLS tunnel before confirm.
+
+        Proxy, cookies, device identity and fingerprint stay identical; only the
+        connection is re-established so a stale keep-alive cannot hang confirm.
+        """
+        if self._web is not None:
+            try:
+                self._web.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._web = None
+
+    def _reset_stripe_session(self) -> None:
+        if self._stripe is not None:
+            try:
+                self._stripe.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._stripe = None
+
     def _app_confirm(self) -> Dict[str, Any]:
         body = {
             "checkout_session_id": self.checkout_id,
@@ -839,10 +860,33 @@ class PlusHarProtocol:
             "confirm_token": self.ctoken,
             "selected_payment_method_type": "card",
         }
-        response = self._app("POST", "/backend-api/payments/checkout/confirm", json_body=body,
-                             telemetry=oai_telemetry_header((time.time() - self.t0) * 1000))
+        self._reset_web_session()
+        started = time.monotonic()
+        logger.info(
+            "plus_har_confirm_start route=/backend-api/payments/checkout/confirm "
+            "timeout=%.1f checkout=%s ctoken=%s",
+            self.timeout, self.checkout_id[:14], bool(self.ctoken),
+        )
+        try:
+            response = self._app("POST", "/backend-api/payments/checkout/confirm", json_body=body,
+                                 telemetry=oai_telemetry_header((time.time() - self.t0) * 1000))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "plus_har_confirm_transport_error elapsed=%.2f type=%s",
+                time.monotonic() - started, type(exc).__name__,
+            )
+            raise
         payload = _json(response)
         status = int(getattr(response, "status_code", 0) or 0)
+        logger.info(
+            "plus_har_confirm_response status=%s elapsed=%.2f payload_status=%s "
+            "next_action=%s error_code=%s",
+            status, time.monotonic() - started,
+            str(payload.get("status") or "")[:40] if isinstance(payload, dict) else "-",
+            str((payload.get("next_action") or {}).get("type") or "-")[:40]
+            if isinstance(payload, dict) and isinstance(payload.get("next_action"), dict) else "-",
+            str(_stripe_error(payload).get("code") or "-")[:60] if isinstance(payload, dict) else "-",
+        )
         self.raw["confirm"] = payload
         if status >= 400:
             self.last_error = _stripe_error(payload)
@@ -885,10 +929,23 @@ class PlusHarProtocol:
             "client_attribution_metadata[merchant_integration_source]": "l1",
             "client_secret": self.intent_secret,
         }
-        response = self._stripe_session().post(
-            f"{STRIPE_BASE}/v1/{kind}/{self.intent_id}/confirm",
-            content=urlencode(form), timeout=self.timeout,
+        self._reset_stripe_session()
+        started = time.monotonic()
+        logger.info(
+            "plus_har_intent_confirm_start kind=%s intent=%s timeout=%.1f",
+            kind, self.intent_id[:14], self.timeout,
         )
+        try:
+            response = self._stripe_session().post(
+                f"{STRIPE_BASE}/v1/{kind}/{self.intent_id}/confirm",
+                content=urlencode(form), timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "plus_har_intent_confirm_transport_error elapsed=%.2f type=%s",
+                time.monotonic() - started, type(exc).__name__,
+            )
+            raise
         payload: Dict[str, Any] = {}
         if getattr(response, "content", b""):
             try:
@@ -896,6 +953,16 @@ class PlusHarProtocol:
             except Exception:  # noqa: BLE001
                 payload = {}
         self.raw["intent"] = payload
+        logger.info(
+            "plus_har_intent_confirm_response status=%s elapsed=%.2f intent_status=%s "
+            "next_action=%s error_code=%s",
+            int(getattr(response, "status_code", 0) or 0),
+            time.monotonic() - started,
+            str(payload.get("status") or "")[:40] if isinstance(payload, dict) else "-",
+            str((payload.get("next_action") or {}).get("type") or "-")[:40]
+            if isinstance(payload, dict) and isinstance(payload.get("next_action"), dict) else "-",
+            str(_stripe_error(payload).get("code") or "-")[:60] if isinstance(payload, dict) else "-",
+        )
         if int(getattr(response, "status_code", 0) or 0) >= 400:
             self.last_error = _stripe_error(payload)
         return payload
@@ -1027,6 +1094,10 @@ class PlusHarProtocol:
         self.stage = "payment"
         status = str(page.get("status") or "")
         payment_status = str(page.get("payment_status") or "")
+        logger.info(
+            "plus_har_settle status=%s payment_status=%s intent_status=%s",
+            status or "-", payment_status or "-", intent_status or "-",
+        )
         if status == "complete" and payment_status in {"paid", "no_payment_required"}:
             if not self._bound_page(page):
                 out.message = "回执与原结账或报价未匹配，不能确认扣款"
@@ -1072,6 +1143,7 @@ class PlusHarProtocol:
             out.state = "challenge_required"
             out.intent_status = intent_status
             out.message = "Stripe 要求继续验证，纯协议停在 requires_action"
+            logger.info("plus_har_settle_requires_action intent=%s", self.intent_id[:14])
             return out
         out.state = "unknown"
         out.intent_status = intent_status or None

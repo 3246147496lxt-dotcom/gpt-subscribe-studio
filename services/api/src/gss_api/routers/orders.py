@@ -692,14 +692,13 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             if cross_country:
                 # Human-like pause after the session refresh, then load the
                 # account shell endpoints before opening the checkout modal.
-                await asyncio.sleep(random.uniform(1.5, 3.5))
+                await asyncio.sleep(random.uniform(1.0, 1.5))
                 try:
                     await asyncio.to_thread(client.warm_account)
                 except DomainError as exc:
                     raise _from_domain(exc, session_reissued=True, nonteam=plan is not Plan.TEAM)
                 except Exception:
                     logger.warning("warm_account_failed_continue")
-                await asyncio.sleep(random.uniform(1.5, 3.5))
                 raw_session = _session_json(client, exit_country)
                 item.session = raw_session
                 item.user_agent = client.user_agent

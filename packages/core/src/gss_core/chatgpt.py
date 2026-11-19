@@ -813,18 +813,18 @@ class ChatGPTClient:
             self.attestation = attestation
         self._merge_cookies()
 
-    def warm_account(self) -> None:
-        """Fetch the normal account bootstrap endpoints before checkout.
+    def warm_account(self, *, full: bool = False) -> None:
+        """Fetch the normal account bootstrap endpoint before checkout.
 
-        This is deliberately separate from ``hydrate()``: account_id is usually
-        already present in the JWT, but a real browser still opens the account
-        shell and receives risk cookies before the pricing modal.
+        Default is the single lightweight /backend-api/me call. ``full=True``
+        adds the HTML shell and accounts/check for diagnostics, but costs extra
+        latency and is not used in the order hot path.
         """
-        self.warmup()
-        endpoints = (
-            ("/backend-api/me", None),
-            (ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),
-        )
+        if full:
+            self.warmup()
+        endpoints = (("/backend-api/me", None),)
+        if full:
+            endpoints += ((ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),)
         for path, params in endpoints:
             try:
                 response = self.http.get(
