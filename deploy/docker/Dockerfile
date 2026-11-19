@@ -41,7 +41,8 @@ ENV NODE_PATH=/app/node_modules
 
 # 依赖层单独缓存：requirements 不变时不会重装
 COPY deploy/server/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt \
+ && python -m playwright install --with-deps chromium
 
 # 代码：packages 与 services 都是「src 布局」，靠 PYTHONPATH 暴露
 COPY packages/ /app/packages/
