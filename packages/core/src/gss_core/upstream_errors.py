@@ -53,6 +53,13 @@ def classify_upstream_failure(
         code = UpstreamFailureCode.UNUSUAL_ACTIVITY
     elif status == 403 and ("sentinel" in text or "challenge" in text or "安全验证" in text):
         code = UpstreamFailureCode.SENTINEL_CHALLENGE_FAILED
+    elif "insufficient_funds" in text or "insufficient funds" in text or "余额不足" in text:
+        code = UpstreamFailureCode.INSUFFICIENT_FUNDS
+    elif any(token in text for token in (
+            "card_declined", "card was declined", "card's balance",
+            "card_velocity_exceeded", "do_not_honor", "generic_decline",
+            "pickup_card", "发卡行拒付", "卡片被拒")):
+        code = UpstreamFailureCode.CARD_DECLINED
     elif "subscription_limit" in text or "subscription limit" in text:
         code = UpstreamFailureCode.SUBSCRIPTION_LIMIT
     elif "billing_country" in text or "billing country" in text:

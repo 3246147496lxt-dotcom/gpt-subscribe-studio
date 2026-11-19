@@ -30,3 +30,15 @@ def test_billing_country_and_unknown():
 def test_unusual_activity_without_http_status():
     result = classify_upstream_failure(status=None, body="ChatGPT 判定异常流量")
     assert result.code is UpstreamFailureCode.UNUSUAL_ACTIVITY
+
+
+def test_insufficient_funds_and_card_declined():
+    assert classify_upstream_failure(
+        status=402, body='{"code":"insufficient_funds"}'
+    ).code is UpstreamFailureCode.INSUFFICIENT_FUNDS
+    assert classify_upstream_failure(
+        status=402, body='{"code":"card_declined","decline_code":"card_velocity_exceeded"}'
+    ).code is UpstreamFailureCode.CARD_DECLINED
+    assert classify_upstream_failure(
+        status=402, body="Your card's balance, credit limit, or transaction amount limit was exceeded"
+    ).code is UpstreamFailureCode.CARD_DECLINED

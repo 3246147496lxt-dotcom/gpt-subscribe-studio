@@ -530,6 +530,8 @@ POST /api/settings/proxies/checkout/test
 | `upstream_timeout` | 上游超时 | 先查订单，不要重复扣款 |
 | `billing_country_mismatch` | 出口与账单国家不兼容 | 使用匹配账单或允许的 split 配置 |
 | `browser_decode_unavailable` | Route C 浏览器解码不可用 | 安装 Playwright/Chromium 或回退 A |
+| `insufficient_funds` | 卡片余额不足 | 提示运营充值/换卡 |
+| `card_declined` | 发卡行拒付或卡限额 | 换卡或等待冷却 |
 | `unknown_upstream` | 未分类上游失败 | 记录 request id 后排查 |
 
 业务错误：

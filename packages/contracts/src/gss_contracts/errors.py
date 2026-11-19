@@ -43,6 +43,9 @@ class UpstreamFailureCode(StrEnum):
     UPSTREAM_TIMEOUT = "upstream_timeout"
     BILLING_COUNTRY_MISMATCH = "billing_country_mismatch"
     BROWSER_DECODE_UNAVAILABLE = "browser_decode_unavailable"
+    SUBSCRIPTION_LIMIT = "subscription_limit"
+    INSUFFICIENT_FUNDS = "insufficient_funds"
+    CARD_DECLINED = "card_declined"
     UNKNOWN_UPSTREAM = "unknown_upstream"
 
 
