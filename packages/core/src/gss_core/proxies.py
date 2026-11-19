@@ -261,6 +261,7 @@ def preflight_proxy(
     *,
     probes: int = 2,
     interval_s: float = 1.0,
+    step_delay_s: float = 0.4,
     timeout_s: float = 10.0,
 ) -> tuple[bool, str]:
     """Verify a proxy is sticky and exits in the expected country.
@@ -300,6 +301,11 @@ def preflight_proxy(
                 if seen and ip != seen[0]:
                     return False, f"出口 IP 不粘: {seen[0]} -> {ip}"
                 seen.append(ip)
+                # 供应商对连续 CONNECT 很敏感；IP 探测后稍等再查国家，
+                # 否则第二个请求常被网关直接回 404。
+                if step_delay_s > 0:
+                    import time
+                    time.sleep(step_delay_s)
                 country_response = client.get(country_url.format(ip=quote(ip, safe="")))
                 country_response.raise_for_status()
                 country_payload = country_response.json()
