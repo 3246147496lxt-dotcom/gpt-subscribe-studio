@@ -813,6 +813,40 @@ class ChatGPTClient:
             self.attestation = attestation
         self._merge_cookies()
 
+    def warm_account(self) -> None:
+        """Fetch the normal account bootstrap endpoints before checkout.
+
+        This is deliberately separate from ``hydrate()``: account_id is usually
+        already present in the JWT, but a real browser still opens the account
+        shell and receives risk cookies before the pricing modal.
+        """
+        self.warmup()
+        endpoints = (
+            ("/backend-api/me", None),
+            (ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),
+        )
+        for path, params in endpoints:
+            try:
+                response = self.http.get(
+                    f"{APP_BASE}{path}",
+                    params=params,
+                    headers=self._route_headers(path),
+                    timeout=self.timeout,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("warmup request failed path=%s error=%s", path, type(exc).__name__)
+                continue
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status == 401:
+                _log_upstream_failure(path, response)
+                raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
+            if status >= 400:
+                _log_upstream_failure(path, response)
+                continue
+            self._merge_cookies()
+            logger.info("warmup ok path=%s status=%s", path, status)
+        self.http.headers.update(self._identity_headers())
+
     def mint_sentinel(self, *, flow: str, page_url: str = "") -> None:
         token = mint(
             flow=flow,
