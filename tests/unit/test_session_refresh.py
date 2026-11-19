@@ -160,7 +160,7 @@ class _StubCheckoutClient:
         self.calls.append("close")
 
 
-def test_checkout_adapter_refreshes_session_before_create(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_checkout_adapter_never_rotates_session(monkeypatch: pytest.MonkeyPatch) -> None:
     stub = _StubCheckoutClient()
 
     class _Factory:
@@ -182,8 +182,8 @@ def test_checkout_adapter_refreshes_session_before_create(monkeypatch: pytest.Mo
     )
 
     assert result.checkout_session_id == "cs_test_1"
-    # 刷新必须发生在创建结账之前；刷新失败也不阻断结账。
-    assert stub.calls.index("refresh") < stub.calls.index("create")
+    assert "refresh" not in stub.calls
+    assert stub.calls.count("create") == 1
 
 
 class _StubPaymentClient:
@@ -202,7 +202,7 @@ class _StubPaymentClient:
         raise DomainError(ErrorCode.PAYMENT_DECLINED, "declined on purpose")
 
 
-def test_payment_adapter_refreshes_session_before_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_payment_adapter_never_rotates_session(monkeypatch: pytest.MonkeyPatch) -> None:
     stub = _StubPaymentClient()
 
     class _Factory:
@@ -227,7 +227,8 @@ def test_payment_adapter_refreshes_session_before_warmup(monkeypatch: pytest.Mon
             )
         )
 
-    assert stub.calls.index("refresh") < stub.calls.index("warmup") < stub.calls.index("confirm")
+    assert "refresh" not in stub.calls
+    assert stub.calls.index("warmup") < stub.calls.index("confirm")
 
 
 def test_refresh_session_logs_upstream_status_and_body(caplog) -> None:

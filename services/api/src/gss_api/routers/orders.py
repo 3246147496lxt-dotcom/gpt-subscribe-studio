@@ -28,13 +28,13 @@ from gss_contracts import (
 )
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
-from gss_core.config import load_settings, use_fake_adapters
+from gss_core.config import ORDER_HTTP_TIMEOUT_S, load_settings, use_fake_adapters
 from gss_core.countries import is_supported, normalize_country
 from gss_core.hosted import TeamHostedClient
 from gss_core.plus_protocol import PlusProtocol
 from gss_core.plus_har_protocol import PlusHarProtocol
 from gss_core.stripe_protocol import StripeProtocol, PaymentOutcome
-from gss_core.proxies import checkout_proxy_for
+from gss_core.proxies import ProxyPreflightError, checkout_proxy_for, verify_refresh_egress
 from gss_core.redaction import redact_sensitive
 from gss_core.chatgpt import (
     ChatGPTClient,
@@ -71,6 +71,7 @@ from .events import notify_order_update
 router = APIRouter(prefix="/api", tags=["orders"])
 logger = logging.getLogger("gss.orders")
 _team_locks: dict[str, asyncio.Lock] = {}
+_creating_keys: set[str] = set()
 
 
 
@@ -123,7 +124,7 @@ def _assert_saved_card_resolved(secrets: OrderSecrets) -> None:
 
 def _verify_saved_checkout(pipeline, secrets: OrderSecrets):
     client = ChatGPTClient.from_raw_session(secrets.session, proxy=secrets.proxy or None)
-    client.timeout = 30.0
+    client.timeout = ORDER_HTTP_TIMEOUT_S
     try:
         session = verification_session(
             client,
@@ -198,7 +199,7 @@ def _set_payment_status(
         view.tax_delta = str(tax_delta)
     if plan_type:
         view.plan_type = plan_type
-    view.status_summary = summary or _default_status_summary(status, view.delivery_status)
+    view.status_summary = redact_sensitive(summary) if summary else _default_status_summary(status, view.delivery_status)
     order = store.get_order(order_id)
     if order is not None:
         view.receipt = _receipt_for(order, view)
@@ -305,72 +306,50 @@ def _to_out(order: Order) -> OrderOut:
     )
 
 
-def _error(status_code: int, code: ErrorCode, message: str) -> HTTPException:
+def _error(status_code: int, code: ErrorCode, message: str, *, session_reissued: bool = False) -> HTTPException:
     return HTTPException(
         status_code=status_code,
-        detail=ErrorOut(code=str(code), message=message).model_dump(),
+        detail=ErrorOut(
+            code=str(code),
+            message=redact_sensitive(message),
+            detail={"session_reissued_for_country": True} if session_reissued else None,
+        ).model_dump(),
     )
 
 
-def _from_domain(exc: DomainError) -> HTTPException:
+def _from_domain(exc: DomainError, *, session_reissued: bool = False) -> HTTPException:
     status_code = status.HTTP_400_BAD_REQUEST
     if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED}:
         status_code = status.HTTP_401_UNAUTHORIZED
-    return _error(status_code, exc.code, exc.message)
+    # 只报告已发生的重签发；不代表凭证已持久化，或仍可恢复。
+    message = "会话已重新签发，本次操作未完成。" if session_reissued else exc.message
+    return _error(status_code, exc.code, message, session_reissued=session_reissued)
 
 
-_PROXY_ERR_HINTS = (
-    "SSL", "EOF", "ConnectError", "Connection closed", "CurlError",
-    "TLS", "timed out", "Timeout", "reset by peer",
-)
+async def _guard_refresh_egress(proxy: str | None, country: str) -> None:
+    if use_fake_adapters():
+        # Fake adapters do not implement authentication. Never hit a real refresh
+        # endpoint just because offline mode skipped the network checks.
+        raise _error(503, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "离线模式不发送会话凭证")
+    try:
+        await asyncio.to_thread(verify_refresh_egress, proxy or "", country)
+    except ProxyPreflightError as exc:
+        logger.warning("session_preflight_aborted status=%s", exc.status_code)
+        raise _error(exc.status_code, ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                     f"{exc}；未发送会话凭证。") from None
 
 
-def _is_proxy_error(exc: Exception) -> bool:
-    return any(k in str(exc) for k in _PROXY_ERR_HINTS)
-
-
-async def _create_checkout_with_retry(pipeline, *, proxy: str, pin_proxy: bool = False,
-                                     hard_pin: bool = False, **kwargs):
-    """出口代理断连时换 SID 重试建单。
-
-    返回 (checkout, 实际使用的 proxy)。调用方必须把返回的 proxy 存进 vault，
-    否则支付会用回旧的（已失效的）出口，造成跨步骤指纹矛盾。
-    """
-    from gss_core.proxies import rotate_proxy_sid
-
-    current = proxy
-    last: Exception | None = None
-    if hard_pin:
-        # 重签发已拿到新 Token：出口 SID 进入硬锁定，连接断开直接中止，
-        # 绝不换 SID，避免 IP 跳变触发 token_revoked。
-        try:
-            return await pipeline.create_checkout(proxy=current, **kwargs), current
-        except DomainError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise DomainError(
-                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
-                f"重签发后出口连接中断，已中止且不切换 SID：{redact_sensitive(str(exc))[:160]}",
-            ) from exc
-    for attempt in range(3):
-        try:
-            checkout = await pipeline.create_checkout(proxy=current, **kwargs)
-            return checkout, current
-        except DomainError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            if not _is_proxy_error(exc):
-                raise
-            last = exc
-            if attempt == 2:
-                break
-            logger.info("checkout_proxy_retry attempt=%d pin_proxy=%s", attempt + 1, pin_proxy)
-            if not pin_proxy:
-                current = rotate_proxy_sid(current) if current else current
-            await asyncio.sleep(2)
-    raise last if last else DomainError(
-        ErrorCode.CHECKOUT_UPSTREAM_ERROR, "建单重试失败"
-    )
+async def _create_checkout_once(pipeline, *, proxy: str, **kwargs):
+    # A timeout is ambiguous: the upstream may already have accepted this POST.
+    # Do not resend it, even on the same connection.
+    try:
+        return await pipeline.create_checkout(proxy=proxy, pin_proxy=True, **kwargs)
+    except DomainError:
+        raise
+    except Exception:
+        raise DomainError(
+            ErrorCode.CHECKOUT_UPSTREAM_ERROR, "建单请求未获确认，已停止且不自动重试。",
+        ) from None
 
 
 @router.post(
@@ -383,6 +362,20 @@ async def create_order(
     payload: OrderCreateRequest,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> OrderOut:
+    # Single-process API: no await between the check and reservation. A concurrent
+    # duplicate must not spend the incoming session or start a second checkout.
+    if not idempotency_key:
+        return await _create_order(payload, None)
+    if idempotency_key in _creating_keys:
+        raise _error(409, ErrorCode.IDEMPOTENCY_CONFLICT, "同一订单正在处理，请勿重复提交。")
+    _creating_keys.add(idempotency_key)
+    try:
+        return await _create_order(payload, idempotency_key)
+    finally:
+        _creating_keys.discard(idempotency_key)
+
+
+async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None) -> OrderOut:
     existing = store.find_by_idempotency(idempotency_key)
     if existing is not None:
         return _to_out(existing)
@@ -453,148 +446,6 @@ async def create_order(
         billing_country=exit_country,
     )
 
-    def _session_json(client: ChatGPTClient, country: str) -> str:
-        return json.dumps({
-            "accessToken": client.access_token,
-            "sessionToken": client.session_token,
-            "deviceId": client.device_id,
-            "sessionId": client.oai_session_id,
-            "userAgent": client.user_agent,
-            "cookies": client.extra_cookies,
-            "statsigContext": {
-                "deviceId": client.device_id,
-                "userAgent": client.user_agent,
-                "country": country,
-            },
-        })
-
-    if original_country and original_country != exit_country and not bundle.session_token:
-        raise _error(
-            status.HTTP_401_UNAUTHORIZED,
-            ErrorCode.INVALID_SESSION,
-            "跨区充值需要完整 Session（缺少 sessionToken），请重新导出整段 session JSON",
-        )
-
-    if bundle.session_token and original_country and original_country != exit_country:
-        logger.info(
-            "session_reissue_start exit_country=%s billing_country=%s original_country=%s",
-            exit_country,
-            billing_country,
-            original_country or "-",
-        )
-        # PH 住宅节点会偶发 TLS reset / CONNECT 404；换 SID 重试，
-        # 避免一次代理抖动就把可用的 sessionToken 判死。
-        # 但每次重签发前必须先做粘性/国家预检，未测通绝不消耗 Session。
-        from gss_core.proxies import preflight_proxy, rotate_proxy_sid
-
-        last_exc: Exception | None = None
-        client = None
-        for attempt in range(3):
-            if not use_fake_adapters():
-                ok, reason = await asyncio.to_thread(
-                    preflight_proxy, exit_proxy or "", exit_country
-                )
-                logger.info(
-                    "proxy_preflight exit_country=%s attempt=%s ok=%s ip=%s reason=%s",
-                    exit_country, attempt + 1, ok,
-                    reason if ok else "-", "-" if ok else redact_sensitive(reason)[:160],
-                )
-                if not ok:
-                    if attempt == 2:
-                        raise _error(
-                            status.HTTP_401_UNAUTHORIZED,
-                            ErrorCode.INVALID_SESSION,
-                            f"PH 代理预检失败（{redact_sensitive(reason)[:120]}），未消耗 Session；请更换粘性 PH 节点后重试",
-                        )
-                    if exit_proxy:
-                        exit_proxy = rotate_proxy_sid(exit_proxy)
-                    await asyncio.sleep(1)
-                    continue
-            try:
-                client = await asyncio.to_thread(
-                    ChatGPTClient.reauthorize_for_country,
-                    raw_session,
-                    proxy=exit_proxy,
-                    country=exit_country,
-                )
-                break
-            except DomainError as exc:
-                last_exc = exc
-                retryable = "无法在目标国家" in exc.message
-                if not retryable or attempt == 2:
-                    raise _from_domain(exc)
-                logger.warning(
-                    "session_reissue_retry exit_country=%s attempt=%s error=%s",
-                    exit_country, attempt + 1, redact_sensitive(exc.message)[:160],
-                )
-                if exit_proxy:
-                    exit_proxy = rotate_proxy_sid(exit_proxy)
-                await asyncio.sleep(1)
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                logger.warning(
-                    "session_reissue_failed exit_country=%s attempt=%s error=%s",
-                    exit_country, attempt + 1, redact_sensitive(str(exc))[:200],
-                )
-                if attempt == 2:
-                    break
-                if exit_proxy:
-                    exit_proxy = rotate_proxy_sid(exit_proxy)
-                await asyncio.sleep(1)
-        if client is None:
-            raise _error(
-                status.HTTP_401_UNAUTHORIZED,
-                ErrorCode.INVALID_SESSION,
-                f"无法在出口国家 {exit_country} 重签发 Session，请检查出口代理后重试",
-            )
-        try:
-            bundle.access_token = client.access_token
-            bundle.session_token = client.session_token
-            bundle.device_id = client.device_id
-            bundle.user_agent = client.user_agent
-            bundle.oai_session_id = client.oai_session_id
-            bundle.country = exit_country
-            bundle.cookies = dict(client.extra_cookies)
-            raw_session = _session_json(client, exit_country)
-            session_reissued = True
-            logger.info(
-                "session_reissued_for_country exit_country=%s billing_country=%s original_country=%s",
-                exit_country,
-                billing_country,
-                original_country or "-",
-            )
-        finally:
-            client.close()
-    elif not bundle.access_token and bundle.session_token:
-        # 同国家、只粘贴 sessionToken：沿用原设备身份刷新一次。
-        client = ChatGPTClient.from_raw_session(raw_session, proxy=exit_proxy)
-        try:
-            refreshed = await asyncio.to_thread(client.refresh_session)
-        except Exception as exc:
-            logger.warning("session token 换取失败: %s", redact_sensitive(str(exc))[:200])
-            refreshed = False
-        try:
-            if not refreshed or not client.access_token:
-                raise _error(
-                    status.HTTP_401_UNAUTHORIZED,
-                    ErrorCode.INVALID_SESSION,
-                    "session token 已失效或无法换取 accessToken，请重新导出 session",
-                )
-            bundle.access_token = client.access_token
-            bundle.session_token = client.session_token or bundle.session_token
-            bundle.device_id = client.device_id or bundle.device_id
-            bundle.user_agent = client.user_agent or bundle.user_agent
-            bundle.oai_session_id = client.oai_session_id or bundle.oai_session_id
-            bundle.country = exit_country
-            bundle.cookies = dict(client.extra_cookies)
-            raw_session = _session_json(client, exit_country)
-            logger.info("已从 session token 换取 accessToken")
-        finally:
-            client.close()
-
-    if not bundle.access_token:
-        raise _error(status.HTTP_401_UNAUTHORIZED, ErrorCode.INVALID_SESSION, "JSON 中没有 accessToken")
-
     seats = 5
     workspace = str(payload.workspace_name or "").strip()
     promo_code = str(payload.promo_code or "").strip()
@@ -617,35 +468,86 @@ async def create_order(
         mode=mode,
         status=OrderStatus.CREATED,
     )
-    store.create_order(order, idempotency_key)
+
+    def _session_json(client: ChatGPTClient, country: str) -> str:
+        return json.dumps({
+            "accessToken": client.access_token,
+            "sessionToken": client.extra_cookies.get("__Secure-next-auth.session-token", client.session_token),
+            "deviceId": client.device_id,
+            "sessionId": client.oai_session_id,
+            "userAgent": client.user_agent,
+            "cookies": client.extra_cookies,
+            "statsigContext": {
+                "deviceId": client.device_id,
+                "userAgent": client.user_agent,
+                "country": country,
+            },
+        })
+
+    if original_country and original_country != exit_country and not bundle.session_token:
+        raise _error(
+            status.HTTP_401_UNAUTHORIZED,
+            ErrorCode.INVALID_SESSION,
+            "跨区充值需要完整 Session（缺少 sessionToken），请重新导出整段 session JSON",
+        )
+
+    def remember(snapshot: str, ua: str, device_id: str) -> OrderSecrets:
+        # Commit the snapshot in RAM before closing the refreshing client, deriving
+        # checkout metadata or invoking an adapter. No public credential handle.
+        item = OrderSecrets(
+            session=snapshot, user_agent=ua, device_id=device_id,
+            proxy=exit_proxy or "", session_country=original_country, exit_country=exit_country,
+            session_reissued=session_reissued,
+        )
+        vault.put(order.id, item)
+        store.create_order(order, idempotency_key)
+        view = store.view(order.id)
+        view.session_reissued_for_country = session_reissued
+        view.exit_country = exit_country
+        return item
+
+    cross_country = bool(original_country and original_country != exit_country)
+    access_token = bundle.access_token
+    if bundle.session_token and (cross_country or not access_token):
+        await _guard_refresh_egress(exit_proxy, exit_country)
+        if cross_country:
+            try:
+                client = await asyncio.to_thread(
+                    ChatGPTClient.reauthorize_for_country, raw_session,
+                    proxy=exit_proxy, country=exit_country,
+                )
+            except DomainError as exc:
+                raise _from_domain(exc)
+            except Exception:
+                raise _error(503, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "会话请求中断，已停止。") from None
+        else:
+            client = ChatGPTClient.from_raw_session(raw_session, proxy=exit_proxy)
+        try:
+            if not cross_country and not await asyncio.to_thread(client.refresh_session):
+                raise _error(401, ErrorCode.INVALID_SESSION, "session token 刷新未获确认，已停止。")
+            access_token = client.access_token
+            if not access_token:
+                raise _error(401, ErrorCode.INVALID_SESSION, "会话刷新未返回 accessToken")
+            session_reissued = cross_country
+            raw_session = _session_json(client, exit_country)
+            item = remember(raw_session, client.user_agent, client.device_id)
+        finally:
+            client.close()
+    else:
+        if not access_token:
+            raise _error(401, ErrorCode.INVALID_SESSION, "JSON 中没有 accessToken")
+        item = remember(raw_session, bundle.user_agent, bundle.device_id)
+
     store.add_job(Job(order_id=order.id, stage="checkout"))
-    view = store.view(order.id)
-    view.session_reissued_for_country = session_reissued
-    view.exit_country = exit_country
-    # 指纹 profile：Session 真实 UA 优先；只有完全缺失时才按 device_id 派生。
-    _profile = profile_from_session_ua(bundle.user_agent) or _pick_profile(bundle.device_id)
-    _billing = address_for(country)
-    _billing["email"] = email_from_access_token(bundle.access_token) or ""
-    vault.put(order.id, OrderSecrets(
-        session=raw_session,
-        proxy=exit_proxy or "",
-        profile=_profile,
-        billing=_billing,
-        user_agent=bundle.user_agent,
-        device_id=bundle.device_id,
-        session_country=original_country,
-        exit_country=exit_country,
-        session_reissued=session_reissued,
-    ))
-    # 建单重试可能换了 SID —— 用最终生效的出口覆盖，保证支付同出口
+    item.profile = profile_from_session_ua(item.user_agent) or _pick_profile(item.device_id)
+    item.billing = address_for(country)
+    item.billing["email"] = email_from_access_token(access_token) or ""
 
     pipeline = build_pipeline()
     try:
-        checkout, exit_proxy = await _create_checkout_with_retry(
+        checkout = await _create_checkout_once(
             pipeline,
             proxy=exit_proxy or "",
-            pin_proxy=True,
-            hard_pin=session_reissued,
             session_reissued=session_reissued,
             session=raw_session,
             plan=plan,
@@ -660,21 +562,16 @@ async def create_order(
         )
     except DomainError as exc:
         store.update_status(order.id, OrderStatus.REJECTED)
-        store.view(order.id).last_error = exc.message
+        error = _from_domain(exc, session_reissued=session_reissued)
+        store.view(order.id).last_error = error.detail["message"]
         logger.info(
-            "checkout_failed id=%s plan=%s country=%s error=%s",
+            "checkout_failed id=%s plan=%s country=%s code=%s",
             order.id,
             plan,
             country,
-            exc.message,
+            exc.code.value,
         )
-        raise _from_domain(exc)
-
-    # 建单最终生效的出口：重试可能换过 SID，支付必须复用
-    _s = vault.get(order.id)
-    if _s is not None:
-        _s.proxy = exit_proxy or ""
-        vault.put(order.id, _s)
+        raise error
 
     view = store.view(order.id)
     view.checkout_url = checkout.checkout_url
@@ -753,7 +650,7 @@ def _team_client(secrets: OrderSecrets, country: str = "") -> ChatGPTClient:
     country 参数保留仅为兼容既有调用方，不再参与出口选择。
     """
     client = ChatGPTClient.from_raw_session(secrets.session, proxy=secrets.proxy or None)
-    client.timeout = 30.0
+    client.timeout = ORDER_HTTP_TIMEOUT_S
     return client
 
 
@@ -797,7 +694,7 @@ async def quote_team(order_id: str, payload: TeamQuoteRequest) -> OrderOut:
             logger.info("team_quote_ok id=%s amount=%s currency=%s elapsed=%.2f",
                         order_id, view.amount, view.currency, time.monotonic() - started)
         except DomainError as exc:
-            view.quote_error = exc.message
+            view.quote_error = redact_sensitive(exc.message)
             logger.warning("team_quote_failed id=%s code=%s elapsed=%.2f error=%s", order_id,
                            exc.code.value, time.monotonic() - started, redact_sensitive(exc.message)[:160])
         except Exception as exc:
@@ -845,7 +742,7 @@ async def prepare_team(order_id: str, payload: TeamPrepareRequest) -> dict:
                             order_id, store.view(order_id).amount, store.view(order_id).currency,
                             time.monotonic() - started)
             except DomainError as exc:
-                store.view(order_id).last_error = exc.message
+                store.view(order_id).last_error = redact_sensitive(exc.message)
                 logger.warning("team_prepare_failed id=%s code=%s elapsed=%.2f confirm_submitted=False error=%s",
                                order_id, exc.code.value, time.monotonic() - started,
                                redact_sensitive(exc.message)[:160])
@@ -957,7 +854,7 @@ async def poll_team(order_id: str) -> OrderOut:
             await _mark_delivered(order_id)
         elif result.status.value == "declined":
             store.update_status(order_id, OrderStatus.FAILED)
-            view.last_error = result.message
+            view.last_error = redact_sensitive(result.message) if result.message else None
             view.next_action = None
             await notify_order_update(order_id, OrderStatus.FAILED)
         elif result.status.value == "requires_action":
@@ -965,7 +862,7 @@ async def poll_team(order_id: str) -> OrderOut:
                 store.update_status(order_id, OrderStatus.PAYING)
             store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
             view.next_action = result.next_action
-            view.last_error = result.message
+            view.last_error = redact_sensitive(result.message) if result.message else None
         # Pending poll responses must not erase an earlier challenge/client_secret.
         return _to_out(order)
 
@@ -1081,22 +978,27 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         uncertain = order.plan is Plan.TEAM and exc.code is ErrorCode.PAYMENT_UNKNOWN_STATE
         failed_status = OrderStatus.UNKNOWN if uncertain else OrderStatus.FAILED
         store.update_status(order_id, failed_status)
-        _set_payment_status(order_id, "failed", summary=f"支付失败：{redact_sensitive(exc.message)[:120]}")
-        view.last_error = exc.message
+        error = _from_domain(exc, session_reissued=view.session_reissued_for_country)
+        message = error.detail["message"]
+        _set_payment_status(order_id, "failed", summary=f"支付失败：{message[:120]}")
+        view.last_error = message
         logger.info(
-            "pay_failed id=%s country=%s error=%s",
+            "pay_failed id=%s country=%s code=%s",
             order_id,
             order.billing_country,
-            exc.message,
+            exc.code.value,
         )
         # SSE 通知：支付失败
-        await notify_order_update(order_id, failed_status, {"error": exc.message})
-        raise _from_domain(exc)
+        await notify_order_update(order_id, failed_status, {"error": message})
+        raise error
 
     new_status = apply_payment_result(OrderStatus.PAYING, payment.status)
     store.update_status(order_id, new_status)
     view.next_action = payment.next_action
-    view.last_error = None if payment.status.value == "succeeded" else payment.message
+    view.last_error = (
+        redact_sensitive(payment.message)
+        if payment.message and payment.status is not PaymentStatus.SUCCEEDED else None
+    )
     if payment.status is PaymentStatus.SUCCEEDED:
         _set_payment_status(
             order_id,
@@ -1111,7 +1013,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     elif payment.status in {PaymentStatus.PROCESSING, PaymentStatus.REQUIRES_ACTION}:
         _set_payment_status(order_id, "processing", summary="支付处理中，请勿重复提交")
     elif payment.status in {PaymentStatus.DECLINED, PaymentStatus.ERROR}:
-        _set_payment_status(order_id, "failed", summary=payment.message or "支付失败")
+        _set_payment_status(order_id, "failed", summary=view.last_error or "支付失败")
     logger.info(
         "pay_finished id=%s country=%s payment=%s order=%s error=%s",
         order_id,
@@ -1216,7 +1118,7 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
             raise _from_domain(exc)
         # 未扣款订单：保持当前状态返回，由前端稍后重查。
         logger.warning("verify_failed id=%s error=%s", order_id, redact_sensitive(exc.message)[:200])
-        view.last_error = f"订阅状态查询失败，稍后会自动重试：{exc.message[:120]}"
+        view.last_error = f"订阅状态查询失败，稍后会自动重试：{redact_sensitive(exc.message)[:120]}"
         return _to_out(store.get_order(order_id))  # type: ignore[arg-type]
     view.subscription = info
     view.plan_type = info.raw_kind or view.plan_type
@@ -1315,7 +1217,7 @@ def _protocol_out(order_id: str, *, state: str, message: Optional[str] = None, *
     summary = view.status_summary or _default_status_summary(view.payment_status, view.delivery_status)
     return ProtocolPayOut(
         state=state,
-        message=message if message is not None else summary,
+        message=redact_sensitive(message) if message is not None else summary,
         payment_status=view.payment_status,
         delivery_status=view.delivery_status,
         payment_intent_id=view.payment_intent_id,
@@ -1470,10 +1372,11 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     try:
         outcome = await asyncio.to_thread(_run)
     except DomainError as exc:
-        raise _from_domain(exc)
+        raise _from_domain(exc, session_reissued=view.session_reissued_for_country)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("protocol_pay_failed id=%s error=%s", order_id, str(exc)[:200])
-        raise _error(status.HTTP_502_BAD_GATEWAY, ErrorCode.CHECKOUT_UPSTREAM_ERROR, str(exc)[:200])
+        logger.warning("protocol_pay_failed id=%s type=%s", order_id, type(exc).__name__)
+        raise _error(status.HTTP_502_BAD_GATEWAY, ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                     "支付请求异常，请先核对订单状态。", session_reissued=view.session_reissued_for_country)
 
     logger.info(
         "protocol_pay id=%s state=%s decline=%s code=%s intent=%s",

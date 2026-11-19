@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Main order HTTP request timeout, not an end-to-end payment deadline.
+ORDER_HTTP_TIMEOUT_S = 15.0
+
 #: 分片文件 → 归属的顶层键（上游约定）。
 SHARD_FILES = ("proxy.json", "runtime.json", "payment.json")
 

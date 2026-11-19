@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
+from gss_core.config import ORDER_HTTP_TIMEOUT_S
 from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.money import quote_from_payload
 from gss_core.redaction import redact_sensitive
@@ -510,7 +511,7 @@ def _new_session(*, proxy: Optional[str], timeout: float, impersonate: str = _IM
 class ChatGPTClient:
     access_token: str
     proxy: Optional[str] = None
-    timeout: float = 90.0
+    timeout: float = ORDER_HTTP_TIMEOUT_S
     account_id: str = ""
     attestation: str = ""
     client_build_number: str = _CLIENT_BUILD

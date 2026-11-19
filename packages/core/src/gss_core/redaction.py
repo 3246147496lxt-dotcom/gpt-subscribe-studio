@@ -12,31 +12,39 @@ from typing import Any, Iterable, List, Mapping, Pattern, Tuple
 
 MASK = "***"
 
+_TOKEN_FIELD = (
+    r"(?:access|refresh|id)[_-]?token|session(?:[_-]?token)?|"
+    r"(?:__Secure-|__Host-)?next-auth\.session-token(?:\.\d+)?"
+)
+_HEADER_FIELD = r"cookies?|set-cookie|authorization"
+_CREDENTIAL_KEY = re.compile(rf"(?:{_TOKEN_FIELD}|{_HEADER_FIELD})", re.I)
+
+# 同时支持 JSON 双引号和日志中 Python repr 的单引号。上游有时截短错误体，
+# 即使结束引号丢失，也要屏蔽到本行行尾。
+_QUOTED = r'"(?:\\[^\r\n]|[^"\\\r\n])*"?' + "|" + r"'(?:\\[^\r\n]|[^'\\\r\n])*'?"
+
+
+def _credential_pair(names: str, unquoted: str) -> Pattern[str]:
+    return re.compile(
+        rf"""(?P<prefix>(?<!\w)(?:{names})(?:["']\s*[:=]\s*|[ \t]*[:=][ \t]*))"""
+        rf"(?P<bytes_marker>b(?=[\"']))?(?P<value>{_QUOTED}|{unquoted})",
+        re.I,
+    )
+
+
+# 裸 HTTP 头必须整行屏蔽，不能在第一个分号截断，留下后续 Cookie。
+_HEADER_PAIR = _credential_pair(_HEADER_FIELD, r"[^\r\n]+")
+_TOKEN_PAIR = _credential_pair(_TOKEN_FIELD, r"""[\[{][^\r\n]*|[^\s"'{}[\],;]+""")
+
+
+def _mask_pair(match: re.Match[str]) -> str:
+    value = match.group("value")
+    quote = value[0] if value[0] in "\"'" else ""
+    return match.group("prefix") + (match.group("bytes_marker") or "") + quote + MASK + quote
+
+
 #: 带上下文的键值对脱敏规则：(正则, 替换模板)。
 _KEYED_RULES: List[Tuple[Pattern[str], str]] = [
-    (
-        re.compile(r"(?i)\b(access[_-]?token)\b(\"?\s*[:=]\s*\"?)([A-Za-z0-9._\-]{6,})"),
-        r"\1\2" + MASK,
-    ),
-    (
-        re.compile(r"(?i)\b(refresh[_-]?token)\b(\"?\s*[:=]\s*\"?)([A-Za-z0-9._\-]{6,})"),
-        r"\1\2" + MASK,
-    ),
-    (
-        re.compile(r"(?i)\b(id[_-]?token)\b(\"?\s*[:=]\s*\"?)([A-Za-z0-9._\-]{6,})"),
-        r"\1\2" + MASK,
-    ),
-    (
-        re.compile(r"(?i)\b(session[_-]?token|session)\b(\"?\s*[:=]\s*\"?)([A-Za-z0-9._\-]{12,})"),
-        r"\1\2" + MASK,
-    ),
-    (
-        re.compile(
-            r"(?i)\b(cookie|set-cookie|authorization)\b(\"?\s*[:=]\s*\"?)"
-            r"(?!(?:bearer|basic)\b)([^\s,;\"']{6,})"
-        ),
-        r"\1\2" + MASK,
-    ),
     (
         re.compile(r"(?i)\b(client[_-]?secret)\b(\"?\s*[:=]\s*\"?)([^\s,;&\"']{6,})"),
         r"\1\2" + MASK,
@@ -87,7 +95,8 @@ def redact(value: str) -> str:
 
     if not value:
         return value
-    text = str(value)
+    text = _HEADER_PAIR.sub(_mask_pair, str(value))
+    text = _TOKEN_PAIR.sub(_mask_pair, text)
     for pattern, repl in _KEYED_RULES:
         text = pattern.sub(repl, text)
     text = _BEARER.sub(lambda m: f"{m.group(1)} {MASK}", text)
@@ -98,12 +107,15 @@ def redact(value: str) -> str:
 
 
 def redact_mapping(obj: Any) -> Any:
-    """递归脱敏字典 / 列表 / 标量。返回同构结构。"""
+    """递归脱敏字典 / 列表 / 标量。凭证键的值整体替换，不保留其中的嵌套字段。"""
 
     if isinstance(obj, str):
         return redact(obj)
     if isinstance(obj, Mapping):
-        return {k: redact_mapping(v) for k, v in obj.items()}
+        return {
+            k: MASK if isinstance(k, str) and _CREDENTIAL_KEY.fullmatch(k) else redact_mapping(v)
+            for k, v in obj.items()
+        }
     if isinstance(obj, (list, tuple, set)):
         return type(obj)(redact_mapping(v) for v in obj)
     return obj

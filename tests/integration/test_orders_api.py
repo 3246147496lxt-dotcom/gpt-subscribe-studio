@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -290,6 +291,7 @@ def test_session_token_only_is_exchanged_before_checkout(monkeypatch) -> None:
         self.access_token = "exchanged-at"
         return True
 
+    monkeypatch.setattr("gss_api.routers.orders._guard_refresh_egress", AsyncMock())
     monkeypatch.setattr(ChatGPTClient, "refresh_session", fake_refresh)
     store.clear()
     created = _order_with_session(TestClient(create_app()), _JWE)
@@ -301,6 +303,7 @@ def test_session_token_only_is_exchanged_before_checkout(monkeypatch) -> None:
 def test_expired_session_token_is_rejected(monkeypatch) -> None:
     from gss_core.chatgpt import ChatGPTClient
 
+    monkeypatch.setattr("gss_api.routers.orders._guard_refresh_egress", AsyncMock())
     monkeypatch.setattr(ChatGPTClient, "refresh_session", lambda self: False)
     store.clear()
     created = _order_with_session(TestClient(create_app()), _JWE)

@@ -6,7 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 from gss_contracts import (
     AdapterCapabilities,
@@ -18,17 +18,18 @@ from gss_contracts import (
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
 from gss_core.chatgpt import ChatGPTClient, clamp_team_seats
+from gss_core.config import ORDER_HTTP_TIMEOUT_S
+from gss_core.session_token import parse_session
 from gss_core.countries import country_codes, currency_for
 from gss_core.proxies import (
     align_proxy_region,
     configured_proxy,
-    rotate_proxy_sid,
     session_proxy,
 )
 
 logger = logging.getLogger("gss.checkout")
 _STRIPE_PROXY_CHECK_URL = "https://api.stripe.com/v1/payment_methods"
-_STRIPE_PROXY_CHECK_TIMEOUT = 8.0
+_STRIPE_PROXY_CHECK_TIMEOUT = ORDER_HTTP_TIMEOUT_S
 
 
 def _probe_stripe_proxy(proxy: Optional[str], *, timeout: float = _STRIPE_PROXY_CHECK_TIMEOUT) -> bool:
@@ -44,23 +45,10 @@ def _probe_stripe_proxy(proxy: Optional[str], *, timeout: float = _STRIPE_PROXY_
             if callable(close):
                 close()
         status = int(getattr(response, "status_code", 0) or 0)
-        return 200 <= status < 500 and status != 407
+        return 200 <= status < 300 or status in {401, 404}
     except Exception as exc:
         logger.warning("Team Stripe 代理预检失败 type=%s", type(exc).__name__)
         return False
-
-
-def _team_proxy_candidates(proxy: Optional[str]) -> Iterable[Optional[str]]:
-    """返回原 SID 加最多两个新 SID，避免重复。"""
-    if proxy:
-        yield proxy
-    current = proxy or ""
-    for _ in range(2):
-        rotated = rotate_proxy_sid(current)
-        if not rotated or rotated == current:
-            break
-        yield rotated
-        current = rotated
 
 
 _LIST_PRICE = {
@@ -85,8 +73,8 @@ class CheckoutAdapterBase:
             },
             failure_modes={
                 "session_expired": "401 → 重新粘贴 session",
-                "cloudflare_403": "被拦 → 换与账单国家一致的出口代理",
-                "unusual_activity": "上游判定异常流量 → 换 SID 或同国家新 session",
+                "cloudflare_403": "被拦 → 中止请求",
+                "unusual_activity": "上游判定异常流量 → 中止请求，不重试",
                 "sentinel_missing": "无法签发 Sentinel → 检查 Node 与出口代理",
             },
         )
@@ -96,10 +84,10 @@ class CheckoutAdapterBase:
 class UpstreamCheckoutAdapter(CheckoutAdapterBase):
     """用客户 session 向 ChatGPT 创建结账会话，并取出 Stripe 公钥。"""
 
-    timeout: int = 120
+    timeout: float = ORDER_HTTP_TIMEOUT_S
 
     async def create_checkout(self, req: CheckoutRequest) -> CheckoutResult:
-        if not req.session:
+        if not req.session or not parse_session(req.session):
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法创建结账")
         # exit_country 决定代理出口与建单定价；billing_country 只决定地址/税额。
         # 已 pin 的 req.proxy 必须原样保留，不能再按 billing_country 改写。
@@ -107,47 +95,15 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         proxy = req.proxy or session_proxy("checkout", exit_country) or configured_proxy("checkout")
         if not req.proxy:
             proxy = align_proxy_region(proxy, exit_country)
-        used_proxy = proxy
-        created = None
         if req.plan is Plan.TEAM:
-            # Team 只允许通过已预检的代理访问上游；候选为原 SID + 最多两个新 SID。
-            candidates = [proxy] if req.pin_proxy else _team_proxy_candidates(proxy)
-            for candidate in candidates:
-                reachable = await asyncio.to_thread(
-                    _probe_stripe_proxy,
-                    candidate,
-                    timeout=_STRIPE_PROXY_CHECK_TIMEOUT,
-                )
-                if not reachable:
-                    logger.warning("checkout_proxy_failed stage=team_stripe_precheck code=unreachable")
-                    continue
-                try:
-                    created = await asyncio.to_thread(self._create, req, candidate)
-                    used_proxy = candidate
-                    break
-                except DomainError as exc:
-                    if exc.code is not ErrorCode.CHECKOUT_UPSTREAM_ERROR or "异常流量" not in str(exc):
-                        raise
-                    logger.warning("checkout_proxy_failed stage=team_create code=unusual_activity")
-                    continue
-            if created is None:
+            if not proxy or not await asyncio.to_thread(_probe_stripe_proxy, proxy,
+                                                        timeout=_STRIPE_PROXY_CHECK_TIMEOUT):
                 raise DomainError(
                     ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                     "订单代理连接Stripe失败，未创建结账/未付款",
                 )
-        else:
-            try:
-                created = await asyncio.to_thread(self._create, req, proxy)
-            except DomainError as exc:
-                if exc.code is not ErrorCode.CHECKOUT_UPSTREAM_ERROR or "异常流量" not in str(exc):
-                    raise
-                if req.pin_proxy:
-                    raise
-                rotated = rotate_proxy_sid(proxy or "")
-                if not rotated or rotated == proxy:
-                    raise
-                created = await asyncio.to_thread(self._create, req, rotated)
-                used_proxy = rotated
+        # One attempt on the selected route. An upstream refusal is terminal.
+        created = await asyncio.to_thread(self._create, req, proxy)
         amount = created.amount
         # Team 托管长链的实际价格（席位、周期、优惠码）只在 Stripe 页面上有，拿不到报价就留空，
         # 不能拿写死的 25 × 席位数冒充应付金额。
@@ -166,16 +122,12 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
             tax_delta=getattr(created, "tax_delta", None),
             checkout_kind=created.checkout_kind or ("hosted" if req.plan is Plan.TEAM else "custom"),
             confirm_return_url=created.confirm_return_url or "",
-            effective_proxy=used_proxy,
+            effective_proxy=proxy,
         )
 
     def _create(self, req: CheckoutRequest, proxy: Optional[str]):
         client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
         client.timeout = float(self.timeout)
-        # 跨区重签发后的 session 已经是目标 IP 上刚换好的，不能再刷一次：
-        # 服务端可能回带旧 statsig，覆盖掉刚生成的设备/UA。
-        if not req.session_reissued:
-            client.refresh_session()
         try:
             return client.create_checkout(
                 plan=str(req.plan),

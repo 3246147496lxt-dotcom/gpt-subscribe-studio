@@ -20,51 +20,45 @@ def created():
                            customer_session_client_secret=None, checkout_kind="hosted", confirm_return_url="")
 
 
-def setup(monkeypatch):
-    monkeypatch.setattr("gss_checkout.adapter.align_proxy_region", lambda proxy, country: proxy)
-    values = iter(("http://new1.invalid:3010", "http://new2.invalid:3010"))
-    monkeypatch.setattr("gss_checkout.adapter.rotate_proxy_sid", lambda proxy: next(values))
-
-
-def test_dead_candidate_is_replaced_before_create_and_effective_proxy_is_preserved(monkeypatch):
-    setup(monkeypatch)
-    checks = []
-    def probe(proxy, **kw): checks.append(proxy); return len(checks) > 1
-    monkeypatch.setattr("gss_checkout.adapter._probe_stripe_proxy", probe)
-    adapter = UpstreamCheckoutAdapter(); calls = []
-    monkeypatch.setattr(adapter, "_create", lambda req, proxy: calls.append(proxy) or created())
+def test_healthy_team_proxy_is_preserved_without_rotation(monkeypatch):
+    checked, attempted = [], []
+    monkeypatch.setattr("gss_checkout.adapter._probe_stripe_proxy",
+                        lambda proxy, **kw: checked.append(proxy) or True)
+    adapter = UpstreamCheckoutAdapter()
+    monkeypatch.setattr(adapter, "_create", lambda req, proxy: attempted.append(proxy) or created())
     result = asyncio.run(adapter.create_checkout(request()))
-    assert calls == ["http://new1.invalid:3010"]
-    assert result.effective_proxy == calls[0]
+    assert checked == attempted == [request().proxy]
+    assert result.effective_proxy == request().proxy
     assert "effective_proxy" not in repr(result)
-    assert checks == ["http://fixture.invalid:3010", "http://new1.invalid:3010"]
 
 
-def test_unusual_activity_rotation_returns_actual_used_proxy(monkeypatch):
-    setup(monkeypatch)
+@pytest.mark.parametrize("plan", [Plan.PLUS, Plan.TEAM])
+def test_unusual_activity_is_terminal(monkeypatch, plan):
     monkeypatch.setattr("gss_checkout.adapter._probe_stripe_proxy", lambda *a, **kw: True)
-    calls = []
-    def create(req, proxy):
-        calls.append(proxy)
-        if len(calls) == 1: raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "异常流量")
-        return created()
-    adapter = UpstreamCheckoutAdapter(); monkeypatch.setattr(adapter, "_create", create)
-    result = asyncio.run(adapter.create_checkout(request()))
-    assert result.effective_proxy == calls[-1] == "http://new1.invalid:3010"
+    attempted = []
+
+    def refused(req, proxy):
+        attempted.append(proxy)
+        raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "异常流量")
+
+    adapter = UpstreamCheckoutAdapter()
+    monkeypatch.setattr(adapter, "_create", refused)
+    with pytest.raises(DomainError, match="异常流量"):
+        asyncio.run(adapter.create_checkout(request(plan)))
+    assert attempted == [request().proxy]
 
 
-def test_all_failed_proxies_do_not_create_checkout_or_fallback_to_direct(monkeypatch):
-    setup(monkeypatch)
+def test_failed_proxy_aborts_without_checkout_or_fallback(monkeypatch):
     seen = []
     monkeypatch.setattr("gss_checkout.adapter._probe_stripe_proxy", lambda proxy, **kw: seen.append(proxy) or False)
-    adapter = UpstreamCheckoutAdapter(); monkeypatch.setattr(adapter, "_create", lambda *a: pytest.fail("No checkout on failed proxies"))
+    adapter = UpstreamCheckoutAdapter()
+    monkeypatch.setattr(adapter, "_create", lambda *a: pytest.fail("No checkout on a failed probe"))
     with pytest.raises(DomainError, match="未创建结账/未付款"):
         asyncio.run(adapter.create_checkout(request()))
-    assert seen == ["http://fixture.invalid:3010", "http://new1.invalid:3010", "http://new2.invalid:3010"]
+    assert seen == [request().proxy]
 
 
 def test_plus_path_does_not_add_team_preflight(monkeypatch):
-    setup(monkeypatch)
     monkeypatch.setattr("gss_checkout.adapter._probe_stripe_proxy", lambda *a, **kw: pytest.fail("Plus preflight changed"))
     adapter = UpstreamCheckoutAdapter(); monkeypatch.setattr(adapter, "_create", lambda *a: created())
     result = asyncio.run(adapter.create_checkout(request(Plan.PLUS)))
@@ -79,7 +73,7 @@ def test_preflight_uses_proxy_and_accepts_unauthenticated_stripe_response(monkey
         def close(self): calls.append("closed")
     def session(**kw):
         assert kw["proxy"] == "http://fixture.invalid:3010"
-        assert kw["timeout"] == 8
+        assert kw["timeout"] == 15
         return HTTP()
     monkeypatch.setattr("gss_core.chatgpt._new_session",session)
     assert _probe_stripe_proxy("http://fixture.invalid:3010") is expected
