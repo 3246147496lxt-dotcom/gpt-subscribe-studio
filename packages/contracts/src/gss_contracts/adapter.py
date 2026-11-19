@@ -56,6 +56,9 @@ class CheckoutRequest:
     # 本单已在目标国家重签发；不要再刷新 session，避免旧 statsig 覆盖新身份。
     session_reissued: bool = False
     verified_billing: Optional[Dict[str, str]] = field(default=None, repr=False)
+    # Route C browser environment; core type is intentionally Any at this boundary.
+    browser_context: Optional[Any] = field(default=None, repr=False)
+    purchase_attempt_id: str = ""
 
 
 @dataclass(frozen=True)

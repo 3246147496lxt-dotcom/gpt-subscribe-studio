@@ -108,6 +108,7 @@ class Order:
 
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     idempotency_key: str = ""
+    purchase_attempt_id: str = ""
     plan: Plan = Plan.PLUS
     billing_country: str = ""
     mode: Mode = field(default_factory=Mode)

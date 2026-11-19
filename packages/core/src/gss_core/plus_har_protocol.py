@@ -190,6 +190,8 @@ class PlusHarProtocol:
         device_id: str = "",
         exit_country: str = "",
         pin_proxy: bool = False,
+        browser_context: Any = None,
+        purchase_attempt_id: str = "",
     ) -> None:
         self.session = session or ""
         self.checkout_url = checkout_url or ""
@@ -210,6 +212,8 @@ class PlusHarProtocol:
         self.country = (self.billing.get("country") or country or "US").upper()
         self.exit_country = (exit_country or country or self.country).upper()
         self.pin_proxy = pin_proxy
+        self.browser_context = browser_context
+        self.purchase_attempt_id = purchase_attempt_id
         self.email = (email or self.billing.get("email") or "").strip()
         self.expected_account = account_id or ""
         self.cuss_secret = customer_session_client_secret or ""
@@ -323,8 +327,13 @@ class PlusHarProtocol:
         if self.proxy:
             session.proxies = {"http": self.proxy, "https": self.proxy}
         session.headers.clear()
-        session.headers.update(self.device.web_headers(referer="https://chatgpt.com/"))
+        web_headers = self.device.web_headers(referer="https://chatgpt.com/")
+        if self.browser_context is not None:
+            web_headers.update(self.browser_context.headers())
+        session.headers.update(web_headers)
         cookies = dict(getattr(self.client, "extra_cookies", {}) or {})
+        if self.browser_context is not None:
+            cookies.update({str(k): str(v) for k, v in (self.browser_context.cookies or {}).items() if k and v is not None})
         if getattr(self.client, "session_token", ""):
             cookies.setdefault("__Secure-next-auth.session-token", self.client.session_token)
         if getattr(self.client, "device_id", ""):
@@ -1458,6 +1467,8 @@ def run_har_context(
     billing: Optional[Dict[str, str]] = None,
     read_only: bool = False,
     exit_country: str = "",
+    browser_context: Any = None,
+    purchase_attempt_id: str = "",
 ) -> Dict[str, Any]:
     """Drive one HAR-faithful attempt on an existing checkout context.
 
@@ -1507,6 +1518,8 @@ def run_har_context(
         device=device,
         read_only=read_only,
         hcaptcha_token=str(context.get("hcaptcha_token") or ""),
+        browser_context=browser_context or context.get("browser_context"),
+        purchase_attempt_id=purchase_attempt_id or str(context.get("purchase_attempt_id") or ""),
     )
     engine.credentials_current = spec.get("credentials_current", lambda: True)
     engine.confirmation_started = bool(context.get("app_confirmation_started") or context.get("intent_id"))

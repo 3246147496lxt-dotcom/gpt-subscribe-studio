@@ -18,6 +18,7 @@ from gss_contracts import BillingMode, OrderStatus, Plan, SubscriptionInfo
 from gss_contracts.adapter import PaymentReceiptEvidence
 from gss_contracts.errors import ErrorCode
 from gss_core.chatgpt import ChatGPTClient
+from gss_core.browser_context import BrowserContext
 from gss_core.config import use_fake_adapters
 from gss_core.checkout_protocol import run_checkout_protocol
 from gss_core.chatgpt import _processor_from_checkout_url
@@ -110,6 +111,8 @@ def _spec(order, view, secrets, payload=None):
         "customer_session_client_secret": view.customer_session_client_secret or "",
         "processor": _processor_from_checkout_url(view.checkout_url or ""),
         "confirm_return_url": view.confirm_return_url or "",
+        "browser_context": BrowserContext.from_dict(getattr(secrets, "browser_context", None)),
+        "purchase_attempt_id": getattr(secrets, "purchase_attempt_id", ""),
     }
 
 

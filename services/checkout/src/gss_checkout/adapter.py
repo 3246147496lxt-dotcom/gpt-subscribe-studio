@@ -93,7 +93,10 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         # exit_country 决定代理出口与建单定价；billing_country 只决定地址/税额。
         # 已 pin 的 req.proxy 必须原样保留，不能再按 billing_country 改写。
         exit_country = req.exit_country or req.billing_country
-        pinned_billing = None if req.plan is Plan.TEAM else checkout_address(exit_country, req.billing_country, req.verified_billing)
+        pinned_billing = None if req.plan is Plan.TEAM else checkout_address(
+            exit_country, req.billing_country, req.verified_billing,
+            profile=req.verified_billing if hasattr(req.verified_billing, "verification_id") else None,
+        )
         proxy = req.proxy or session_proxy("checkout", exit_country) or configured_proxy("checkout")
         if not req.proxy:
             proxy = align_proxy_region(proxy, exit_country)
@@ -133,6 +136,9 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
     def _create(self, req: CheckoutRequest, proxy: Optional[str]):
         client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
         client.timeout = float(self.timeout)
+        client.purchase_attempt_id = str(getattr(req, "purchase_attempt_id", "") or "")
+        if getattr(req, "browser_context", None) is not None:
+            client.apply_browser_context(req.browser_context)
         try:
             return client.create_checkout(
                 plan=str(req.plan),
@@ -156,7 +162,9 @@ class FakeCheckoutAdapter(CheckoutAdapterBase):
 
     async def create_checkout(self, req: CheckoutRequest) -> CheckoutResult:
         pinned_billing = None if req.plan is Plan.TEAM else checkout_address(
-            req.exit_country or req.billing_country, req.billing_country, req.verified_billing)
+            req.exit_country or req.billing_country, req.billing_country, req.verified_billing,
+            profile=req.verified_billing if hasattr(req.verified_billing, "verification_id") else None,
+        )
         self.calls.append(req)
         currency = currency_for(req.exit_country or req.billing_country)
         amount = Decimal("0.00") if req.billing_mode is BillingMode.PROMO else _list_price(req)

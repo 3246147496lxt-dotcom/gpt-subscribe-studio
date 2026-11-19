@@ -95,8 +95,8 @@ def load_profile() -> VerifiedBilling:
         raise MissingProfile from None
 
 
-def verify_claims(*claims, order_billing=None, verification_id=None) -> VerifiedBilling:
-    profile = load_profile()
+def verify_claims(*claims, order_billing=None, verification_id=None, profile=None) -> VerifiedBilling:
+    profile = profile or load_profile()
     if verification_id is not None and verification_id != profile.verification_id:
         raise BillingMismatch
     for claim in (*claims, order_billing):
@@ -115,10 +115,10 @@ def split_exit_billing_allowed() -> bool:
     return os.environ.get("GSS_ALLOW_SPLIT_EXIT_BILLING", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def checkout_address(country: str, declared_country: str, claim=None) -> VerifiedBilling:
+def checkout_address(country: str, declared_country: str, claim=None, profile=None) -> VerifiedBilling:
     """The existing channel puts its country into checkout billing details. Never correct a mismatch."""
     try:
-        profile = verify_claims(claim)
+        profile = verify_claims(claim, profile=profile)
         if declared_country.strip().upper() != profile["country"]:
             raise BillingMismatch
         if not split_exit_billing_allowed() and country.strip().upper() != profile["country"]:

@@ -526,6 +526,9 @@ class ChatGPTClient:
     timezone: str = "America/New_York"
     sentinel_token: str = ""
     sentinel_so: str = ""
+    purchase_attempt_id: str = ""
+    browser_context: Any = field(default=None, repr=False)
+    _sec_ch_ua_override: str = field(default="", repr=False)
     _http: Any = field(default=None, repr=False)
     _stripe_http: Any = field(default=None, repr=False)
     credentials_current: Optional[Callable[[], bool]] = field(default=None, repr=False, compare=False, kw_only=True)
@@ -627,6 +630,8 @@ class ChatGPTClient:
 
     @property
     def sec_ch_ua(self) -> str:
+        if self._sec_ch_ua_override:
+            return self._sec_ch_ua_override
         major = self.chrome_major
         return ('"Google Chrome";v="' + major + '", "Chromium";v="' + major
                 + '", "Not(A:Brand";v="24"')
@@ -643,6 +648,27 @@ class ChatGPTClient:
         return {"platform": p["platform"], "platform_label": p["label"],
                 "screen_w": p["screen"][0], "screen_h": p["screen"][1],
                 "avail_h": p["screen"][2], "cores": 8}
+
+    def apply_browser_context(self, context: Any) -> None:
+        """Apply a Route-C browser environment before create_checkout."""
+        if context is None:
+            return
+        self.browser_context = context
+        if getattr(context, "user_agent", ""):
+            self.user_agent = str(context.user_agent)
+        if getattr(context, "sec_ch_ua", ""):
+            self._sec_ch_ua_override = str(context.sec_ch_ua)
+        if getattr(context, "locale", ""):
+            self.language = str(context.locale)
+        if getattr(context, "timezone_id", ""):
+            self.timezone = str(context.timezone_id)
+        cookies = getattr(context, "cookies", None) or {}
+        if isinstance(cookies, dict):
+            self.extra_cookies.update({str(k): str(v) for k, v in cookies.items() if k and v is not None})
+        if getattr(context, "sentinel_token", ""):
+            self.sentinel_token = str(context.sentinel_token)
+        if self._http is not None:
+            self._http.headers.update(self._identity_headers())
 
     def _identity_headers(self) -> Dict[str, str]:
         headers = {
@@ -673,6 +699,8 @@ class ChatGPTClient:
             headers.pop("Authorization")
         if self.account_id:
             headers["chatgpt-account-id"] = self.account_id
+        if self.browser_context is not None:
+            headers.update(self.browser_context.headers())
         return headers
 
     def _route_headers(self, route: str, *, page_url: str = "") -> Dict[str, str]:
@@ -692,6 +720,8 @@ class ChatGPTClient:
         if self.sentinel_so:
             headers["openai-sentinel-so-token"] = self.sentinel_so
             headers["OpenAI-Sentinel-SO-Token"] = self.sentinel_so
+        if self.purchase_attempt_id:
+            headers["X-GSS-Purchase-Attempt"] = self.purchase_attempt_id
         return headers
 
     def _app_cookie_names(self) -> set[str]:
@@ -1054,7 +1084,10 @@ class ChatGPTClient:
         tax_country = (billing_country or country).upper()
         currency = currency_for(country)
         hosted = str(plan) == "team"
-        billing = None if hosted else checkout_address(country, tax_country, verified_billing)
+        billing = None if hosted else checkout_address(
+            country, tax_country, verified_billing,
+            profile=verified_billing if hasattr(verified_billing, "verification_id") else None,
+        )
         campaign_id = str(promo_campaign_id or "").strip()[:120]
         page_url = (
             f"{APP_BASE}/?promo_campaign={quote(campaign_id or 'plus-1-month-free', safe='')}"

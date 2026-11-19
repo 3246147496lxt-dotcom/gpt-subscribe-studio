@@ -14,6 +14,9 @@ dependencies = [
     "curl_cffi>=0.13.0",
 ]
 
+[project.optional-dependencies]
+browser = ["playwright>=1.50"]
+
 [tool.uv]
 # 根项目是「虚拟工作区」，不打包自身；各 service / package 独立成包。
 package = false

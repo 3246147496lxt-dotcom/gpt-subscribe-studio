@@ -18,7 +18,7 @@ from .adapter import (
     PromoEligibility,
     SubscriptionInfo,
 )
-from .errors import DomainError, ErrorCode
+from .errors import DomainError, ErrorCode, UpstreamFailureCode
 from .models import (
     AccountSource,
     BillingMode,
@@ -32,6 +32,7 @@ from .models import (
     PlatformCard,
     ProxyPool,
 )
+from .route import RoutePlan, RouteProfile, RouteStage
 from .state import (
     DELIVERABLE_ORDER_STATUSES,
     ORDER_TRANSITIONS,
@@ -65,6 +66,7 @@ __all__ = [
     "AccountAdapter",
     # errors
     "ErrorCode",
+    "UpstreamFailureCode",
     "DomainError",
     # models
     "Plan",
@@ -78,6 +80,10 @@ __all__ = [
     "PaymentAttempt",
     "PlatformCard",
     "ProxyPool",
+    # route
+    "RouteProfile",
+    "RoutePlan",
+    "RouteStage",
     # state
     "OrderStatus",
     "PaymentStatus",

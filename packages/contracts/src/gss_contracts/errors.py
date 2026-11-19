@@ -31,6 +31,19 @@ class ErrorCode(StrEnum):
     COMPLIANCE_BLOCKED = "compliance_blocked"
 
 
+class UpstreamFailureCode(StrEnum):
+    """Stable failure taxonomy for checkout diagnostics (additive, never auth)."""
+
+    UNUSUAL_ACTIVITY = "unusual_activity"
+    SENTINEL_CHALLENGE_FAILED = "sentinel_challenge_failed"
+    PROXY_TUNNEL_FAILED = "proxy_tunnel_failed"
+    PROXY_AUTHENTICATION_FAILED = "proxy_authentication_failed"
+    UPSTREAM_TIMEOUT = "upstream_timeout"
+    BILLING_COUNTRY_MISMATCH = "billing_country_mismatch"
+    BROWSER_DECODE_UNAVAILABLE = "browser_decode_unavailable"
+    UNKNOWN_UPSTREAM = "unknown_upstream"
+
+
 class DomainError(Exception):
     """带错误码的领域异常。``detail`` 必须已脱敏。"""
 
@@ -49,4 +62,4 @@ class DomainError(Exception):
         return payload
 
 
-__all__ = ["ErrorCode", "DomainError"]
+__all__ = ["ErrorCode", "UpstreamFailureCode", "DomainError"]

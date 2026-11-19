@@ -15,6 +15,9 @@ class OrderView:
 
     # RAM-only keyed equality check; never part of the public order projection.
     create_request_tag: Optional[bytes] = field(default=None, repr=False)
+    purchase_attempt_id: Optional[str] = None
+    route_profile: str = "A"
+    failure_code: Optional[str] = None
     checkout_url: Optional[str] = None
     checkout_session_id: Optional[str] = None
     publishable_key: Optional[str] = None

@@ -37,6 +37,8 @@ class OrderSecrets:
     # 建单时选定的指纹 profile，支付与求解器必须复用同一份
     profile: Optional[Dict[str, Any]] = None
     billing: Dict[str, str] = field(default_factory=dict)
+    browser_context: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    purchase_attempt_id: str = ""
     team_context: Optional[Dict[str, Any]] = None
     saved_card_context: Optional[Dict[str, Any]] = None
     expires_at: datetime = field(default_factory=lambda: _utcnow() + _TTL)

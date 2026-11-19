@@ -26,6 +26,7 @@ from gss_contracts import (
     Order,
     OrderStatus,
     Plan,
+    RoutePlan,
 )
 from gss_contracts.adapter import receipt_matches_order, team_entitlement_matches, verification_lease
 from gss_contracts.errors import DomainError, ErrorCode
@@ -33,7 +34,18 @@ from gss_account import FakeAccountAdapter
 from gss_checkout import FakeCheckoutAdapter
 from gss_core.billing import address_for
 from gss_core.config import ORDER_HTTP_TIMEOUT_S, load_settings, use_fake_adapters
-from gss_core.countries import is_supported, normalize_country
+from gss_core.browser_context import BrowserContext
+from gss_core.browser_decode import BrowserDecodeUnavailable, PlaywrightBrowserDecoder
+from gss_core.countries import currency_for, is_supported, normalize_country
+from gss_core.billing_profiles import load_billing_profiles
+from gss_core.purchase_attempt import new_purchase_attempt_id
+from gss_core.upstream_errors import classify_upstream_failure
+from gss_core.route_profiles import (
+    browser_decode_enabled,
+    browser_decode_fallback_a,
+    browser_decode_url,
+    route_plan_from_env,
+)
 from gss_core.hosted import TeamHostedClient
 from gss_core.plus_protocol import PlusProtocol
 from gss_core.plus_har_protocol import PlusHarProtocol
@@ -52,7 +64,7 @@ from gss_core.session_token import (
     parse_session_bundle,
 )
 from gss_core.vault import OrderSecrets, vault
-from gss_core.verified_payer import ObservedBillingConflict, split_exit_billing_allowed
+from gss_core.verified_payer import MissingProfile, ObservedBillingConflict, split_exit_billing_allowed
 from gss_core.saved_card_protocol import _minor
 from gss_core.saved_cards import verification_session
 from gss_orchestrator.pipeline import apply_payment_result, assert_deliverable
@@ -351,8 +363,15 @@ def _to_out(order: Order) -> OrderOut:
     public_billing = view.billing if team else None
     if not team and view.billing_verified and view.billing_verification_id and view.billing:
         try:
+            active_profile = None
+            if os.environ.get("GSS_BILLING_PROFILES_FILE", "").strip() and view.currency:
+                try:
+                    active_profile = load_billing_profiles().resolve(view.currency)
+                except MissingProfile:
+                    active_profile = None
             public_billing = require_verified_billing(
-                order_billing=view.billing, verification_id=view.billing_verification_id
+                order_billing=view.billing, verification_id=view.billing_verification_id,
+                profile=active_profile,
             )
         except HTTPException:
             # Revocation/rotation hides the old payer's address, not the receipt.
@@ -376,6 +395,9 @@ def _to_out(order: Order) -> OrderOut:
     return OrderOut(
         id=order.id,
         status=str(order.status),
+        purchase_attempt_id=getattr(view, "purchase_attempt_id", None) or getattr(order, "purchase_attempt_id", None),
+        route_profile=getattr(view, "route_profile", None),
+        failure_code=getattr(view, "failure_code", None),
         plan=str(order.plan),
         billing_country=order.billing_country,
         mode=ModeIn(
@@ -462,8 +484,10 @@ async def _guard_refresh_egress(proxy: str | None, country: str) -> None:
         await asyncio.to_thread(verify_refresh_egress, proxy or "", country)
     except ProxyPreflightError as exc:
         logger.warning("session_preflight_aborted status=%s", exc.status_code)
-        raise _error(exc.status_code, ErrorCode.CHECKOUT_UPSTREAM_ERROR,
-                     f"{exc}；未发送会话凭证。") from None
+        raise HTTPException(exc.status_code, detail={
+            "code": "proxy_tunnel_failed",
+            "message": f"{exc}；未发送会话凭证。",
+        }) from None
 
 
 async def _create_checkout_once(pipeline, *, proxy: str, **kwargs):
@@ -567,7 +591,19 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             status.HTTP_400_BAD_REQUEST, ErrorCode.COMPLIANCE_BLOCKED,
             f"不支持的出口地区: {normalize_country(payload.exit_country)}" if not non_team else "不支持的出口地区，未创建订单。",
         )
-    verified = require_verified_billing(*([claim] if claim is not None else [])) if non_team else None
+    billing_profile = None
+    if non_team and os.environ.get("GSS_BILLING_PROFILES_FILE", "").strip():
+        try:
+            profile_currency = currency_for(normalize_country(
+                payload.exit_country or payload.billing_country or "US"))
+            billing_profile = load_billing_profiles().resolve(profile_currency)
+        except MissingProfile:
+            raise HTTPException(503, detail={
+                "code": "BILLING_PROFILE_UNAVAILABLE",
+                "message": "已核验账单资料不可用，不能提交新的结账或付款。",
+            }) from None
+    verified = (require_verified_billing(*([claim] if claim is not None else []), profile=billing_profile)
+                if non_team else None)
     # Never derive the payer's country from a route, browser locale, or session.
     # The Team schema still requires its original explicit country.
     country = verified["country"] if verified is not None else normalize_country(payload.billing_country)
@@ -621,6 +657,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
 
     order = Order(
         idempotency_key=idempotency_key or "",
+        purchase_attempt_id=new_purchase_attempt_id(),
         plan=plan,
         billing_country=country,
         mode=mode,
@@ -667,17 +704,20 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         item = OrderSecrets(
             session=snapshot, user_agent=ua, device_id=device_id,
             proxy=exit_proxy or "", session_country=original_country, exit_country=exit_country,
-            session_reissued=session_reissued,
+            session_reissued=session_reissued, purchase_attempt_id=order.purchase_attempt_id,
         )
         vault.put(order.id, item)
         store.create_order(order, idempotency_key)
         view = store.view(order.id)
         view.create_request_tag = tag
+        view.purchase_attempt_id = order.purchase_attempt_id
         view.session_reissued_for_country = session_reissued
         view.exit_country = exit_country
         return item
 
     cross_country = bool(original_country and original_country != exit_country)
+    route_plan = route_plan_from_env()
+    browser_context: BrowserContext | None = None
     access_token = bundle.access_token
     if bundle.session_token and (cross_country or not access_token):
         try:
@@ -732,6 +772,47 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             raise _error(401, ErrorCode.INVALID_SESSION, "JSON 中没有 accessToken")
         item = remember(raw_session, bundle.user_agent, bundle.device_id)
 
+    view = store.view(order.id)
+    view.route_profile = str(route_plan.profile)
+    if route_plan.use_browser_context:
+        if not browser_decode_enabled():
+            if not browser_decode_fallback_a():
+                store.update_status(order.id, OrderStatus.REJECTED)
+                view.failure_code = "browser_decode_unavailable"
+                view.last_error = "浏览器解码未启用，Route C 已停止。"
+                _release_create_failure(claim_dir, order.id, idempotency_key)
+                raise HTTPException(503, detail={
+                    "code": "browser_decode_unavailable",
+                    "message": "浏览器解码未启用，Route C 已停止。",
+                })
+            route_plan = RoutePlan.for_profile("A")
+            view.route_profile = "A"
+        else:
+            try:
+                decoder = PlaywrightBrowserDecoder(
+                    headless=os.environ.get("GSS_BROWSER_HEADLESS", "0").strip().lower()
+                    in {"1", "true", "yes", "on"},
+                    timeout_ms=int(os.environ.get("GSS_BROWSER_TIMEOUT_MS", "30000") or "30000"),
+                    target_url=browser_decode_url(),
+                )
+                browser_context = await decoder.decode(target_url=browser_decode_url())
+            except BrowserDecodeUnavailable:
+                if not browser_decode_fallback_a():
+                    store.update_status(order.id, OrderStatus.REJECTED)
+                    view.failure_code = "browser_decode_unavailable"
+                    view.last_error = "浏览器解码失败，Route C 已停止。"
+                    _release_create_failure(claim_dir, order.id, idempotency_key)
+                    raise HTTPException(503, detail={
+                        "code": "browser_decode_unavailable",
+                        "message": "浏览器解码失败，Route C 已停止。",
+                    })
+                route_plan = RoutePlan.for_profile("A")
+                view.route_profile = "A"
+                browser_context = None
+            if browser_context is not None:
+                item.browser_context = browser_context.vault_dict()
+                item.purchase_attempt_id = order.purchase_attempt_id
+                vault.put(order.id, item)
     store.add_job(Job(order_id=order.id, stage="checkout"))
     item.profile = profile_from_session_ua(item.user_agent) or _pick_profile(item.device_id)
     if verified is not None:
@@ -744,7 +825,8 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         pipeline = build_pipeline()
     try:
         if verified is not None:
-            require_verified_billing(order_billing=verified, verification_id=verified.verification_id)
+            require_verified_billing(order_billing=verified, verification_id=verified.verification_id,
+                                    profile=verified)
         checkout = await _create_checkout_once(
             pipeline,
             proxy=exit_proxy or "",
@@ -759,6 +841,8 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             workspace_name=workspace,
             seat_quantity=seats,
             price_interval=interval,
+            browser_context=browser_context,
+            purchase_attempt_id=order.purchase_attempt_id,
             **({"verified_billing": verified} if verified is not None else {}),
         )
     except HTTPException:
@@ -766,6 +850,9 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         raise
     except DomainError as exc:
         store.update_status(order.id, OrderStatus.REJECTED)
+        store.view(order.id).failure_code = str(
+            classify_upstream_failure(exc=exc, stage="checkout").code
+        )
         error = _from_domain(exc, session_reissued=session_reissued, nonteam=plan is not Plan.TEAM)
         store.view(order.id).last_error = error.detail["message"]
         logger.info(
@@ -784,7 +871,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             if not getattr(checkout, "billing", None):
                 raise HTTPException(409, "未取得结账账单核对结果，已停止付款。")
             require_verified_billing(checkout.billing, order_billing=verified,
-                                     verification_id=verified.verification_id)
+                                     verification_id=verified.verification_id, profile=verified)
         except HTTPException:
             store.update_status(order.id, OrderStatus.REJECTED)
             raise
@@ -1544,6 +1631,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 device_id=getattr(secrets, "device_id", "") or "",
                 exit_country=getattr(secrets, "exit_country", "") or "",
                 pin_proxy=True,
+                browser_context=BrowserContext.from_dict(getattr(secrets, "browser_context", None)),
+                purchase_attempt_id=getattr(secrets, "purchase_attempt_id", ""),
             )
             hp.credentials_current = credentials_current
             hp.receipt_expected_minor = _minor(view.amount, currency) if view.amount is not None else None

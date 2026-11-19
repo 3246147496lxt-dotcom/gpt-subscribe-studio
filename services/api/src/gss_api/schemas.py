@@ -115,6 +115,9 @@ class SubscriptionOut(BaseModel):
 class OrderOut(BaseModel):
     id: str
     status: str
+    purchase_attempt_id: Optional[str] = None
+    route_profile: Optional[str] = None
+    failure_code: Optional[str] = None
     plan: str
     billing_country: str
     mode: ModeIn

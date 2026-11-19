@@ -358,6 +358,8 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
         return run_har_context(
             client, context, spec, card=card, billing=billing, read_only=read_only,
             exit_country=str(spec.get("exit_country") or ""),
+            browser_context=spec.get("browser_context"),
+            purchase_attempt_id=str(spec.get("purchase_attempt_id") or ""),
         )
     if "credentials_current" in spec:
         context["credentials_current"] = spec["credentials_current"]
