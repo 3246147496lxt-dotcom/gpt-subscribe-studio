@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -262,21 +263,25 @@ class PlusHarProtocol:
         self.raw: Dict[str, Any] = {}
 
     # ── lifecycle ──────────────────────────────────────────────────
+    @staticmethod
+    def _safe_close(handle: Any, timeout_s: float = 2.0) -> None:
+        if handle is None:
+            return
+        try:
+            worker = threading.Thread(target=handle.close, daemon=True)
+            worker.start()
+            worker.join(timeout_s)
+        except Exception:  # noqa: BLE001
+            pass
+
     def close(self) -> None:
         for handle in (self._web, self._stripe, self._m):
-            try:
-                if handle is not None:
-                    handle.close()
-            except Exception:  # noqa: BLE001
-                pass
+            self._safe_close(handle)
         self._web = None
         self._stripe = None
         self._m = None
         if self._owns_client and self.client is not None:
-            try:
-                self.client.close()
-            except Exception:  # noqa: BLE001
-                pass
+            self._safe_close(self.client)
 
     @staticmethod
     def _processor_from_url(url: str) -> str:
@@ -838,19 +843,11 @@ class PlusHarProtocol:
         Proxy, cookies, device identity and fingerprint stay identical; only the
         connection is re-established so a stale keep-alive cannot hang confirm.
         """
-        if self._web is not None:
-            try:
-                self._web.close()
-            except Exception:  # noqa: BLE001
-                pass
+        self._safe_close(self._web)
         self._web = None
 
     def _reset_stripe_session(self) -> None:
-        if self._stripe is not None:
-            try:
-                self._stripe.close()
-            except Exception:  # noqa: BLE001
-                pass
+        self._safe_close(self._stripe)
         self._stripe = None
 
     def _app_confirm(self) -> Dict[str, Any]:
