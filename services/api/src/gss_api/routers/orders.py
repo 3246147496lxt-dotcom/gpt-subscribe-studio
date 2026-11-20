@@ -457,8 +457,9 @@ def _from_domain(exc: DomainError, *, session_reissued: bool = False, nonteam: b
     status_code = status.HTTP_400_BAD_REQUEST
     if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED}:
         status_code = status.HTTP_401_UNAUTHORIZED
-    # 只报告已发生的重签发；不代表凭证已持久化，或仍可恢复。
-    message = "会话已重新签发，本次操作未完成。" if session_reissued else exc.message
+    # 只报告已发生的重签发；同时保留真实失败原因，避免把上游错误伪装成代理错误。
+    message = (f"会话已重新签发，但后续步骤失败：{exc.message}"
+               if session_reissued else exc.message)
     return _error(status_code, exc.code, read_text(message) if nonteam else message, session_reissued=session_reissued)
 
 
