@@ -1159,3 +1159,14 @@ def test_provider_billing_echo_vetoes_checkout_without_another_request(monkeypat
     assert exc.value.code is ErrorCode.BILLING_COUNTRY_MISMATCH
     assert "foreign-private-address" not in str(exc.value)
     assert calls[-1] == boundary and calls.count(boundary) == 1
+
+
+def test_pro_lite_cl_payload_uses_cl_price_but_keeps_us_tax_billing() -> None:
+    from gss_core.chatgpt import _checkout_body
+
+    body = _checkout_body(plan="pro_lite", country="CL", currency="CLP")
+    assert body["plan_name"] == "chatgptprolite"
+    assert body["billing_details"] == {"country": "CL", "currency": "CLP"}
+    assert body["checkout_ui_mode"] == "custom"
+    assert body["checkout_source"] == "chatgpt_web_merged"
+    assert body["purchase_attempt_id"]

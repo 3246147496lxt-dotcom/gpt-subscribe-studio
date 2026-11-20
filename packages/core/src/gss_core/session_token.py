@@ -213,7 +213,7 @@ def _parse_cookie_header(text: str) -> Dict[str, str]:
     return cookies
 
 
-__all__ = ["SessionBundle", "parse_session", "parse_session_bundle", "parse_statsig_context"]
+__all__ = ["SessionBundle", "parse_session", "parse_session_bundle", "parse_statsig_context", "identity_cookies_for_reissue"]
 
 def email_from_access_token(access_token: str) -> str:
     """从 ChatGPT accessToken（JWT）里取账户邮箱。
@@ -265,3 +265,18 @@ def email_from_access_token(access_token: str) -> str:
         if found:
             return found
     return ""
+
+
+# 跨区重签发只允许身份凭据进入新出口。旧环境 Cookie 带有签发地的
+# Cloudflare / 设备指纹，必须丢弃，不能在目标国家复用。
+REISSUE_COOKIE_ALLOWLIST = frozenset({"__Secure-next-auth.session-token"})
+
+
+def identity_cookies_for_reissue(cookies: Dict[str, str]) -> Dict[str, str]:
+    """Return only cookies that establish identity, never old geo/device state."""
+    return {
+        str(name): str(value)
+        for name, value in (cookies or {}).items()
+        if name in REISSUE_COOKIE_ALLOWLIST and value is not None
+    }
+

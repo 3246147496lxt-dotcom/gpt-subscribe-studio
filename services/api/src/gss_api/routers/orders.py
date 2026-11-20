@@ -458,8 +458,12 @@ def _from_domain(exc: DomainError, *, session_reissued: bool = False, nonteam: b
     if exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED}:
         status_code = status.HTTP_401_UNAUTHORIZED
     # 只报告已发生的重签发；同时保留真实失败原因，避免把上游错误伪装成代理错误。
-    message = (f"会话已重新签发，但后续步骤失败：{exc.message}"
-               if session_reissued else exc.message)
+    # 上游错误可能截断并回显 Cookie 值，不能把原始 message 直接拼进响应。
+    raw_reason = redact_sensitive(exc.message or "")
+    if re.search(r"(?i)(?:session-token|set-cookie|cookie)", raw_reason):
+        raw_reason = "上游拒绝建单（凭证内容已隐藏）"
+    message = (f"会话已重新签发，但后续步骤失败：{raw_reason}"
+               if session_reissued else raw_reason)
     return _error(status_code, exc.code, read_text(message) if nonteam else message, session_reissued=session_reissued)
 
 

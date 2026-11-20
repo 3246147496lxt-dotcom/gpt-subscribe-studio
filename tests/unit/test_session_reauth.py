@@ -64,6 +64,13 @@ def _session():
                 "userAgent": OLD_UA,
                 "country": "US",
             },
+            "cookies": {
+                "__cf_bm": "old-cloudflare",
+                "_cfuvid": "old-cfuvid",
+                "oai-did": "old-device-id",
+                "oai-sc": "old-sc",
+                "__Secure-next-auth.session-token": "core-session-token",
+            },
         }
     )
 
@@ -100,6 +107,10 @@ def test_reauthorize_drops_old_identity_and_uses_target_proxy(monkeypatch):
         # 旧 statsig 的 deviceId/UA 不能覆盖新生成的身份。
         assert client.device_id != "old-device-id"
         assert client.extra_cookies["oai-did"] == client.device_id
+        # Old Cloudflare / device-state cookies must not cross the region boundary.
+        assert "__cf_bm" not in client.extra_cookies
+        assert "_cfuvid" not in client.extra_cookies
+        assert client.extra_cookies.get("oai-sc") is None
     finally:
         client.close()
 

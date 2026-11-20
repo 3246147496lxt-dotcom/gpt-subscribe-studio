@@ -22,7 +22,12 @@ from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.money import quote_from_payload
 from gss_core.redaction import redact_sensitive
 from gss_core.sentinel import extract_attestation, extract_build, header_value, mint, so_header_value
-from gss_core.session_token import SessionBundle, parse_session_bundle, parse_statsig_context
+from gss_core.session_token import (
+    SessionBundle,
+    identity_cookies_for_reissue,
+    parse_session_bundle,
+    parse_statsig_context,
+)
 
 APP_BASE = "https://chatgpt.com"
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
@@ -585,7 +590,9 @@ class ChatGPTClient:
             session_country=country,
             language=locale_for(country),
             timezone=timezone_for(country),
-            extra_cookies={session_cookie: bundle.session_token},
+            extra_cookies=identity_cookies_for_reissue(
+                {session_cookie: bundle.session_token}
+            ),
         )
         try:
             if not client.refresh_session(trust_statsig=False):
@@ -1110,6 +1117,10 @@ class ChatGPTClient:
             workspace_name=workspace_name,
             seat_quantity=seat_quantity,
             price_interval=price_interval,
+        )
+        logger.info(
+            "checkout_payload plan=%s exit_country=%s billing_country=%s currency=%s keys=%s",
+            plan, country, tax_country, currency, sorted(body),
         )
         checkout_url = f"{APP_BASE}/backend-api/payments/checkout"
         response = self.http.post(
