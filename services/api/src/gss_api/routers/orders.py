@@ -933,7 +933,8 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             except DomainError as exc:
                 failure = classify_upstream_failure(exc=exc, stage="checkout")
                 retryable = str(failure.code) in {"unusual_activity", "proxy_tunnel_failed"}
-                if checkout_attempt == 0 and retryable and exit_proxy:
+                rotate_enabled = _env_on("GSS_CHECKOUT_ROTATE")
+                if checkout_attempt == 0 and retryable and exit_proxy and rotate_enabled:
                     logger.warning("checkout_proxy_rotating code=%s", failure.code)
                     exit_proxy = rotate_proxy_sid(exit_proxy, force=True)
                     item.proxy = exit_proxy
