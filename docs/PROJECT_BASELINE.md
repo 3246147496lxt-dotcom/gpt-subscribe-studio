@@ -498,3 +498,51 @@ tests/unit/test_persistence_and_locks.py
 ```text
 717 passed
 ```
+
+---
+
+## 10. 2026-11-20 核心业务功能实施状态
+
+### 自动关闭连续订阅
+
+```text
+[x] QuickPayRequest.auto_cancel_renew（默认 true）
+[x] 支付成功且订阅生效后执行，不影响 paid/delivered
+[x] auto_renew_status: disabled/pending/canceling/canceled/manual_required
+[x] 最多 2 次重试（1s + 4s）
+[x] vault 过期返回 vault_expired，要求人工登录取消
+[x] 手动重试接口不接收新 Session
+[x] 取消后 GET subscriptions 验证 will_renew=false
+[x] 数据库/API/前端状态展示
+```
+
+### 建单阶段 SID 轮换
+
+```text
+[x] fresh_proxy_sid / rotate_proxy_sid(force=True)
+[x] 仅在 create_checkout 遇到 unusual_activity / proxy_tunnel_failed 时重试
+[x] 最多 1 次自动重试（总计 2 次建单）
+[x] 不进入 confirm 阶段
+[x] proxy_rotations / proxy_last_sid 持久化
+[x] proxy_last_sid API 返回时截断为 abcd***wxyz
+```
+
+### 测试
+
+```text
+722 passed
+```
+
+新增测试：
+
+```text
+tests/unit/test_cancel_auto_renew.py
+tests/unit/test_checkout_proxy_rotation.py
+```
+
+### 仍需生产确认
+
+```text
+GSS_CANCEL_AUTORENEW_PATH 需要从真实 ChatGPT 取消续费请求确认后配置；
+未配置时自动取消会安全降级为 manual_required，不会猜测路径。
+```

@@ -183,3 +183,48 @@ POST /api/payments/locks/{lock_id}/release
   "operator": "web-operator"
 }
 ```
+
+## 自动关闭续费
+
+一键充值请求可传：
+
+```json
+{"auto_cancel_renew": true}
+```
+
+结果返回：
+
+```text
+auto_renew_status: disabled | pending | canceling_auto_renew | canceled | manual_required
+auto_renew_canceled_at
+auto_renew_error
+```
+
+手动重试：
+
+```http
+POST /api/orders/{order_id}/auto-renew/cancel
+```
+
+不接收新 Session；vault 过期返回：
+
+```text
+409 vault_expired
+```
+
+## 建单 SID 轮换
+
+仅建单阶段遇到 `unusual_activity` / `proxy_tunnel_failed` 时：
+
+```text
+最多自动重试 1 次
+confirm 阶段绝不换 SID
+```
+
+返回：
+
+```text
+proxy_rotations
+proxy_last_sid（截断脱敏）
+proxy_last_exit_ip
+```

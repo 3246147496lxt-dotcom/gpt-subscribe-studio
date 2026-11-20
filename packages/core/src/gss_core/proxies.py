@@ -240,9 +240,20 @@ def rewrite_proxy_exit(proxy: str, *, region: str = "", sid: str = "") -> str:
     return urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment))
 
 
-def rotate_proxy_sid(proxy: str) -> str:
-    """只换 SID，地区不变。"""
-    return rewrite_proxy_exit(proxy, sid=new_proxy_sid())
+def fresh_proxy_sid(exclude: set[str] | None = None) -> str:
+    """Generate a SID even when GSS_PROXY_SID is pinned (checkout retry only)."""
+    exclude = {str(item) for item in (exclude or set())}
+    alphabet = string.ascii_letters + string.digits
+    for _ in range(20):
+        sid = "".join(secrets.choice(alphabet) for _ in range(8))
+        if sid not in exclude:
+            return sid
+    return "".join(secrets.choice(alphabet) for _ in range(12))
+
+
+def rotate_proxy_sid(proxy: str, *, force: bool = False) -> str:
+    """只换 SID，地区不变。``force`` is reserved for pre-payment checkout retry."""
+    return rewrite_proxy_exit(proxy, sid=fresh_proxy_sid() if force else new_proxy_sid())
 
 
 def exit_country_for(session_country: str = "", billing_country: str = "") -> str:
@@ -367,6 +378,12 @@ def proxy_exit_region(proxy: str) -> str:
     username = unquote(urlsplit(str(proxy or "")).username or "")
     match = _REGION.search(username)
     return match[2].upper() if match else ""
+
+
+def proxy_exit_sid(proxy: str | None) -> str:
+    username = unquote(urlsplit(str(proxy or "")).username or "")
+    match = _SID.search(username)
+    return match.group(2) if match else ""
 
 
 def align_proxy_region(proxy: str | None, country: str) -> str | None:

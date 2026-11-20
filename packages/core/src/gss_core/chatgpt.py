@@ -2033,6 +2033,69 @@ class ChatGPTClient:
             _raise_stripe(payload, status)
         return payload
 
+    def cancel_auto_renew(self, *, plan_type: str = "") -> Dict[str, Any]:
+        """Cancel next renewal using the live order session.
+
+        The real ChatGPT cancel endpoint is deployment-specific and must be
+        verified from a browser capture. No endpoint is guessed here: if the
+        env var is absent, callers must mark manual_required.
+        """
+        path = os.environ.get("GSS_CANCEL_AUTORENEW_PATH", "").strip()
+        if not path:
+            raise DomainError(
+                ErrorCode.SUBSCRIPTION_NOT_ACTIVE,
+                "自动关闭续费接口未配置，需人工处理",
+            )
+        method = (os.environ.get("GSS_CANCEL_AUTORENEW_METHOD", "POST").strip().upper()
+                  or "POST")
+        if method not in {"POST", "PATCH", "PUT"}:
+            raise DomainError(ErrorCode.COMPLIANCE_BLOCKED, "自动关闭续费请求方法不支持")
+        subscription = self.subscription_payload()
+        subscription_id = ""
+        for block in (subscription, subscription.get("entitlement"),
+                      subscription.get("last_active_subscription")):
+            if isinstance(block, dict):
+                subscription_id = str(block.get("subscription_id") or subscription_id)
+        template = os.environ.get("GSS_CANCEL_AUTORENEW_BODY", "").strip()
+        body: Any = None
+        if template:
+            try:
+                rendered = template
+                for key, value in {
+                    "plan_type": _PLAN_TYPE.get(str(plan_type), str(plan_type)),
+                    "subscription_id": subscription_id,
+                    "account_id": self.account_id,
+                }.items():
+                    rendered = rendered.replace("{" + key + "}", str(value))
+                body = json.loads(rendered)
+            except (KeyError, ValueError, json.JSONDecodeError) as exc:
+                raise DomainError(
+                    ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                    "取消续费请求模板无效，已停止",
+                ) from exc
+        url = f"{APP_BASE}{path}"
+        headers = self._route_headers(path)
+        logger.info("cancel_auto_renew_start path=%s method=%s", path, method)
+        if method == "POST":
+            response = self.http.post(url, json=body, headers=headers, timeout=self.timeout)
+        elif method == "PATCH":
+            response = self.http.patch(url, json=body, headers=headers, timeout=self.timeout)
+        else:
+            response = self.http.put(url, json=body, headers=headers, timeout=self.timeout)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status == 401:
+            _log_upstream_failure(path, response)
+            raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效，无法关闭自动续费")
+        if status >= 400:
+            _log_upstream_failure(path, response)
+            raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "关闭自动续费请求失败")
+        verified = self.subscription_payload()
+        will_renew = _will_renew(verified)
+        if will_renew is True:
+            raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "上游未确认自动续费已关闭")
+        logger.info("cancel_auto_renew_ok path=%s will_renew=%s", path, will_renew)
+        return {"canceled": True, "will_renew": will_renew, "subscription_id": subscription_id}
+
     def subscription_payload(self) -> Dict[str, Any]:
         self._check_credentials()
         if not self.account_id:
@@ -2051,6 +2114,16 @@ class ChatGPTClient:
         if int(getattr(response, "status_code", 0) or 0) >= 400:
             self._raise(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, response, "查询订阅")
         return _json(response)
+
+
+
+def _will_renew(payload: Dict[str, Any]) -> Optional[bool]:
+    for block in (payload, payload.get("entitlement"),
+                  payload.get("last_active_subscription"),
+                  payload.get("subscription")):
+        if isinstance(block, dict) and "will_renew" in block:
+            return bool(block.get("will_renew"))
+    return None
 
 
 def _json(response: Any) -> Dict[str, Any]:

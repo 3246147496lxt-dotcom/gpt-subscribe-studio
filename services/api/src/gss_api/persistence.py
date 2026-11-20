@@ -104,6 +104,15 @@ class Persistence:
                 view_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                auto_cancel_renew INTEGER NOT NULL DEFAULT 0,
+                auto_renew_status TEXT NOT NULL DEFAULT 'disabled',
+                auto_renew_attempts INTEGER NOT NULL DEFAULT 0,
+                auto_renew_canceled_at TEXT,
+                auto_renew_error TEXT,
+                auto_renew_http_status INTEGER,
+                proxy_rotations INTEGER NOT NULL DEFAULT 0,
+                proxy_last_sid TEXT,
+                proxy_last_exit_ip TEXT,
                 unknown_since TEXT,
                 finished_at TEXT
             );
@@ -183,6 +192,15 @@ class Persistence:
         for statement in (
             "ALTER TABLE quick_pay_jobs ADD COLUMN lock_id TEXT",
             "ALTER TABLE order_events ADD COLUMN message TEXT",
+            "ALTER TABLE orders ADD COLUMN auto_cancel_renew INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN auto_renew_status TEXT NOT NULL DEFAULT 'disabled'",
+            "ALTER TABLE orders ADD COLUMN auto_renew_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN auto_renew_canceled_at TEXT",
+            "ALTER TABLE orders ADD COLUMN auto_renew_error TEXT",
+            "ALTER TABLE orders ADD COLUMN auto_renew_http_status INTEGER",
+            "ALTER TABLE orders ADD COLUMN proxy_rotations INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE orders ADD COLUMN proxy_last_sid TEXT",
+            "ALTER TABLE orders ADD COLUMN proxy_last_exit_ip TEXT",
         ):
             try:
                 self._conn.execute(statement)
@@ -207,7 +225,9 @@ class Persistence:
                 "session_reissued_for_country", "exit_country", "payment_status",
                 "delivery_status", "payment_intent_id", "observed_payment_id",
                 "paid_amount", "paid_currency", "tax_delta", "plan_type", "status_summary",
-                "receipt",
+                "receipt", "auto_cancel_renew", "auto_renew_status", "auto_renew_attempts",
+                "auto_renew_canceled_at", "auto_renew_error", "auto_renew_http_status",
+                "proxy_rotations", "proxy_last_sid", "proxy_last_exit_ip",
             )
             if not isinstance(getattr(view, name, None), (bytes, bytearray))
         }
@@ -225,6 +245,9 @@ class Persistence:
             view.payment_intent_id, view.checkout_session_id, view.checkout_kind,
             view.failure_code, view.last_error or view.quote_error, view.tax_delta,
             view.route_profile, int(view.billing_verified), int(view.session_reissued_for_country),
+            int(view.auto_cancel_renew), view.auto_renew_status, int(view.auto_renew_attempts),
+            view.auto_renew_canceled_at, view.auto_renew_error, view.auto_renew_http_status,
+            int(view.proxy_rotations), view.proxy_last_sid, view.proxy_last_exit_ip,
             self._view_to_json(view), order.created_at.isoformat(), _utcnow(),
             view.unknown_since if hasattr(view, "unknown_since") else None,
             view.finished_at if hasattr(view, "finished_at") else None,
@@ -237,8 +260,11 @@ class Persistence:
                     risk_acknowledged, status, payment_status, delivery_status, amount, cost,
                     currency, payment_intent_id, checkout_session_id, checkout_kind, failure_code,
                     last_error, tax_delta, route_profile, billing_verified, session_reissued,
+                    auto_cancel_renew, auto_renew_status, auto_renew_attempts,
+                    auto_renew_canceled_at, auto_renew_error, auto_renew_http_status,
+                    proxy_rotations, proxy_last_sid, proxy_last_exit_ip,
                     view_json, created_at, updated_at, unknown_since, finished_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     idempotency_key=excluded.idempotency_key,
                     account_fingerprint=excluded.account_fingerprint,
@@ -258,6 +284,15 @@ class Persistence:
                     billing_verified=excluded.billing_verified,
                     session_reissued=excluded.session_reissued,
                     view_json=excluded.view_json,
+                    auto_cancel_renew=excluded.auto_cancel_renew,
+                    auto_renew_status=excluded.auto_renew_status,
+                    auto_renew_attempts=excluded.auto_renew_attempts,
+                    auto_renew_canceled_at=excluded.auto_renew_canceled_at,
+                    auto_renew_error=excluded.auto_renew_error,
+                    auto_renew_http_status=excluded.auto_renew_http_status,
+                    proxy_rotations=excluded.proxy_rotations,
+                    proxy_last_sid=excluded.proxy_last_sid,
+                    proxy_last_exit_ip=excluded.proxy_last_exit_ip,
                     updated_at=excluded.updated_at,
                     unknown_since=excluded.unknown_since,
                     finished_at=excluded.finished_at""",

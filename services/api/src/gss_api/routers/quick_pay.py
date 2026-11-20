@@ -6,6 +6,7 @@ from fastapi import APIRouter, Header, HTTPException
 from ..schemas import QuickPayJobOut, QuickPayRequest
 from ..services.order_flow import get_job, get_job_by_key, start_quick_pay
 from .. import locks
+from .orders import mask_sid
 from ..persistence import get_db_optional
 
 router = APIRouter(prefix="/api/payments", tags=["quick-pay"])
@@ -27,6 +28,12 @@ def _out(job) -> QuickPayJobOut:
         currency=job.currency,
         failure_code=job.failure_code,
         message=job.message,
+        auto_renew_status=getattr(job, "auto_renew_status", "disabled"),
+        auto_renew_canceled_at=getattr(job, "auto_renew_canceled_at", None),
+        auto_renew_error=getattr(job, "auto_renew_error", None),
+        proxy_rotations=getattr(job, "proxy_rotations", 0),
+        proxy_last_sid=mask_sid(getattr(job, "proxy_last_sid", None)),
+        proxy_last_exit_ip=getattr(job, "proxy_last_exit_ip", None),
     )
 
 

@@ -57,6 +57,7 @@ class OrderCreateRequest(AddressedRequest):
     workspace_name: str = ""
     seat_quantity: Optional[int] = None
     price_interval: str = "month"
+    auto_cancel_renew: bool = False
 
     @field_validator("billing_country")
     @classmethod
@@ -153,6 +154,15 @@ class OrderOut(BaseModel):
     plan_type: Optional[str] = None
     status_summary: Optional[str] = None
     receipt: Optional[Dict[str, Any]] = None
+    auto_cancel_renew: bool = False
+    auto_renew_status: str = "disabled"
+    auto_renew_attempts: int = 0
+    auto_renew_canceled_at: Optional[str] = None
+    auto_renew_error: Optional[str] = None
+    auto_renew_http_status: Optional[int] = None
+    proxy_rotations: int = 0
+    proxy_last_sid: Optional[str] = None
+    proxy_last_exit_ip: Optional[str] = None
 
     @model_serializer(mode="wrap")
     def _preserve_team_contract(self, serialize):
@@ -183,6 +193,7 @@ class QuickPayRequest(AddressedRequest):
     workspace_name: str = ""
     seat_quantity: Optional[int] = None
     price_interval: str = "month"
+    auto_cancel_renew: bool = True
     debug_checkout_only: bool = False
 
 
@@ -206,3 +217,9 @@ class QuickPayJobOut(BaseModel):
     currency: Optional[str] = None
     failure_code: Optional[str] = None
     message: Optional[str] = None
+    auto_renew_status: str = "disabled"
+    auto_renew_canceled_at: Optional[str] = None
+    auto_renew_error: Optional[str] = None
+    proxy_rotations: int = 0
+    proxy_last_sid: Optional[str] = None
+    proxy_last_exit_ip: Optional[str] = None

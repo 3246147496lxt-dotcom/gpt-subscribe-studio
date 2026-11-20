@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 
 from gss_contracts.errors import DomainError
+from gss_core.chatgpt import ChatGPTClient
 from gss_core.redaction import redact_sensitive
 
 from ..schemas import BillingIn, OrderCreateRequest, QuickPayRequest
@@ -42,6 +43,12 @@ class QuickPayJob:
     timings: Dict[str, Any] = field(default_factory=dict)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     lock_id: Optional[str] = None
+    auto_renew_status: str = "disabled"
+    auto_renew_canceled_at: Optional[str] = None
+    auto_renew_error: Optional[str] = None
+    proxy_rotations: int = 0
+    proxy_last_sid: Optional[str] = None
+    proxy_last_exit_ip: Optional[str] = None
     locked_by: Optional[str] = None
     lease_until: Optional[float] = None
     started_at: float = field(default_factory=time.time)
@@ -170,6 +177,56 @@ def start_quick_pay(payload: QuickPayRequest, idempotency_key: str,
     return job
 
 
+async def _cancel_auto_renew(job: QuickPayJob, *, order_id: str, plan: str) -> None:
+    view = orders.store.view(order_id)
+    if not view.auto_cancel_renew:
+        view.auto_renew_status = "disabled"
+        job.auto_renew_status = "disabled"
+        return
+    _set_stage(job, "canceling_auto_renew", "正在关闭下期自动续费")
+    view.auto_renew_status = "canceling_auto_renew"
+    orders.store.persist(order_id)
+    secrets = orders.vault.get(order_id)
+    if secrets is None:
+        view.auto_renew_status = "manual_required"
+        view.auto_renew_error = "vault_expired"
+        job.auto_renew_status = "manual_required"
+        job.auto_renew_error = "vault_expired"
+        orders.store.persist(order_id)
+        return
+    plan_type = orders.normalize_plan_name(plan)
+    last_error = ""
+    attempts = 0
+    for attempt in range(3):
+        attempts = attempt + 1
+        view.auto_renew_attempts = attempts
+        try:
+            client = await asyncio.to_thread(
+                ChatGPTClient.from_raw_session, secrets.session, proxy=secrets.proxy,
+            )
+            try:
+                await asyncio.to_thread(client.cancel_auto_renew, plan_type=plan_type)
+            finally:
+                client.close()
+            view.auto_renew_status = "canceled"
+            view.auto_renew_canceled_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            job.auto_renew_status = "canceled"
+            job.auto_renew_canceled_at = view.auto_renew_canceled_at
+            orders.store.persist(order_id)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = _safe_message(exc)
+            if "未配置" in last_error or "Session" in last_error:
+                break
+            if attempt < 2:
+                await asyncio.sleep(1 if attempt == 0 else 4)
+    view.auto_renew_status = "manual_required"
+    view.auto_renew_error = last_error or "cancel_failed"
+    job.auto_renew_status = "manual_required"
+    job.auto_renew_error = view.auto_renew_error
+    orders.store.persist(order_id)
+
+
 async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: str) -> QuickPayJob:
     job = _jobs.get(job_id)
     if job is None:
@@ -220,6 +277,12 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         job.order_id = order.id
         view = orders.store.view(order.id)
         view.account_fingerprint = job.account_fingerprint
+        view.auto_cancel_renew = bool(payload.auto_cancel_renew)
+        view.auto_renew_status = "pending" if payload.auto_cancel_renew else "disabled"
+        job.auto_renew_status = view.auto_renew_status
+        job.proxy_rotations = view.proxy_rotations
+        job.proxy_last_sid = view.proxy_last_sid
+        job.proxy_last_exit_ip = view.proxy_last_exit_ip
         orders.store.persist(order.id)
         job.purchase_attempt_id = order.purchase_attempt_id
         job.amount = order.amount
@@ -254,6 +317,8 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         if status == "succeeded" or state == "paid":
             job.status = "succeeded"
             job.stage = "succeeded"
+            await _cancel_auto_renew(job, order_id=job.order_id or order.id, plan=payload.plan)
+            job.stage = "auto_renew_canceled" if job.auto_renew_status == "canceled" else "succeeded"
         elif state in {"failed", "rejected", "card_declined"}:
             job.status = "failed"
             job.stage = "failed"

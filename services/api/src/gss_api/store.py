@@ -54,6 +54,15 @@ class OrderView:
     plan_type: Optional[str] = None
     status_summary: Optional[str] = None
     receipt: Optional[Dict[str, Any]] = None
+    auto_cancel_renew: bool = False
+    auto_renew_status: str = "disabled"
+    auto_renew_attempts: int = 0
+    auto_renew_canceled_at: Optional[str] = None
+    auto_renew_error: Optional[str] = None
+    auto_renew_http_status: Optional[int] = None
+    proxy_rotations: int = 0
+    proxy_last_sid: Optional[str] = None
+    proxy_last_exit_ip: Optional[str] = None
     unknown_since: Optional[str] = None
     finished_at: Optional[str] = None
 

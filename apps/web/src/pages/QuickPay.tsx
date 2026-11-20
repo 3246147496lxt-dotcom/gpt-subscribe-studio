@@ -22,6 +22,8 @@ const STAGE_LABEL: Record<string, string> = {
   checkout_created: "结账单已生成",
   confirming_payment: "正在完成扣款确认",
   verifying_delivery: "正在核验订阅交付",
+  canceling_auto_renew: "正在关闭自动续费",
+  auto_renew_canceled: "自动续费已关闭",
   succeeded: "充值成功",
   failed: "充值失败",
   unknown: "扣款结果待核对",
@@ -83,6 +85,7 @@ export function QuickPay() {
   const [expiry, setExpiry] = useState("");
   const [cvc, setCvc] = useState("");
   const [debugOnly, setDebugOnly] = useState(false);
+  const [autoCancelRenew, setAutoCancelRenew] = useState(true);
   const [busy, setBusy] = useState(false);
   const [job, setJob] = useState<QuickPayJob | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -138,6 +141,7 @@ export function QuickPay() {
           plan, exit_country: exitCountry, billing_country: "US", session: session.trim(),
           card: { number: digits, exp_month: month, exp_year: year.length === 2 ? `20${year}` : year, cvc },
           mode: { account_source: "customer_session", card_source: "customer", billing_mode: "standard", risk_acknowledged: false },
+          auto_cancel_renew: autoCancelRenew,
           debug_checkout_only: false,
         }, crypto.randomUUID());
         setJob(created);
@@ -169,6 +173,7 @@ export function QuickPay() {
         plan, exit_country: exitCountry, billing_country: "US", session: session.trim(),
         card: { number: "0000000000000000", cvc: "000", exp_month: "01", exp_year: "2030" },
         mode: { account_source: "customer_session", card_source: "customer", billing_mode: "standard", risk_acknowledged: false },
+        auto_cancel_renew: autoCancelRenew,
         debug_checkout_only: true,
       }, crypto.randomUUID());
       setJob(created);
@@ -213,6 +218,9 @@ export function QuickPay() {
           <Textarea label="ChatGPT Session JSON" placeholder="粘贴完整 session JSON" rows={8} value={session}
             onChange={(event) => setSession(event.currentTarget.value)} disabled={busy}
             styles={{ input: { height: 200, resize: "none" } }} />
+          <Switch checked={autoCancelRenew} onChange={(event) => setAutoCancelRenew(event.currentTarget.checked)}
+            disabled={busy} label="充值后自动关闭连续订阅"
+            description="扣款成功后设置到期不自动续费，保留当前周期权益；不会退款。" />
           <Group grow align="end">
             <Select label="套餐" value={plan} onChange={(value) => setPlan((value as Plan) || "plus")} disabled={busy}
               data={[{ value: "plus", label: "Plus" }, { value: "go", label: "Go" }, { value: "pro_lite", label: "Pro Standard" }, { value: "pro", label: "Pro More" }, { value: "pro_max", label: "Pro Max" }]} />
@@ -264,6 +272,8 @@ export function QuickPay() {
               {job.order_id && <Text size="sm">订单：<Code>{job.order_id}</Code></Text>}
               {job.amount && <Text size="sm">金额：<strong>{job.amount} {job.currency}</strong></Text>}
               {job.purchase_attempt_id && <Text size="sm">尝试：<Code>{job.purchase_attempt_id}</Code></Text>}
+              {job.auto_renew_status === "canceled" && <Badge color="green">自动续费已关闭</Badge>}
+              {job.auto_renew_status === "manual_required" && <Badge color="orange">自动续费待人工处理</Badge>}
             </Group>
             {job.failure_code && <Alert color="red" title={FAILURE_LABEL[job.failure_code] || "充值失败"}>{job.message}</Alert>}
             {job.events && job.events.length > 0 && (

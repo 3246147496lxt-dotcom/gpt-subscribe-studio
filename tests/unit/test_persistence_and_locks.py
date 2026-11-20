@@ -23,6 +23,8 @@ def test_roundtrip_persists_unknown_and_never_stores_secret_fields(tmp_path):
     order = _order()
     view = OrderView(payment_status="processing", payment_intent_id="pi_test_1",
                      account_fingerprint="fingerprint-1", exit_country="CL",
+                     auto_cancel_renew=True, auto_renew_status="pending",
+                     proxy_rotations=1, proxy_last_sid="abcd1234wxyz",
                      unknown_since="2026-11-20T00:00:00+00:00")
     db.save_order(order, view, account_fingerprint=view.account_fingerprint)
     rows = db.load_orders()
@@ -32,6 +34,9 @@ def test_roundtrip_persists_unknown_and_never_stores_secret_fields(tmp_path):
     assert loaded_view.payment_status == "processing"
     assert loaded_view.payment_intent_id == "pi_test_1"
     assert loaded_view.exit_country == "CL"
+    assert loaded_view.auto_cancel_renew is True
+    assert loaded_view.auto_renew_status == "pending"
+    assert loaded_view.proxy_rotations == 1
     assert fingerprint == "fingerprint-1"
 
     conn = sqlite3.connect(tmp_path / "gss.db")

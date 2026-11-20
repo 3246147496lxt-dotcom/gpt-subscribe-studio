@@ -20,6 +20,12 @@ export type QuickPayJob = {
   currency?: string | null;
   failure_code?: string | null;
   message?: string | null;
+  auto_renew_status?: string;
+  auto_renew_canceled_at?: string | null;
+  auto_renew_error?: string | null;
+  proxy_rotations?: number;
+  proxy_last_sid?: string | null;
+  proxy_last_exit_ip?: string | null;
 };
 
 export type QuickPayInput = {
@@ -29,6 +35,7 @@ export type QuickPayInput = {
   session: string;
   card: { number: string; cvc: string; exp_month: string; exp_year: string };
   mode: { account_source: "customer_session"; card_source: "customer"; billing_mode: "standard"; risk_acknowledged: boolean };
+  auto_cancel_renew: boolean;
   debug_checkout_only: boolean;
 };
 

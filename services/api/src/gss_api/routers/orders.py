@@ -50,7 +50,13 @@ from gss_core.hosted import TeamHostedClient
 from gss_core.plus_protocol import PlusProtocol
 from gss_core.plus_har_protocol import PlusHarProtocol
 from gss_core.stripe_protocol import StripeProtocol, PaymentOutcome
-from gss_core.proxies import ProxyPreflightError, checkout_proxy_for, verify_refresh_egress
+from gss_core.proxies import (
+    ProxyPreflightError,
+    checkout_proxy_for,
+    proxy_exit_sid,
+    rotate_proxy_sid,
+    verify_refresh_egress,
+)
 from gss_core.redaction import redact_sensitive
 from gss_core.chatgpt import (
     ChatGPTClient,
@@ -439,6 +445,15 @@ def _to_out(order: Order) -> OrderOut:
         status_summary=(view.status_summary if team else read_text(view.status_summary))
         or _default_status_summary(view.payment_status, view.delivery_status),
         receipt=(view.receipt or None) if team else receipt_view(view.receipt),
+        auto_cancel_renew=view.auto_cancel_renew,
+        auto_renew_status=view.auto_renew_status,
+        auto_renew_attempts=view.auto_renew_attempts,
+        auto_renew_canceled_at=view.auto_renew_canceled_at,
+        auto_renew_error=view.auto_renew_error,
+        auto_renew_http_status=view.auto_renew_http_status,
+        proxy_rotations=view.proxy_rotations,
+        proxy_last_sid=mask_sid(view.proxy_last_sid),
+        proxy_last_exit_ip=view.proxy_last_exit_ip,
     )
 
 
@@ -465,6 +480,15 @@ def _from_domain(exc: DomainError, *, session_reissued: bool = False, nonteam: b
     message = (f"会话已重新签发，但后续步骤失败：{raw_reason}"
                if session_reissued else raw_reason)
     return _error(status_code, exc.code, read_text(message) if nonteam else message, session_reissued=session_reissued)
+
+
+def mask_sid(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value)
+    if len(text) <= 8:
+        return "***"
+    return text[:4] + "***" + text[-4:]
 
 
 def normalize_plan_name(value: str) -> str:
@@ -755,6 +779,8 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         store.create_order(order, idempotency_key)
         view = store.view(order.id)
         view.account_fingerprint = fingerprint
+        view.auto_cancel_renew = bool(payload.auto_cancel_renew)
+        view.auto_renew_status = "pending" if payload.auto_cancel_renew else "disabled"
         view.create_request_tag = tag
         view.purchase_attempt_id = order.purchase_attempt_id
         view.session_reissued_for_country = session_reissued
@@ -882,24 +908,46 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         if verified is not None:
             require_verified_billing(order_billing=verified, verification_id=verified.verification_id,
                                     profile=verified)
-        checkout = await _create_checkout_once(
-            pipeline,
-            proxy=exit_proxy or "",
-            session_reissued=session_reissued,
-            session=raw_session,
-            plan=plan,
-            billing_country=country,
-            exit_country=exit_country,
-            mode=mode,
-            promo_code=promo_code,
-            promo_campaign_id=promo_campaign_id,
-            workspace_name=workspace,
-            seat_quantity=seats,
-            price_interval=interval,
-            browser_context=browser_context,
-            purchase_attempt_id=order.purchase_attempt_id,
-            **({"verified_billing": verified} if verified is not None else {}),
-        )
+        checkout = None
+        for checkout_attempt in range(2):
+            try:
+                checkout = await _create_checkout_once(
+                    pipeline,
+                    proxy=exit_proxy or "",
+                    session_reissued=session_reissued,
+                    session=raw_session,
+                    plan=plan,
+                    billing_country=country,
+                    exit_country=exit_country,
+                    mode=mode,
+                    promo_code=promo_code,
+                    promo_campaign_id=promo_campaign_id,
+                    workspace_name=workspace,
+                    seat_quantity=seats,
+                    price_interval=interval,
+                    browser_context=browser_context,
+                    purchase_attempt_id=order.purchase_attempt_id,
+                    **({"verified_billing": verified} if verified is not None else {}),
+                )
+                break
+            except DomainError as exc:
+                failure = classify_upstream_failure(exc=exc, stage="checkout")
+                retryable = str(failure.code) in {"unusual_activity", "proxy_tunnel_failed"}
+                if checkout_attempt == 0 and retryable and exit_proxy:
+                    logger.warning("checkout_proxy_rotating code=%s", failure.code)
+                    exit_proxy = rotate_proxy_sid(exit_proxy, force=True)
+                    item.proxy = exit_proxy
+                    item.session = raw_session
+                    vault.put(order.id, item)
+                    view.proxy_rotations += 1
+                    view.proxy_last_sid = proxy_exit_sid(exit_proxy)
+                    view.proxy_last_exit_ip = None
+                    store.persist(order.id)
+                    _mark(progress, "checkout_retry_started")
+                    continue
+                raise
+        if checkout is None:
+            raise _error(502, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "建单未返回结果")
     except HTTPException:
         store.update_status(order.id, OrderStatus.REJECTED)
         raise
@@ -1478,6 +1526,66 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
             view.subscription = info
             view.last_error = "尚未核实本单付款"
     # An unpaid checkout or a client-supplied paid flag provides no settlement evidence.
+    return _to_out(order)
+
+
+
+
+@router.post("/orders/{order_id}/auto-renew/cancel", response_model=OrderOut)
+async def cancel_auto_renew(order_id: str) -> OrderOut:
+    """Manual retry of the post-payment auto-renew cancellation.
+
+    Deliberately does not accept a new session: the operation must reuse the
+    original session/proxy, otherwise it can touch the wrong account or region.
+    """
+    order = store.get_order(order_id)
+    if order is None:
+        raise _error(status.HTTP_404_NOT_FOUND, ErrorCode.COMPLIANCE_BLOCKED, "订单不存在")
+    view = store.view(order_id)
+    if view.payment_status != "succeeded":
+        raise HTTPException(409, detail={"code": "auto_renew_not_paid",
+                                         "message": "订单尚未确认扣款成功，不能取消续费"})
+    if not view.auto_cancel_renew:
+        view.auto_renew_status = "disabled"
+        return _to_out(order)
+    if view.auto_renew_status == "canceled":
+        return _to_out(order)
+    secrets = vault.get(order_id)
+    if secrets is None:
+        view.auto_renew_status = "manual_required"
+        view.auto_renew_error = "vault_expired"
+        store.persist(order_id)
+        raise HTTPException(409, detail={"code": "vault_expired",
+                                         "message": "原订单会话上下文已过期，请人工登录账号取消续费"})
+    view.auto_renew_status = "canceling_auto_renew"
+    view.auto_renew_attempts = 0
+    store.persist(order_id)
+    last_error = ""
+    for attempt in range(3):
+        view.auto_renew_attempts = attempt + 1
+        try:
+            client = await asyncio.to_thread(
+                ChatGPTClient.from_raw_session, secrets.session, proxy=secrets.proxy,
+            )
+            try:
+                await asyncio.to_thread(client.cancel_auto_renew,
+                                        plan_type=normalize_plan_name(str(order.plan)))
+            finally:
+                client.close()
+            view.auto_renew_status = "canceled"
+            view.auto_renew_canceled_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            view.auto_renew_error = None
+            store.persist(order_id)
+            return _to_out(order)
+        except Exception as exc:  # noqa: BLE001
+            last_error = redact_sensitive(str(exc))[:300]
+            if "未配置" in last_error or "Session" in last_error:
+                break
+            if attempt < 2:
+                await asyncio.sleep(1 if attempt == 0 else 4)
+    view.auto_renew_status = "manual_required"
+    view.auto_renew_error = last_error or "cancel_failed"
+    store.persist(order_id)
     return _to_out(order)
 
 
