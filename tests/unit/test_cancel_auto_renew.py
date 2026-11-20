@@ -40,16 +40,18 @@ def test_cancel_auto_renew_uses_template_and_verifies(monkeypatch):
 
     def subscription_payload():
         calls["n"] += 1
-        return {"will_renew": True} if calls["n"] == 1 else {"will_renew": False}
+        base = {"will_renew": True} if calls["n"] == 1 else {"will_renew": False}
+        base["entitlement"] = {"subscription_id": "sub_nested_1"}
+        return base
 
     monkeypatch.setattr(client, "subscription_payload", subscription_payload)
     result = client.cancel_auto_renew(plan_type="pro_lite")
     assert result["canceled"] is True
     assert result["will_renew"] is False
-    assert http.calls and http.calls[0][1].endswith("/backend-api/subscriptions//cancel")
+    assert http.calls and http.calls[0][1].endswith("/backend-api/subscriptions/sub_nested_1/cancel")
     assert http.calls[0][2] == {
         "plan_type": "prolite",
-        "subscription_id": "",
+        "subscription_id": "sub_nested_1",
         "account_id": "acct-1",
     }
 
@@ -89,3 +91,20 @@ def test_order_flow_cancel_marks_canceled(monkeypatch):
     asyncio.run(order_flow._cancel_auto_renew(job, order_id=order.id, plan="pro_lite"))
     assert view.auto_renew_status == "canceled"
     assert job.auto_renew_status == "canceled"
+
+
+class _RedirectHttp(_Http):
+    def post(self, url, **kwargs):
+        return type("R", (), {"status_code": 302, "url": url, "text": "",
+                               "headers": {"location": "https://billing.stripe.com/p/session/x"},
+                               "json": lambda self: {}})()
+
+
+def test_cancel_redirects_to_stripe_portal(monkeypatch):
+    monkeypatch.setenv("GSS_CANCEL_AUTORENEW_PATH", "/backend-api/subscriptions/cancel")
+    client = ChatGPTClient(access_token="token", account_id="acct-1")
+    client._http = _RedirectHttp()
+    monkeypatch.setattr(client, "subscription_payload", lambda: {"entitlement": {"subscription_id": "sub_1"}})
+    with pytest.raises(DomainError) as exc:
+        client.cancel_auto_renew(plan_type="pro_lite")
+    assert "Stripe" in exc.value.message

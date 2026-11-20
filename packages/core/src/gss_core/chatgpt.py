@@ -2051,12 +2051,16 @@ class ChatGPTClient:
         if method not in {"POST", "PATCH", "PUT"}:
             raise DomainError(ErrorCode.COMPLIANCE_BLOCKED, "自动关闭续费请求方法不支持")
         subscription = self.subscription_payload()
-        subscription_id = ""
-        for block in (subscription, subscription.get("entitlement"),
-                      subscription.get("last_active_subscription")):
-            if isinstance(block, dict):
-                subscription_id = str(block.get("subscription_id") or subscription_id)
+        subscription_id = _subscription_id(subscription)
+        if not self.account_id:
+            self.hydrate()
         template = os.environ.get("GSS_CANCEL_AUTORENEW_BODY", "").strip()
+        if "{subscription_id}" in path or "{subscription_id}" in template:
+            if not subscription_id:
+                raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "无法从订阅响应提取 subscription_id")
+        if "{account_id}" in path or "{account_id}" in template:
+            if not self.account_id:
+                raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "无法提取 account_id")
         body: Any = None
         if template:
             try:
@@ -2093,6 +2097,14 @@ class ChatGPTClient:
         if status == 401:
             _log_upstream_failure(path, response)
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效，无法关闭自动续费")
+        if 300 <= status < 400:
+            headers = getattr(response, "headers", {}) or {}
+            location = str(headers.get("location") or headers.get("Location") or "")
+            if "billing.stripe.com" in location or status in {301, 302, 303, 307, 308}:
+                raise DomainError(
+                    ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                    "上游要求跳转 Stripe 账单门户，需人工处理",
+                )
         if status >= 400:
             _log_upstream_failure(path, response)
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "关闭自动续费请求失败")
@@ -2122,6 +2134,32 @@ class ChatGPTClient:
             self._raise(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, response, "查询订阅")
         return _json(response)
 
+
+
+def _nested_first(payload: Any, keys: tuple[str, ...], *, depth: int = 0) -> str:
+    if depth > 8:
+        return ""
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for key in ("entitlement", "last_active_subscription", "subscription",
+                    "current_subscription", "data", "result"):
+            if key in payload:
+                found = _nested_first(payload[key], keys, depth=depth + 1)
+                if found:
+                    return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _nested_first(item, keys, depth=depth + 1)
+            if found:
+                return found
+    return ""
+
+
+def _subscription_id(payload: Dict[str, Any]) -> str:
+    return _nested_first(payload, ("subscription_id", "id"))
 
 
 def _will_renew(payload: Dict[str, Any]) -> Optional[bool]:
