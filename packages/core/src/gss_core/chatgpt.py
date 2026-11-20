@@ -2073,8 +2073,15 @@ class ChatGPTClient:
                     ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                     "取消续费请求模板无效，已停止",
                 ) from exc
-        url = f"{APP_BASE}{path}"
-        headers = self._route_headers(path)
+        rendered_path = path
+        for key, value in {
+            "plan_type": _PLAN_TYPE.get(str(plan_type), str(plan_type)),
+            "subscription_id": subscription_id,
+            "account_id": self.account_id,
+        }.items():
+            rendered_path = rendered_path.replace("{" + key + "}", str(value))
+        url = f"{APP_BASE}{rendered_path}"
+        headers = self._route_headers(rendered_path)
         logger.info("cancel_auto_renew_start path=%s method=%s", path, method)
         if method == "POST":
             response = self.http.post(url, json=body, headers=headers, timeout=self.timeout)

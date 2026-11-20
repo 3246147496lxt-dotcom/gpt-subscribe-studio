@@ -29,7 +29,7 @@ class _Http:
 
 
 def test_cancel_auto_renew_uses_template_and_verifies(monkeypatch):
-    monkeypatch.setenv("GSS_CANCEL_AUTORENEW_PATH", "/backend-api/subscriptions/cancel")
+    monkeypatch.setenv("GSS_CANCEL_AUTORENEW_PATH", "/backend-api/subscriptions/{subscription_id}/cancel")
     monkeypatch.setenv("GSS_CANCEL_AUTORENEW_METHOD", "POST")
     monkeypatch.setenv("GSS_CANCEL_AUTORENEW_BODY",
                        '{"plan_type":"{plan_type}","subscription_id":"{subscription_id}","account_id":"{account_id}"}')
@@ -46,7 +46,8 @@ def test_cancel_auto_renew_uses_template_and_verifies(monkeypatch):
     result = client.cancel_auto_renew(plan_type="pro_lite")
     assert result["canceled"] is True
     assert result["will_renew"] is False
-    assert http.calls and http.calls[0][2] == {
+    assert http.calls and http.calls[0][1].endswith("/backend-api/subscriptions//cancel")
+    assert http.calls[0][2] == {
         "plan_type": "prolite",
         "subscription_id": "",
         "account_id": "acct-1",
