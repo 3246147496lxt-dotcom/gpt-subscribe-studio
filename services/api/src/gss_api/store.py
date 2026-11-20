@@ -16,6 +16,7 @@ class OrderView:
     # RAM-only keyed equality check; never part of the public order projection.
     create_request_tag: Optional[bytes] = field(default=None, repr=False)
     purchase_attempt_id: Optional[str] = None
+    account_fingerprint: Optional[str] = field(default=None, repr=False)
     route_profile: str = "A"
     failure_code: Optional[str] = None
     checkout_url: Optional[str] = None
@@ -53,6 +54,8 @@ class OrderView:
     plan_type: Optional[str] = None
     status_summary: Optional[str] = None
     receipt: Optional[Dict[str, Any]] = None
+    unknown_since: Optional[str] = None
+    finished_at: Optional[str] = None
 
 
 class InMemoryStore:
@@ -61,6 +64,34 @@ class InMemoryStore:
         self.jobs: Dict[str, Job] = {}
         self.views: Dict[str, OrderView] = {}
         self._idempotency: Dict[str, str] = {}
+        self.db = None
+
+    def attach_db(self, db) -> None:
+        """Attach SQLite persistence and rehydrate known orders."""
+        self.db = db
+        for order, view, fingerprint in db.load_orders():
+            self.orders[order.id] = order
+            self.views[order.id] = view
+            if fingerprint:
+                view.account_fingerprint = fingerprint
+            if order.idempotency_key:
+                self._idempotency[order.idempotency_key] = order.id
+        for row in db.load_idempotency():
+            if row.get("order_id"):
+                self._idempotency[row["key"]] = row["order_id"]
+
+    def persist(self, order_id: str) -> None:
+        if self.db is None:
+            return
+        order = self.orders.get(order_id)
+        if order is None:
+            return
+        view = self.views.setdefault(order_id, OrderView())
+        try:
+            self.db.save_order(order, view, account_fingerprint=view.account_fingerprint)
+        except Exception:
+            # Persistence failure must never crash a financial request.
+            pass
 
     def forget_idempotency(self, key: Optional[str]) -> None:
         if key:
@@ -77,6 +108,7 @@ class InMemoryStore:
         self.views.setdefault(order.id, OrderView())
         if idempotency_key:
             self._idempotency[idempotency_key] = order.id
+        self.persist(order.id)
         return order
 
     def get_order(self, order_id: str) -> Optional[Order]:
@@ -88,6 +120,13 @@ class InMemoryStore:
     def update_status(self, order_id: str, status: OrderStatus) -> Order:
         order = self.orders[order_id]
         order.status = status
+        if self.db is not None:
+            try:
+                self.db.save_idempotency(order.idempotency_key, "order_create",
+                                         order_id=order.id, state=str(status))
+            except Exception:
+                pass
+        self.persist(order_id)
         return order
 
     def add_job(self, job: Job) -> Job:
@@ -102,6 +141,11 @@ class InMemoryStore:
         self.jobs.clear()
         self.views.clear()
         self._idempotency.clear()
+        if self.db is not None:
+            try:
+                self.db.clear_all()
+            except Exception:
+                pass
 
 
 store = InMemoryStore()

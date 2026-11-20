@@ -65,6 +65,7 @@ GET  /api/payments/quick-pay/{job_id}
 ```json
 {
   "job_id": "JOB_ID",
+  "lock_id": null,
   "status": "running",
   "stage": "browser_decode",
   "order_id": "ORDER_ID",
@@ -148,3 +149,37 @@ message=仅建单完成，未提交卡
 - 前端不要打印请求体；
 - 终态后不得用同一订单重复提交卡；
 - `unknown` 状态禁止自动换卡重试。
+
+## unknown 锁
+
+当 `status=unknown` 时，`lock_id` 非空：
+
+```json
+{
+  "status": "unknown",
+  "stage": "unknown",
+  "lock_id": "LOCK_ID",
+  "order_id": "ORDER_ID"
+}
+```
+
+同一账号再次提交会返回：
+
+```text
+HTTP 409
+code=payment_unknown_lock
+```
+
+解锁：
+
+```http
+POST /api/payments/locks/{lock_id}/release
+```
+
+```json
+{
+  "confirm_no_charge": true,
+  "note": "已核对银行账单，无扣款",
+  "operator": "web-operator"
+}
+```

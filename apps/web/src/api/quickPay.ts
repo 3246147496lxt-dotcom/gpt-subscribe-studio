@@ -2,6 +2,7 @@ import type { Plan } from "./client";
 
 export type QuickPayJob = {
   job_id: string;
+  lock_id?: string | null;
   status: "queued" | "running" | "succeeded" | "failed" | "unknown";
   stage: string;
   order_id?: string | null;
@@ -44,4 +45,33 @@ export async function startQuickPay(input: QuickPayInput, idempotencyKey: string
 export async function getQuickPay(jobId: string): Promise<QuickPayJob> {
   const response = await fetch(`/api/payments/quick-pay/${encodeURIComponent(jobId)}`, { cache: "no-store" });
   return parse<QuickPayJob>(response);
+}
+
+export type PaymentLock = {
+  id: string;
+  lock_key: string;
+  lock_type: string;
+  order_id?: string | null;
+  job_id?: string | null;
+  idempotency_key?: string | null;
+  payment_intent_id?: string | null;
+  state: "held" | "released";
+  reason: string;
+  created_at: string;
+  released_at?: string | null;
+  released_by?: string | null;
+  release_note?: string | null;
+};
+
+export async function releasePaymentLock(lockId: string, note: string): Promise<PaymentLock> {
+  const response = await fetch(`/api/payments/locks/${encodeURIComponent(lockId)}/release`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm_no_charge: true, note, operator: "web-operator" }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(body?.detail?.message || `解锁失败 HTTP ${response.status}`);
+  }
+  return body.lock as PaymentLock;
 }

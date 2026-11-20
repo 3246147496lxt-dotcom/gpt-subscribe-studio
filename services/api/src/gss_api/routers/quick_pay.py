@@ -5,6 +5,7 @@ from fastapi import APIRouter, Header, HTTPException
 
 from ..schemas import QuickPayJobOut, QuickPayRequest
 from ..services.order_flow import get_job, get_job_by_key, start_quick_pay
+from .. import locks
 
 router = APIRouter(prefix="/api/payments", tags=["quick-pay"])
 
@@ -12,6 +13,7 @@ router = APIRouter(prefix="/api/payments", tags=["quick-pay"])
 def _out(job) -> QuickPayJobOut:
     return QuickPayJobOut(
         job_id=job.id,
+        lock_id=getattr(job, "lock_id", None),
         status=job.status,
         stage=job.stage,
         order_id=job.order_id,
@@ -38,7 +40,15 @@ async def quick_pay(
     existing = get_job_by_key(key)
     if existing is not None:
         return _out(existing)
-    job = start_quick_pay(payload, key)
+    fingerprint = locks.account_fingerprint(payload.session)
+    held = locks.find_active_lock(fingerprint)
+    if held is not None:
+        raise HTTPException(409, detail={
+            "code": "payment_unknown_lock",
+            "message": "存在未核销的 unknown 订单，请先人工核对账单",
+            **locks.lock_payload(held),
+        })
+    job = start_quick_pay(payload, key, fingerprint)
     return _out(job)
 
 

@@ -431,3 +431,44 @@ tests/unit/test_upstream_errors.py
 tests/unit/test_quick_pay_flow.py
 docs/QUICK_PAY_API.md
 ```
+
+---
+
+## 8. 2026-11-20 P0 加固实施状态
+
+本轮已实施 `GAP-F1`、`GAP-F2`、`GAP-F4` 的第一版：
+
+```text
+[x] SQLite 持久化：orders / quick_pay_jobs / idempotency_keys / account_locks / order_events
+[x] WAL + busy_timeout=5000 + foreign_keys=ON
+[x] GSS_DB_PATH / GSS_DATA_DIR，生产 /data，本地 ./data 自动创建
+[x] 启动时自动建表/迁移
+[x] unknown/processing 写入 account_locks
+[x] 同账号 held 锁返回 409 payment_unknown_lock
+[x] 人工解锁接口：confirm_no_charge + 非空备注
+[x] 解锁前复查本地 payment_status，已成功订单拒绝解锁
+[x] 启动恢复：confirming/verifying 阶段的 running job 转为 unknown 并加锁
+[x] React 19 localStorage 硬锁 + 二次确认 Modal
+[x] 数据库字段白名单：不含 card / cvc / session / cookie
+```
+
+当前剩余边界：
+
+```text
+- 仍是单节点 SQLite；多副本需迁移 PostgreSQL
+- 人工解锁只复查本地 payment_status；没有重新调用 Stripe GET 时，
+  不能把“unknown”自动改判为“no charge”
+- quick-pay 任务 lease 尚未实现，两个 worker 同时跑同一 job 仍需互斥
+```
+
+测试基线：
+
+```text
+714 passed
+```
+
+新增测试：
+
+```text
+tests/unit/test_persistence_and_locks.py
+```

@@ -27,6 +27,7 @@ from gss_core.vault import vault
 from ..public_payment import protocol_view
 from ..schemas import AddressedRequest, BillingIn, CardIn
 from ..store import store
+from .. import locks
 from .events import notify_order_update
 from .orders import (
     PAID_AWAITING_ENTITLEMENT, PAYMENT_UNCONFIRMED,
@@ -209,11 +210,13 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
             result["message"] = PAYMENT_UNCONFIRMED
             _set_payment_status(order.id, "processing", summary=PAYMENT_UNCONFIRMED)
             store.update_status(order.id, OrderStatus.UNKNOWN)
+            locks.hold_order_unknown(order.id, reason="unknown_payment")
         elif context.get("app_confirmation_started"):
             _set_payment_status(order.id, "processing")
             store.update_status(order.id, OrderStatus.PAYING)
     if result.get("code"):
         view.failure_code = str(result["code"])
+    store.persist(order.id)
     result.update({
         "payment_status": view.payment_status,
         "delivery_status": view.delivery_status,

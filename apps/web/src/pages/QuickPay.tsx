@@ -1,10 +1,10 @@
 import {
-  Alert, Badge, Button, Card, Code, Group, Progress, Select, Stack, Switch, Text, Textarea, TextInput, Title,
+  Alert, Badge, Button, Card, Checkbox, Code, Group, Modal, Progress, Select, Stack, Switch, Text, Textarea, TextInput, Title,
 } from "@mantine/core";
 import { IconBolt, IconCheck, IconX } from "@tabler/icons-react";
 import { useMemo, useState } from "react";
 
-import { getQuickPay, startQuickPay, type QuickPayJob } from "../api/quickPay";
+import { getQuickPay, releasePaymentLock, startQuickPay, type QuickPayJob } from "../api/quickPay";
 import type { Plan } from "../api/client";
 import { REGIONS } from "../plans";
 
@@ -46,6 +46,19 @@ function terminal(job: QuickPayJob) {
   return job.status === "succeeded" || job.status === "failed" || job.status === "unknown";
 }
 
+const LOCK_KEY = "gss.quickpay.unknown_lock";
+
+type StoredLock = { lock_id: string; order_id?: string | null; payment_intent_id?: string | null; locked_at: string; reason: string };
+
+function readLock(): StoredLock | null {
+  try {
+    const raw = window.localStorage.getItem(LOCK_KEY);
+    return raw ? JSON.parse(raw) as StoredLock : null;
+  } catch {
+    return null;
+  }
+}
+
 export function QuickPay() {
   const [session, setSession] = useState("");
   const [plan, setPlan] = useState<Plan>("plus");
@@ -57,6 +70,11 @@ export function QuickPay() {
   const [busy, setBusy] = useState(false);
   const [job, setJob] = useState<QuickPayJob | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [locked, setLocked] = useState<StoredLock | null>(() => readLock());
+  const [unlockOpen, setUnlockOpen] = useState(false);
+  const [unlockConfirmed, setUnlockConfirmed] = useState(false);
+  const [unlockNote, setUnlockNote] = useState("");
+  const [unlockBusy, setUnlockBusy] = useState(false);
 
   const progress = useMemo(() => {
     const order = ["creating_order", "reissuing", "browser_decode", "checkout_created", "confirming_payment", "verifying_delivery", "succeeded"];
@@ -66,8 +84,31 @@ export function QuickPay() {
     return Math.min(100, Math.round(((idx + 1) / order.length) * 100));
   }, [job]);
 
+  function persistLock(next: StoredLock) {
+    window.localStorage.setItem(LOCK_KEY, JSON.stringify(next));
+    setLocked(next);
+  }
+
+  async function unlock() {
+    if (!locked || !unlockConfirmed || !unlockNote.trim()) return;
+    setUnlockBusy(true);
+    try {
+      await releasePaymentLock(locked.lock_id, unlockNote.trim());
+      window.localStorage.removeItem(LOCK_KEY);
+      setLocked(null);
+      setUnlockOpen(false);
+      setUnlockConfirmed(false);
+      setUnlockNote("");
+      setError(null);
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "解锁失败");
+    } finally {
+      setUnlockBusy(false);
+    }
+  }
+
   async function submit() {
-    if (busy) return;
+    if (busy || locked) return;
     if (!session.trim()) { setError("请粘贴 ChatGPT Session JSON。"); return; }
     if (!debugOnly) {
       const [month, year] = expiry.split("/").map((part) => part.trim());
@@ -88,6 +129,15 @@ export function QuickPay() {
           await sleep(i < 10 ? 1000 : i < 60 ? 2000 : 5000);
           const current = await getQuickPay(created.job_id);
           setJob(current);
+          if (current.status === "unknown") {
+            persistLock({
+              lock_id: current.lock_id || "",
+              order_id: current.order_id,
+              payment_intent_id: null,
+              locked_at: new Date().toISOString(),
+              reason: "unknown_payment",
+            });
+          }
           if (terminal(current)) break;
         }
       } catch (exc) {
@@ -110,6 +160,15 @@ export function QuickPay() {
         await sleep(1000);
         const current = await getQuickPay(created.job_id);
         setJob(current);
+        if (current.status === "unknown") {
+          persistLock({
+            lock_id: current.lock_id || "",
+            order_id: current.order_id,
+            payment_intent_id: null,
+            locked_at: new Date().toISOString(),
+            reason: "unknown_payment",
+          });
+        }
         if (terminal(current)) break;
       }
     } catch (exc) {
@@ -121,6 +180,14 @@ export function QuickPay() {
 
   return (
     <Stack gap="lg">
+      {locked && (
+        <Alert color="red" title="已锁定：存在未核销的 unknown 订单">
+          订单 {locked.order_id || "-"} 的扣款结果待核对。当前页面禁止再次提交；请核对银行账单后再解锁。
+          <Group mt="sm">
+            <Button color="red" variant="outline" onClick={() => setUnlockOpen(true)}>人工确认账单未扣款</Button>
+          </Group>
+        </Alert>
+      )}
       <Card withBorder radius="lg" p="lg" className="workspace-panel">
         <Stack gap="md">
           <div>
@@ -149,8 +216,8 @@ export function QuickPay() {
           )}
           <Group justify="space-between">
             <Text size="sm" c="dimmed">账单地址：美国免税地址（服务端固定，只读）</Text>
-            <Button leftSection={<IconBolt size={17} />} loading={busy} disabled={busy} onClick={() => void submit()}>
-              {busy ? "处理中" : debugOnly ? "仅建单" : "立即充值"}
+            <Button leftSection={<IconBolt size={17} />} loading={busy} disabled={busy || Boolean(locked)} onClick={() => void submit()}>
+              {locked ? "已锁定" : busy ? "处理中" : debugOnly ? "仅建单" : "立即充值"}
             </Button>
           </Group>
           {error && <Alert color="red" title="请求失败">{error}</Alert>}
@@ -178,6 +245,22 @@ export function QuickPay() {
           </Stack>
         </Card>
       )}
+
+      <Modal opened={unlockOpen} onClose={() => setUnlockOpen(false)} title="确认账单未扣款" centered>
+        <Stack>
+          <Text size="sm">请先登录银行或 Stripe 核对，确认本笔没有扣款。解锁后不会恢复原支付，只会允许发起新单。</Text>
+          <Checkbox checked={unlockConfirmed} onChange={(event) => setUnlockConfirmed(event.currentTarget.checked)}
+            label="我已核对账单，确认没有扣款" />
+          <Textarea label="操作备注" placeholder="例如：已核对 11-20 账单，无扣款" value={unlockNote}
+            onChange={(event) => setUnlockNote(event.currentTarget.value)} minRows={3} />
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setUnlockOpen(false)} disabled={unlockBusy}>取消</Button>
+            <Button color="red" loading={unlockBusy} disabled={!unlockConfirmed || !unlockNote.trim()} onClick={() => void unlock()}>
+              确认解锁
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
     </Stack>
   );
 }

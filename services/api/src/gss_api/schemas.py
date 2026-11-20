@@ -188,6 +188,7 @@ class QuickPayRequest(AddressedRequest):
 
 class QuickPayJobOut(BaseModel):
     job_id: str
+    lock_id: Optional[str] = None
     status: str
     stage: str
     order_id: Optional[str] = None

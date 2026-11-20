@@ -15,8 +15,9 @@ from gss_core import install_logging_filter
 from gss_core.config import load_settings, missing_upstreams, use_fake_adapters
 from gss_core.proxies import GatewayStore, configured_proxy
 
+from .persistence import init_db
 from .store import store
-from .routers import events, orders, promo, proxies, quick_pay, saved_cards, protocol_cards
+from .routers import events, locks, orders, promo, proxies, quick_pay, saved_cards, protocol_cards
 
 __version__ = "0.1.0"
 
@@ -61,6 +62,10 @@ def create_app() -> FastAPI:
     install_logging_filter(logging.getLogger("gss"))
     settings = load_settings()
     proxy_sid_pinned = _check_pinned_proxy_sid()
+    db = init_db()
+    store.attach_db(db)
+    from .locks import recover_incomplete_jobs
+    recover_incomplete_jobs()
 
     app = FastAPI(
         title="gpt-subscribe-studio API",
@@ -88,6 +93,7 @@ def create_app() -> FastAPI:
 
     app.include_router(orders.router)
     app.include_router(quick_pay.router)
+    app.include_router(locks.router)
     app.include_router(saved_cards.router)
     app.include_router(protocol_cards.router)
     app.include_router(promo.router)

@@ -87,7 +87,7 @@ from ..schemas import (
     TeamQuoteRequest,
 )
 from ..store import store
-from .. import purchase_claims
+from .. import locks, purchase_claims
 from .events import notify_order_update
 
 router = APIRouter(prefix="/api", tags=["orders"])
@@ -611,6 +611,14 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         bundle = parse_session_bundle(raw_session)
     except ValueError as exc:
         raise _error(status.HTTP_401_UNAUTHORIZED, ErrorCode.INVALID_SESSION, str(exc))
+    fingerprint = locks.account_fingerprint(raw_session)
+    held = locks.find_active_lock(fingerprint)
+    if held is not None:
+        raise HTTPException(409, detail={
+            "code": "payment_unknown_lock",
+            "message": "存在未核销的 unknown 订单，请先人工核对账单",
+            **locks.lock_payload(held),
+        })
     
     if payload.billing_country is not None and not is_supported(payload.billing_country):
         raise _error(
@@ -740,6 +748,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         vault.put(order.id, item)
         store.create_order(order, idempotency_key)
         view = store.view(order.id)
+        view.account_fingerprint = fingerprint
         view.create_request_tag = tag
         view.purchase_attempt_id = order.purchase_attempt_id
         view.session_reissued_for_country = session_reissued
