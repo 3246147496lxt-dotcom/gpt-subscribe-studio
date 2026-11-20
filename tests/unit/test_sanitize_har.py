@@ -19,6 +19,7 @@ def test_filters_static_and_redacts_sensitive_values():
                     {"name": "Cookie", "value": "session=secret"},
                     {"name": "Authorization", "value": "Bearer secret"},
                     {"name": "Content-Type", "value": "application/json"},
+                    {"name": "x-openai-target-route", "value": "/backend-api/payments/checkout"},
                 ],
                 "postData": {"mimeType": "application/json", "text": json.dumps({
                     "plan_name": "chatgptprolite",
@@ -45,7 +46,10 @@ def test_filters_static_and_redacts_sensitive_values():
     assert entry["path"] == "/backend-api/payments/checkout"
     assert entry["status"] == 200
     assert entry["time_ms"] == 12.5
-    assert entry["request_headers"] == {"content-type": "application/json"}
+    assert entry["request_headers"] == {
+        "content-type": "application/json",
+        "x-openai-target-route": "/backend-api/payments/checkout",
+    }
     assert entry["request_json"]["plan_name"] == "chatgptprolite"
     assert entry["request_json"]["card"] == module.REDACTED
     assert entry["request_json"]["email"] == module.REDACTED

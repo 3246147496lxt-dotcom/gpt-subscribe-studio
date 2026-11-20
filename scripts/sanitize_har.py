@@ -45,7 +45,12 @@ KEEP_VALUE_KEYS = {
     "total", "subtotal", "unit_amount", "quantity", "minorUnitsAmount",
     "created", "livemode",
 }
-SAFE_HEADER_NAMES = {"content-type", "accept"}
+SAFE_HEADER_NAMES = {
+    "content-type", "accept", "accept-language",
+    "x-openai-target-path", "x-openai-target-route",
+    "originator", "x-openai-web-frontend",
+    "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
+}
 
 
 def _is_static(entry: dict[str, Any], path: str) -> bool:
