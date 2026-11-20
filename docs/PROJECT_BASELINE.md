@@ -464,7 +464,7 @@ docs/QUICK_PAY_API.md
 测试基线：
 
 ```text
-714 passed
+715 passed
 ```
 
 新增测试：

@@ -91,3 +91,20 @@ def test_unknown_lock_blocks_and_manual_release_requires_confirmation(tmp_path, 
     assert ok and released["state"] == "released"
     assert locks.find_active_lock("fp-lock") is None
     assert db.get_lock(lock["id"])["released_by"] == "tester"
+
+
+def test_release_refuses_payment_that_is_already_succeeded(tmp_path, monkeypatch):
+    db = Persistence(str(tmp_path / "gss.db"))
+    monkeypatch.setattr(persistence, "_db", db)
+    store = InMemoryStore()
+    store.attach_db(db)
+    monkeypatch.setattr(locks, "store", store)
+    order = _order("order-paid-lock")
+    order.status = OrderStatus.ACTIVE
+    store.orders[order.id] = order
+    store.views[order.id] = OrderView(payment_status="succeeded", account_fingerprint="fp-paid")
+    lock = locks.hold_unknown(fingerprint="fp-paid", order_id=order.id)
+    ok, message, _ = locks.release(lock["id"], confirm_no_charge=True, note="checked", operator="tester")
+    assert not ok
+    assert "成功" in message
+    assert db.get_lock(lock["id"])["state"] == "held"
