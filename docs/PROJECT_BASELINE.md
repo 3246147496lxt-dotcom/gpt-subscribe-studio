@@ -472,3 +472,29 @@ docs/QUICK_PAY_API.md
 ```text
 tests/unit/test_persistence_and_locks.py
 ```
+
+---
+
+## 9. 2026-11-20 P1 可观测性实施状态
+
+已实施：
+
+```text
+[x] QuickPayJobOut.timings_ms
+[x] order_events 状态时间线 / QuickPayJobOut.events
+[x] FAILURE_LABEL 中文提示与排查指引补全
+[x] pro5 -> pro_lite 服务端别名
+```
+
+前端展示：
+
+```text
+排队 / 建单 / 重签发 / 浏览器解码 / 创建结账单 / 支付确认 / 总耗时
+最近阶段事件时间线
+```
+
+测试：
+
+```text
+717 passed
+```

@@ -467,6 +467,12 @@ def _from_domain(exc: DomainError, *, session_reissued: bool = False, nonteam: b
     return _error(status_code, exc.code, read_text(message) if nonteam else message, session_reissued=session_reissued)
 
 
+def normalize_plan_name(value: str) -> str:
+    """Accept competitor-facing aliases while keeping Plan.pro_lite internal."""
+    name = str(value or "").strip().lower()
+    return "pro_lite" if name == "pro5" else name
+
+
 def _env_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -580,7 +586,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         return _to_out(existing)
 
     try:
-        plan = Plan(payload.plan)
+        plan = Plan(normalize_plan_name(payload.plan))
     except ValueError:
         raise _error(status.HTTP_400_BAD_REQUEST, ErrorCode.COMPLIANCE_BLOCKED, f"未知套餐: {payload.plan}")
 

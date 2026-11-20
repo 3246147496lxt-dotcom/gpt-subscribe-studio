@@ -66,6 +66,11 @@ def test_quick_pay_job_lock_roundtrip(tmp_path):
     assert row["status"] == "unknown"
     assert row["lock_id"] == "lock-1"
     assert row["account_fingerprint"] == "fp-job"
+    db.add_event(stage="checkout_created", event="succeeded", job_id="job-1",
+                 message="结账单已生成")
+    events = db.list_events(job_id="job-1")
+    assert events and events[0]["stage"] == "checkout_created"
+    assert events[0]["message"] == "结账单已生成"
 
 
 def test_unknown_lock_blocks_and_manual_release_requires_confirmation(tmp_path, monkeypatch):

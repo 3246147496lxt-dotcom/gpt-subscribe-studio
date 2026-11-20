@@ -6,6 +6,7 @@ the job record, order, vault, or logs.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -115,6 +116,23 @@ def _persist_job(job: QuickPayJob) -> None:
             pass
 
 
+def _event(job: QuickPayJob, stage: str, message: str = "") -> None:
+    db = get_db_optional()
+    if db is not None:
+        try:
+            db.add_event(stage=stage, event=job.status, order_id=job.order_id or "",
+                         job_id=job.id, message=message)
+        except Exception:
+            pass
+
+
+def _set_stage(job: QuickPayJob, stage: str, message: str = "", *, event: bool = True) -> None:
+    if job.stage != stage and event:
+        _event(job, stage, message)
+    job.stage = stage
+    _persist_job(job)
+
+
 def _from_db_job(row: dict) -> QuickPayJob:
     return QuickPayJob(
         id=row["id"], idempotency_key=row["idempotency_key"],
@@ -123,7 +141,8 @@ def _from_db_job(row: dict) -> QuickPayJob:
         purchase_attempt_id=row.get("purchase_attempt_id"),
         amount=row.get("amount"), currency=row.get("currency"),
         failure_code=row.get("failure_code"), message=row.get("message"),
-        lock_id=row.get("lock_id"), started_at=0, finished_at=None,
+        lock_id=row.get("lock_id"), timings=json.loads(row.get("timings_json") or "{}"),
+        started_at=0, finished_at=None,
     )
 
 
@@ -158,9 +177,13 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
     if job.status != "queued":
         return job
     job.status = "running"
-    job.stage = "creating_order"
-    _persist_job(job)
+    run_started = time.monotonic()
+    if job.started_at > 1_000_000_000:
+        job.timings["queue_ms"] = max(0, int((time.time() - job.started_at) * 1000))
+    _set_stage(job, "creating_order", "已接受任务，开始建单")
+    _event(job, "running", job.stage)
     card = payload.card.model_dump()  # local only; never assigned to job
+    stage_started: Dict[str, float] = {"creating_order": run_started}
     try:
         create_payload = OrderCreateRequest(
             plan=payload.plan,
@@ -174,9 +197,25 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             seat_quantity=payload.seat_quantity,
             price_interval=payload.price_interval,
         )
+        def progress(stage: str) -> None:
+            now = time.monotonic()
+            if stage in {"reissuing", "browser_decode", "creating_checkout"}:
+                stage_started[stage] = now
+            if stage == "reissued":
+                job.timings["reissue_ms"] = int((now - stage_started.get("reissuing", now)) * 1000)
+            elif stage == "session_refreshed":
+                job.timings["reissue_ms"] = int((now - stage_started.get("session_refresh", now)) * 1000)
+            elif stage == "browser_decoded":
+                job.timings["browser_decode_ms"] = int((now - stage_started.get("browser_decode", now)) * 1000)
+            elif stage == "browser_decode_skipped":
+                job.timings["browser_decode_ms"] = 0
+            elif stage == "checkout_created":
+                job.timings["create_checkout_ms"] = int((now - stage_started.get("creating_checkout", now)) * 1000)
+                job.timings["create_order_ms"] = int((now - run_started) * 1000)
+            _set_stage(job, stage)
+
         order = await orders._create_order(
-            create_payload, idempotency_key,
-            progress=lambda stage: (setattr(job, "stage", stage), _persist_job(job)),
+            create_payload, idempotency_key, progress=progress,
         )
         job.order_id = order.id
         view = orders.store.view(order.id)
@@ -185,16 +224,19 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         job.purchase_attempt_id = order.purchase_attempt_id
         job.amount = order.amount
         job.currency = order.currency
-        job.stage = "checkout_created"
-        _persist_job(job)
+        _set_stage(job, "checkout_created", "结账单已生成")
         if payload.debug_checkout_only:
             job.status = "succeeded"
             job.stage = "checkout_created"
             job.message = "仅建单完成，未提交卡"
             job.finished_at = time.time()
+            job.timings["total_ms"] = int((time.monotonic() - run_started) * 1000)
+            _event(job, "succeeded", job.message)
+            _persist_job(job)
             return job
 
-        job.stage = "confirming_payment"
+        _set_stage(job, "confirming_payment", "正在提交卡片并确认支付")
+        payment_started = time.monotonic()
         order_billing = BillingIn(**order.billing) if getattr(order, "billing", None) else None
         bind_payload = protocol_cards.BindProtocolRequest(
             card=payload.card,
@@ -203,7 +245,8 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             expected_currency=str(order.currency or ""),
         )
         result = await protocol_cards.bind_and_pay_protocol(order.id, bind_payload)
-        job.stage = "verifying_delivery"
+        job.timings["payment_ms"] = int((time.monotonic() - payment_started) * 1000)
+        _set_stage(job, "verifying_delivery", "支付已提交，正在核验交付")
         status = str(result.get("payment_status") or "")
         state = str(result.get("state") or "")
         job.failure_code = str(result.get("code") or "") or None
@@ -216,7 +259,7 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             job.stage = "failed"
         elif state == "unknown" or status == "processing":
             job.status = "unknown"
-            job.stage = "unknown"
+            _set_stage(job, "unknown", "扣款结果待核对，已锁定")
             held = locks.hold_order_unknown(
                 job.order_id or "", job_id=job.id, reason="unknown_payment",
             )
@@ -225,6 +268,8 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             job.status = "failed"
             job.stage = "failed"
         job.finished_at = time.time()
+        job.timings["total_ms"] = int((time.monotonic() - run_started) * 1000)
+        _event(job, job.status, job.message or "")
         _persist_job(job)
         return job
     except Exception as exc:  # noqa: BLE001
@@ -233,6 +278,8 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         job.failure_code = _error_code(exc)
         job.message = _error_message(exc)
         job.finished_at = time.time()
+        job.timings["total_ms"] = int((time.monotonic() - run_started) * 1000)
+        _event(job, "failed", job.message or "")
         _persist_job(job)
         logger.warning(
             "quick_pay_failed job=%s order=%s code=%s type=%s",

@@ -28,14 +28,30 @@ const STAGE_LABEL: Record<string, string> = {
 };
 
 const FAILURE_LABEL: Record<string, string> = {
-  card_declined: "发卡行拒付或卡限额",
-  insufficient_funds: "卡片余额不足",
-  subscription_limit: "账号已达到订阅上限",
-  unusual_activity: "上游判定异常流量",
-  sentinel_challenge_failed: "安全验证失败",
-  proxy_tunnel_failed: "代理连接失败",
-  upstream_timeout: "上游超时",
-  browser_decode_unavailable: "浏览器解码不可用",
+  card_declined: "发卡行拒付或卡限额；请换卡或联系发卡行",
+  insufficient_funds: "卡片余额不足；请充值或换卡",
+  subscription_limit: "账号已达到订阅上限；请换账号或先处理现有订阅",
+  unusual_activity: "上游判定异常流量；请换同国家 SID 或换干净 Session",
+  sentinel_challenge_failed: "安全验证失败；已熔断，未继续扣款",
+  proxy_tunnel_failed: "代理连接失败；请检查出口节点是否可用",
+  proxy_authentication_failed: "代理认证失败；请检查代理账号或权限",
+  upstream_timeout: "上游超时；请勿自动重复扣款，先核对账单",
+  browser_decode_unavailable: "浏览器解码不可用；请检查 Chromium/Playwright 环境",
+  checkout_upstream_error: "建单被上游拒绝；请查看阶段日志和 failure_code",
+  invalid_session: "Session 无效或缺少必要凭证；请重新导出完整 Session JSON",
+  session_expired: "Session 已过期；请重新登录并导出新 Session",
+  payment_unknown_state: "扣款结果待核对；已锁定，请人工确认账单",
+  unknown_upstream: "未分类上游错误；请保留订单号和阶段日志排查",
+};
+
+const TIMING_LABEL: Record<string, string> = {
+  queue_ms: "排队",
+  create_order_ms: "建单",
+  reissue_ms: "重签发",
+  browser_decode_ms: "浏览器解码",
+  create_checkout_ms: "创建结账单",
+  payment_ms: "支付确认",
+  total_ms: "总耗时",
 };
 
 function sleep(ms: number) {
@@ -234,12 +250,32 @@ export function QuickPay() {
               </Badge>
             </Group>
             <Progress value={progress} animated={!terminal(job)} />
+            {job.timings_ms && Object.keys(job.timings_ms).length > 0 && (
+              <Group gap="xs" wrap="wrap">
+                {Object.entries(TIMING_LABEL).map(([key, label]) => {
+                  const value = job.timings_ms?.[key];
+                  return value === undefined ? null : (
+                    <Badge key={key} variant="light">{label} {value} ms</Badge>
+                  );
+                })}
+              </Group>
+            )}
             <Group gap="lg">
               {job.order_id && <Text size="sm">订单：<Code>{job.order_id}</Code></Text>}
               {job.amount && <Text size="sm">金额：<strong>{job.amount} {job.currency}</strong></Text>}
               {job.purchase_attempt_id && <Text size="sm">尝试：<Code>{job.purchase_attempt_id}</Code></Text>}
             </Group>
             {job.failure_code && <Alert color="red" title={FAILURE_LABEL[job.failure_code] || "充值失败"}>{job.message}</Alert>}
+            {job.events && job.events.length > 0 && (
+              <Stack gap={4}>
+                <Text size="sm" fw={600}>阶段时间线</Text>
+                {job.events.slice(-8).map((event, index) => (
+                  <Text key={`${event.created_at}-${index}`} size="xs" c="dimmed">
+                    {new Date(event.created_at).toLocaleTimeString()} · {STAGE_LABEL[event.stage] || event.stage} · {event.message}
+                  </Text>
+                ))}
+              </Stack>
+            )}
             {job.status === "succeeded" && <Alert color="green" icon={<IconCheck size={18} />}>{job.message || "充值成功"}</Alert>}
             {job.status === "unknown" && <Alert color="orange" icon={<IconX size={18} />}>扣款结果待核对，请勿重复提交。</Alert>}
           </Stack>

@@ -186,9 +186,18 @@ class QuickPayRequest(AddressedRequest):
     debug_checkout_only: bool = False
 
 
+class QuickPayEventOut(BaseModel):
+    state: str
+    stage: str
+    message: str = ""
+    created_at: str
+
+
 class QuickPayJobOut(BaseModel):
     job_id: str
     lock_id: Optional[str] = None
+    timings_ms: Dict[str, int] = Field(default_factory=dict)
+    events: list[QuickPayEventOut] = Field(default_factory=list)
     status: str
     stage: str
     order_id: Optional[str] = None

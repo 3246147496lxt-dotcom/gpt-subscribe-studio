@@ -170,18 +170,24 @@ class Persistence:
                 job_id TEXT,
                 stage TEXT NOT NULL,
                 event TEXT NOT NULL,
+                message TEXT,
                 code TEXT,
                 elapsed_ms INTEGER,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_events_order ON order_events(order_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_events_job ON order_events(job_id, created_at);
             """
         )
-        try:
-            self._conn.execute("ALTER TABLE quick_pay_jobs ADD COLUMN lock_id TEXT")
-        except sqlite3.OperationalError:
-            pass
+        for statement in (
+            "ALTER TABLE quick_pay_jobs ADD COLUMN lock_id TEXT",
+            "ALTER TABLE order_events ADD COLUMN message TEXT",
+        ):
+            try:
+                self._conn.execute(statement)
+            except sqlite3.OperationalError:
+                pass
         self._conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
             (str(SCHEMA_VERSION),),
@@ -396,16 +402,34 @@ class Persistence:
 
     # -- events ------------------------------------------------------------- #
     def add_event(self, *, stage: str, event: str, order_id: str = "", job_id: str = "",
-                  code: str = "", elapsed_ms: Optional[int] = None,
+                  message: str = "", code: str = "", elapsed_ms: Optional[int] = None,
                   metadata: Optional[dict[str, Any]] = None) -> None:
         with self._lock:
             self._conn.execute(
-                """INSERT INTO order_events(order_id, job_id, stage, event, code,
-                   elapsed_ms, metadata_json, created_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (order_id or None, job_id or None, stage, event, code or None,
+                """INSERT INTO order_events(order_id, job_id, stage, event, message, code,
+                   elapsed_ms, metadata_json, created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (order_id or None, job_id or None, stage, event, message or None, code or None,
                  elapsed_ms, json.dumps(metadata or {}, ensure_ascii=False, default=str), _utcnow()),
             )
             self._conn.commit()
+
+    def list_events(self, *, job_id: str = "", order_id: str = "") -> list[dict[str, Any]]:
+        with self._lock:
+            if job_id:
+                rows = self._conn.execute(
+                    "SELECT * FROM order_events WHERE job_id=? ORDER BY id ASC", (job_id,)
+                ).fetchall()
+            elif order_id:
+                rows = self._conn.execute(
+                    "SELECT * FROM order_events WHERE order_id=? ORDER BY id ASC", (order_id,)
+                ).fetchall()
+            else:
+                return []
+        return [
+            {"state": row["event"], "stage": row["stage"], "message": row["message"] or "",
+             "created_at": row["created_at"]}
+            for row in rows
+        ]
 
     def clear_all(self) -> None:
         """Test/reset helper; never called by a live request path."""

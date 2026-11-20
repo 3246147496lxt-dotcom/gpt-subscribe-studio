@@ -1,8 +1,17 @@
 import type { Plan } from "./client";
 
+export type QuickPayEvent = {
+  state: string;
+  stage: string;
+  message: string;
+  created_at: string;
+};
+
 export type QuickPayJob = {
   job_id: string;
   lock_id?: string | null;
+  timings_ms?: Record<string, number>;
+  events?: QuickPayEvent[];
   status: "queued" | "running" | "succeeded" | "failed" | "unknown";
   stage: string;
   order_id?: string | null;

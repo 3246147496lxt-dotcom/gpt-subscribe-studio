@@ -6,14 +6,19 @@ from fastapi import APIRouter, Header, HTTPException
 from ..schemas import QuickPayJobOut, QuickPayRequest
 from ..services.order_flow import get_job, get_job_by_key, start_quick_pay
 from .. import locks
+from ..persistence import get_db_optional
 
 router = APIRouter(prefix="/api/payments", tags=["quick-pay"])
 
 
 def _out(job) -> QuickPayJobOut:
+    db = get_db_optional()
+    events = db.list_events(job_id=job.id) if db is not None else []
     return QuickPayJobOut(
         job_id=job.id,
         lock_id=getattr(job, "lock_id", None),
+        timings_ms={str(k): int(v) for k, v in (getattr(job, "timings", {}) or {}).items()},
+        events=events,
         status=job.status,
         stage=job.stage,
         order_id=job.order_id,

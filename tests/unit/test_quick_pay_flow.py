@@ -1,8 +1,23 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from gss_api.schemas import BillingIn, CardIn, ModeIn, QuickPayRequest
 from gss_api.services import order_flow
+
+
+@pytest.fixture(autouse=True)
+def _clear_jobs():
+    order_flow._jobs.clear()
+    order_flow._by_key.clear()
+    from gss_api.persistence import get_db_optional
+    db = get_db_optional()
+    if db is not None:
+        db.clear_all()
+    yield
+    order_flow._jobs.clear()
+    order_flow._by_key.clear()
 
 
 def _payload(debug=False):
@@ -24,6 +39,13 @@ def test_quick_pay_runs_create_then_pay(monkeypatch):
 
     async def create_order(payload, key, progress=None):
         calls.append(("create", key))
+        if progress:
+            progress("reissuing")
+            progress("reissued")
+            progress("browser_decode")
+            progress("browser_decoded")
+            progress("creating_checkout")
+            progress("checkout_created")
         return SimpleNamespace(id="order-1", purchase_attempt_id="pa_1", amount="982.14", currency="PHP")
 
     async def bind(order_id, payload):
@@ -38,6 +60,9 @@ def test_quick_pay_runs_create_then_pay(monkeypatch):
     assert [c[0] for c in calls] == ["create", "bind"]
     assert calls[1][1] == "order-1"
     assert calls[1][2:] == ("982.14", "PHP")
+    assert "create_order_ms" in result.timings
+    assert "create_checkout_ms" in result.timings
+    assert result.timings.get("total_ms", 0) >= 0
 
 
 def test_quick_pay_card_is_not_stored_on_job(monkeypatch):
