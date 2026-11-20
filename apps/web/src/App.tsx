@@ -19,7 +19,7 @@ const helpItems = [
 
 export function App() {
   const [history, setHistory] = useState(loadHistory);
-  const [view, setView] = useState<string | null>("order");
+  const [view, setView] = useState<string | null>("quick");
   const scheme = useComputedColorScheme("light");
   const { toggleColorScheme } = useMantineColorScheme();
   const record = useCallback((order: Order) => setHistory(recordOrder(order)), []);

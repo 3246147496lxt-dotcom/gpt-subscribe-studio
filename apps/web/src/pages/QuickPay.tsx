@@ -127,8 +127,9 @@ export function QuickPay() {
             <Title order={2}>一键充值</Title>
             <Text c="dimmed" size="sm" mt={4}>Session、套餐和银行卡一次提交；账单地址由服务端固定为已核验的美国免税地址。</Text>
           </div>
-          <Textarea label="ChatGPT Session JSON" placeholder="粘贴完整 session JSON" minRows={5} value={session}
-            onChange={(event) => setSession(event.currentTarget.value)} disabled={busy} autosize />
+          <Textarea label="ChatGPT Session JSON" placeholder="粘贴完整 session JSON" rows={8} value={session}
+            onChange={(event) => setSession(event.currentTarget.value)} disabled={busy}
+            styles={{ input: { height: 200, resize: "none" } }} />
           <Group grow align="end">
             <Select label="套餐" value={plan} onChange={(value) => setPlan((value as Plan) || "plus")} disabled={busy}
               data={[{ value: "plus", label: "Plus" }, { value: "go", label: "Go" }, { value: "pro_lite", label: "Pro Standard" }, { value: "pro", label: "Pro More" }, { value: "pro_max", label: "Pro Max" }]} />
