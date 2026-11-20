@@ -2088,11 +2088,14 @@ class ChatGPTClient:
         headers = self._route_headers(rendered_path)
         logger.info("cancel_auto_renew_start path=%s method=%s", path, method)
         if method == "POST":
-            response = self.http.post(url, json=body, headers=headers, timeout=self.timeout)
+            response = self.http.post(url, json=body, headers=headers,
+                                      timeout=self.timeout, allow_redirects=False)
         elif method == "PATCH":
-            response = self.http.patch(url, json=body, headers=headers, timeout=self.timeout)
+            response = self.http.patch(url, json=body, headers=headers,
+                                       timeout=self.timeout, allow_redirects=False)
         else:
-            response = self.http.put(url, json=body, headers=headers, timeout=self.timeout)
+            response = self.http.put(url, json=body, headers=headers,
+                                     timeout=self.timeout, allow_redirects=False)
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 401:
             _log_upstream_failure(path, response)
