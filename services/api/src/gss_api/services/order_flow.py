@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -23,7 +24,10 @@ from gss_core.redaction import redact_sensitive
 from ..schemas import BillingIn, OrderCreateRequest, QuickPayRequest
 from ..routers import orders, protocol_cards
 from .. import locks
-from ..persistence import get_db_optional, load_checkout_diagnostics
+from ..persistence import (
+    QuickPayAdmissionBlocked, QuickPayAdmissionConflict, get_db_optional, load_checkout_diagnostics,
+)
+from .quick_pay_intent import quick_pay_intent_digest
 
 logger = logging.getLogger("gss.quick_pay")
 
@@ -57,7 +61,6 @@ class QuickPayJob:
 
 
 _jobs: Dict[str, QuickPayJob] = {}
-_by_key: Dict[str, str] = {}
 _tasks: set[asyncio.Task] = set()
 
 
@@ -83,35 +86,20 @@ def _error_message(exc: Exception) -> str:
 
 
 def get_job(job_id: str) -> Optional[QuickPayJob]:
-    job = _jobs.get(job_id)
-    if job is not None:
-        return job
+    # Only a local dispatcher owns a mutable cached job. Do not cache another
+    # worker's read-only snapshot: it may still be progressing there.
+    if job_id in _jobs:
+        return _jobs[job_id]
     db = get_db_optional()
-    if db is None:
-        return None
-    for row in db.load_jobs():
-        if row.get("id") == job_id:
-            job = _from_db_job(row)
-            _jobs[job.id] = job
-            _by_key[job.idempotency_key] = job.id
-            return job
-    return None
+    row = db.get_quick_pay_by_id(job_id) if db is not None else None
+    return _from_db_job(row) if row is not None else None
 
 
 def get_job_by_key(key: str) -> Optional[QuickPayJob]:
-    job_id = _by_key.get(key)
-    if job_id:
-        return _jobs.get(job_id)
+    """Read-only lookup; this is never an admission or dispatch decision."""
     db = get_db_optional()
-    if db is None:
-        return None
-    for row in db.load_jobs():
-        if row.get("idempotency_key") == key:
-            job = _from_db_job(row)
-            _jobs[job.id] = job
-            _by_key[key] = job.id
-            return job
-    return None
+    row = db.get_quick_pay_by_key(key) if db is not None else None
+    return (_jobs.get(row["id"]) or _from_db_job(row)) if row is not None else None
 
 
 def _persist_job(job: QuickPayJob) -> None:
@@ -185,23 +173,44 @@ def _capture_checkout_failure(job: QuickPayJob, exc: Exception) -> None:
             job.order_id = candidate
 
 
-def _new_job(idempotency_key: str, account_fingerprint: str = "") -> QuickPayJob:
-    existing = get_job_by_key(idempotency_key)
-    if existing is not None:
-        return existing
+def _reserve_job(payload: QuickPayRequest, idempotency_key: str,
+                 account_fingerprint: str) -> tuple[QuickPayJob, bool]:
+    """A committed SQLite reservation is the only permission to dispatch."""
+    db = get_db_optional()
+    unavailable = {"code": "quick_pay_unavailable", "message": "暂时无法确认作业受理状态，请保留原幂等键。"}
+    if db is None:
+        raise HTTPException(503, detail=unavailable)
     job = QuickPayJob(id=uuid.uuid4().hex, idempotency_key=idempotency_key,
                       account_fingerprint=account_fingerprint or None)
+    intent = quick_pay_intent_digest(payload, account_fingerprint)
+    try:
+        row, created = db.reserve_quick_pay(job, intent)
+    except QuickPayAdmissionConflict:
+        raise HTTPException(409, detail={
+            "code": "idempotency_conflict",
+            "message": "无法将此幂等键与本次请求匹配，未再次提交；如有原作业号，请查询其状态。",
+        }) from None
+    except QuickPayAdmissionBlocked as exc:
+        raise HTTPException(409, detail={
+            "code": "payment_unknown_lock",
+            "message": "存在未核销的 unknown 订单，请先人工核对账单",
+            **locks.lock_payload(exc.lock),
+        }) from None
+    except sqlite3.Error:
+        # Even when the outcome of COMMIT cannot be determined, do not send
+        # anything upstream or disclose SQLite error text / request material.
+        logger.warning("quick_pay_admission_unavailable")
+        raise HTTPException(503, detail=unavailable) from None
+    if not created:
+        return _jobs.get(row["id"]) or _from_db_job(row), False
     _jobs[job.id] = job
-    _by_key[idempotency_key] = job.id
-    _persist_job(job)
-    return job
+    return job, True
 
 
 def start_quick_pay(payload: QuickPayRequest, idempotency_key: str,
                     account_fingerprint: str = "") -> QuickPayJob:
-    """Reserve a job; the caller schedules run_quick_pay."""
-    job = _new_job(idempotency_key, account_fingerprint)
-    if job.status != "queued" or job.stage != "queued":
+    job, created = _reserve_job(payload, idempotency_key, account_fingerprint)
+    if not created:  # Includes an existing queued job, even after a restart.
         return job
     task = asyncio.create_task(run_quick_pay(job.id, payload, idempotency_key))
     _tasks.add(task)

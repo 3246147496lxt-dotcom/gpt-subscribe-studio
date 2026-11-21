@@ -50,7 +50,6 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
     monkeypatch.setenv("GSS_CHECKOUT_ROTATE", "1")
     monkeypatch.delenv("GSS_BILLING_PROFILES_FILE", raising=False)
     monkeypatch.setattr(order_flow, "_jobs", {})
-    monkeypatch.setattr(order_flow, "_by_key", {})
     store = InMemoryStore()
     monkeypatch.setattr(orders, "store", store)
     monkeypatch.setattr(orders, "vault", Mock())
@@ -98,7 +97,8 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
     monkeypatch.setattr(persistence, "_db", db)
     store.attach_db(db)
     try:
-        job = order_flow._new_job(key, fingerprint)
+        job, created = order_flow._reserve_job(payload, key, fingerprint)
+        assert created
         job = asyncio.run(order_flow.run_quick_pay(job.id, payload, key))
         assert job.status == "failed" and job.diagnostics == expected and job.order_id
         assert post.call_count == 1 and post.call_args.args[0].endswith("/backend-api/payments/checkout")
@@ -118,7 +118,6 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
     finally:
         db.close()
     order_flow._jobs.clear()
-    order_flow._by_key.clear()
     fresh = persistence.Persistence(str(path))
     monkeypatch.setattr(persistence, "_db", fresh)
     try:
@@ -160,7 +159,6 @@ def test_poll_does_not_infer_field_states_for_pre_upgrade_rows(tmp_path, monkeyp
     finally:
         old.close()
     monkeypatch.setattr(order_flow, "_jobs", {})
-    monkeypatch.setattr(order_flow, "_by_key", {})
     fresh = persistence.Persistence(str(path))
     monkeypatch.setattr(persistence, "_db", fresh)
     try:

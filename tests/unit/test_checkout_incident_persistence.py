@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from gss_api.persistence import Persistence
 from gss_api.routers import quick_pay
-from gss_api.schemas import ModeIn
+from gss_api.schemas import ModeIn, QuickPayRequest
 from gss_api.services import order_flow as flow
 from gss_contracts.errors import DomainError, ErrorCode
 
@@ -27,14 +27,14 @@ def db(monkeypatch):
     monkeypatch.setattr(flow, "get_db_optional", lambda: db)
     monkeypatch.setattr(quick_pay, "get_db_optional", lambda: db)
     monkeypatch.setattr(flow, "_jobs", {})
-    monkeypatch.setattr(flow, "_by_key", {})
     yield db
     db._conn.close()
 
 
 @pytest.mark.parametrize("shape", ["domain", "http_nested", "http_flat"])
 def test_failure_before_payment_has_same_safe_projection_after_cache_loss(db, monkeypatch, shape):
-    job = flow._new_job("offline-key")
+    job, _ = flow._reserve_job(QuickPayRequest(plan="plus", session="offline", debug_checkout_only=True),
+                               "offline-key", "test-owner")
     raw = {**SNAPSHOT, "cookie": MARKER}
     oid = str(uuid.uuid4())
     monkeypatch.setattr(flow.orders.store, "get_order", lambda i: (
@@ -62,7 +62,6 @@ def test_failure_before_payment_has_same_safe_projection_after_cache_loss(db, mo
     assert result.status == "failed" and result.diagnostics == SNAPSHOT
     assert MARKER not in repr(db.load_jobs()) and MARKER not in repr(db.list_events(job_id=job.id))
     flow._jobs.clear()
-    flow._by_key.clear()
     out = asyncio.run(quick_pay.quick_pay_status(job.id))
     assert out.diagnostics == SNAPSHOT and out.status == "failed"
     assert out.order_id == (None if shape == "domain" else oid)
@@ -72,7 +71,8 @@ def test_failure_before_payment_has_same_safe_projection_after_cache_loss(db, mo
 
 @pytest.mark.parametrize("again", [{}, {"upstream_status": 401, "upstream_code": "token_revoked"}])
 def test_first_snapshot_survives_stale_job_overwrite(db, again):
-    job = flow._new_job("offline-key")
+    job, _ = flow._reserve_job(QuickPayRequest(plan="plus", session="offline", debug_checkout_only=True),
+                               "offline-key", "test-owner")
     original = DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "已拒绝", SNAPSHOT)
     flow._capture_checkout_failure(job, original)
     flow._capture_checkout_failure(job, HTTPException(401, {"detail": again}))
@@ -88,7 +88,8 @@ def test_first_snapshot_survives_stale_job_overwrite(db, again):
 
 @pytest.mark.parametrize("stored", [None, "", "{bad json", "[]", '{"cf_ray":{"secret":"x"}}'])
 def test_legacy_row_never_exposes_garbage_and_can_acquire_first_valid_snapshot(db, stored):
-    job = flow._new_job("offline-key")
+    job, _ = flow._reserve_job(QuickPayRequest(plan="plus", session="offline", debug_checkout_only=True),
+                               "offline-key", "test-owner")
     row = db.load_jobs()[0]
     assert flow._from_db_job({**row, "diagnostics_json": stored}).diagnostics == {}
     if stored is not None:  # schema is NOT NULL, but older projections may lack the field

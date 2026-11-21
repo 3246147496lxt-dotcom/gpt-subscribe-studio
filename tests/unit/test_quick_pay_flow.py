@@ -8,16 +8,13 @@ from gss_api.services import order_flow
 
 
 @pytest.fixture(autouse=True)
-def _clear_jobs():
-    order_flow._jobs.clear()
-    order_flow._by_key.clear()
-    from gss_api.persistence import get_db_optional
-    db = get_db_optional()
-    if db is not None:
-        db.clear_all()
+def _clear_jobs(monkeypatch):
+    from gss_api import persistence
+    db = persistence.Persistence(":memory:")
+    monkeypatch.setattr(persistence, "_db", db)
+    monkeypatch.setattr(order_flow, "_jobs", {})
     yield
-    order_flow._jobs.clear()
-    order_flow._by_key.clear()
+    db.close()
 
 
 def _payload(debug=False):
@@ -54,7 +51,7 @@ def test_quick_pay_runs_create_then_pay(monkeypatch):
 
     monkeypatch.setattr(order_flow.orders, "_create_order", create_order)
     monkeypatch.setattr(order_flow.protocol_cards, "bind_and_pay_protocol", bind)
-    job = order_flow._new_job("quick-key")
+    job, _ = order_flow._reserve_job(_payload(), "quick-key", "test-owner")
     result = asyncio.run(order_flow.run_quick_pay(job.id, _payload(), "quick-key"))
     assert result.status == "succeeded"
     assert [c[0] for c in calls] == ["create", "bind"]
@@ -75,7 +72,7 @@ def test_quick_pay_card_is_not_stored_on_job(monkeypatch):
 
     monkeypatch.setattr(order_flow.orders, "_create_order", create_order)
     monkeypatch.setattr(order_flow.protocol_cards, "bind_and_pay_protocol", bind)
-    job = order_flow._new_job("quick-key-2")
+    job, _ = order_flow._reserve_job(_payload(), "quick-key-2", "test-owner")
     asyncio.run(order_flow.run_quick_pay(job.id, _payload(), "quick-key-2"))
     assert job.status == "failed"
     assert job.failure_code == "card_declined"
@@ -94,7 +91,7 @@ def test_debug_checkout_only_never_calls_bind(monkeypatch):
 
     monkeypatch.setattr(order_flow.orders, "_create_order", create_order)
     monkeypatch.setattr(order_flow.protocol_cards, "bind_and_pay_protocol", bind)
-    job = order_flow._new_job("quick-key-3")
+    job, _ = order_flow._reserve_job(_payload(debug=True), "quick-key-3", "test-owner")
     result = asyncio.run(order_flow.run_quick_pay(job.id, _payload(debug=True), "quick-key-3"))
     assert result.status == "succeeded"
     assert result.stage == "checkout_created"

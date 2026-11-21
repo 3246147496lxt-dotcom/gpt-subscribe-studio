@@ -42,7 +42,6 @@ def test_hint_survives_restart_and_does_not_change_the_order(evidence, monkeypat
     fresh = Persistence(path)
     monkeypatch.setattr(persistence, "_db", fresh)
     monkeypatch.setattr(order_flow, "_jobs", {})
-    monkeypatch.setattr(order_flow, "_by_key", {})
     app = FastAPI()
     app.include_router(quick_pay.router)
     try:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -22,7 +23,20 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .store import OrderView
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_INTENT_DIGEST = re.compile(r"v1:[0-9a-f]{64}")
+
+
+class QuickPayAdmissionConflict(Exception):
+    """Cannot prove this key refers to the same account, intent and job."""
+
+
+class QuickPayAdmissionBlocked(Exception):
+    """A new job is blocked; replaying an admitted job never redispatches."""
+
+    def __init__(self, lock: dict[str, Any]) -> None:
+        super().__init__("quick_pay_admission_blocked")
+        self.lock = lock
 
 
 def _utcnow() -> str:
@@ -142,6 +156,7 @@ class Persistence:
             CREATE TABLE IF NOT EXISTS quick_pay_jobs (
                 id TEXT PRIMARY KEY,
                 idempotency_key TEXT NOT NULL UNIQUE,
+                intent_digest TEXT,
                 account_fingerprint TEXT,
                 order_id TEXT,
                 status TEXT NOT NULL,
@@ -225,6 +240,13 @@ class Persistence:
                 self._conn.execute(statement)
             except sqlite3.OperationalError:
                 pass
+        # Historical jobs have no comparable intent. Keep NULL; do not infer
+        # one from incomplete inputs, and do not suppress migration I/O errors.
+        try:
+            self._conn.execute("ALTER TABLE quick_pay_jobs ADD COLUMN intent_digest TEXT")
+        except sqlite3.OperationalError as exc:
+            if str(exc).lower() != "duplicate column name: intent_digest":
+                raise
         self._conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
             (str(SCHEMA_VERSION),),
@@ -353,6 +375,76 @@ class Persistence:
         return result
 
     # -- jobs --------------------------------------------------------------- #
+    def get_quick_pay_by_key(self, key: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM quick_pay_jobs WHERE idempotency_key=?", (key,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_quick_pay_by_id(self, job_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM quick_pay_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def reserve_quick_pay(
+        self, job: Any, intent_digest: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Commit a new queued job and key, or return the existing row read-only.
+
+        Only the insert winner can dispatch. BEGIN IMMEDIATE serializes the entire
+        admission decision, including the funds-lock check, across SQLite connections.
+        """
+        if not _INTENT_DIGEST.fullmatch(intent_digest):
+            raise ValueError("invalid quick-pay intent digest")
+        key, owner = job.idempotency_key, job.account_fingerprint
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            with self._conn:  # any SQL or commit failure rolls back both inserts
+                row = self.get_quick_pay_by_key(key)
+                idx = self._conn.execute(
+                    "SELECT scope, job_id, order_id FROM idempotency_keys WHERE key=?", (key,)
+                ).fetchone()
+                order = self._conn.execute(
+                    "SELECT id, account_fingerprint FROM orders WHERE idempotency_key=?", (key,)
+                ).fetchone()
+                if row is not None:
+                    if (not owner or owner != row["account_fingerprint"]
+                            or intent_digest != row["intent_digest"] or idx is None
+                            or idx["job_id"] != row["id"] or idx["scope"] != "quick_pay"):
+                        raise QuickPayAdmissionConflict()
+                    # The worker may publish its order link in either record first.
+                    # While an order exists without a verified link, use GET by job ID.
+                    links = {v for v in (row["order_id"], idx["order_id"]) if v}
+                    if (links != ({order["id"]} if order is not None else set())
+                            or (order is not None and order["account_fingerprint"]
+                                and order["account_fingerprint"] != owner)):
+                        raise QuickPayAdmissionConflict()
+                    return row, False
+
+                if idx is not None or order is not None:
+                    raise QuickPayAdmissionConflict()
+                held = self.find_active_lock(f"account:{owner}") if owner else None
+                if held is not None:
+                    raise QuickPayAdmissionBlocked(held)
+                now = _utcnow()
+                self._conn.execute(
+                    """INSERT INTO quick_pay_jobs
+                       (id,idempotency_key,intent_digest,account_fingerprint,status,stage,created_at,updated_at)
+                       VALUES(?,?,?,?,'queued','queued',?,?)""",
+                    (job.id, key, intent_digest, owner or None, now, now),
+                )
+                self._conn.execute(
+                    """INSERT INTO idempotency_keys (key,scope,job_id,state,created_at,last_seen_at)
+                       VALUES(?,'quick_pay',?,'queued',?,?)""", (key, job.id, now, now),
+                )
+                created = self.get_quick_pay_by_id(job.id)
+                if created is None:
+                    raise sqlite3.DatabaseError("quick-pay reservation unreadable")
+                return created, True
+
     def save_job(self, job: Any) -> None:
         payload = (
             job.id, job.idempotency_key, getattr(job, "account_fingerprint", None),
@@ -444,16 +536,27 @@ class Persistence:
     # -- idempotency -------------------------------------------------------- #
     def save_idempotency(self, key: str, scope: str, *, order_id: str = "", job_id: str = "", state: str) -> None:
         now = _utcnow()
-        with self._lock:
-            self._conn.execute(
+        # Job and order writers share the key and may learn different links at
+        # different times. Do not erase a link with NULL or rebind a populated one.
+        with self._lock, self._conn:
+            cur = self._conn.execute(
                 """INSERT INTO idempotency_keys(key, scope, order_id, job_id, state, created_at, last_seen_at)
                    VALUES(?,?,?,?,?,?,?)
                    ON CONFLICT(key) DO UPDATE SET
-                     order_id=excluded.order_id, job_id=excluded.job_id,
-                     state=excluded.state, last_seen_at=excluded.last_seen_at""",
+                     order_id=COALESCE(NULLIF(idempotency_keys.order_id,''), excluded.order_id),
+                     job_id=COALESCE(NULLIF(idempotency_keys.job_id,''), excluded.job_id),
+                     state=excluded.state, last_seen_at=excluded.last_seen_at
+                   WHERE (excluded.order_id IS NULL OR COALESCE(idempotency_keys.order_id,'')=''
+                          OR excluded.order_id=idempotency_keys.order_id)
+                     AND (excluded.job_id IS NULL OR COALESCE(idempotency_keys.job_id,'')=''
+                          OR excluded.job_id=idempotency_keys.job_id)
+                     AND (idempotency_keys.scope=excluded.scope
+                          OR (idempotency_keys.scope IN ('quick_pay','order_create')
+                              AND excluded.scope IN ('quick_pay','order_create')))""",
                 (key, scope, order_id or None, job_id or None, state, now, now),
             )
-            self._conn.commit()
+            if cur.rowcount != 1:
+                raise QuickPayAdmissionConflict()
 
     def load_idempotency(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -562,4 +665,7 @@ def get_db_optional() -> Optional[Persistence]:
     return _db
 
 
-__all__ = ["Persistence", "init_db", "get_db_optional", "resolve_db_path"]
+__all__ = [
+    "Persistence", "QuickPayAdmissionBlocked", "QuickPayAdmissionConflict",
+    "init_db", "get_db_optional", "resolve_db_path",
+]

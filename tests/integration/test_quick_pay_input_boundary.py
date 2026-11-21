@@ -25,8 +25,6 @@ def api(monkeypatch):
     db = persistence.Persistence(":memory:")
     monkeypatch.setattr(persistence, "_db", db)
     monkeypatch.setattr(main, "store", InMemoryStore())
-    monkeypatch.setattr(quick_pay, "get_job_by_key", lambda key: None)
-    monkeypatch.setattr(quick_pay.locks, "find_active_lock", lambda f: None)
     start = Mock(return_value=QuickPayJob(id="inert-fixture", idempotency_key="input-boundary"))
     monkeypatch.setattr(quick_pay, "start_quick_pay", start)
     try:
