@@ -59,6 +59,7 @@ from gss_core.chatgpt import (
     STRIPE_BASE,
     ChatGPTClient,
     _intent_object,
+    _PLAN_NAME,
     _json,
     payment_intent_from_confirm,
     public_checkout_id,
@@ -333,7 +334,8 @@ class PlusHarProtocol:
         session.headers.update(web_headers)
         cookies = dict(getattr(self.client, "extra_cookies", {}) or {})
         if self.browser_context is not None:
-            cookies.update({str(k): str(v) for k, v in (self.browser_context.cookies or {}).items() if k and v is not None})
+            from gss_core.browser_context import safe_browser_cookies
+            cookies.update(safe_browser_cookies(self.browser_context.cookies))
         if getattr(self.client, "session_token", ""):
             cookies.setdefault("__Secure-next-auth.session-token", self.client.session_token)
         if getattr(self.client, "device_id", ""):
@@ -433,6 +435,16 @@ class PlusHarProtocol:
             self.client.account_id = self.expected_account
         self.client.language = self.device.locale
         self.client.timezone = self.device.timezone
+        if self.browser_context is not None:
+            # Route C headers, Sentinel profile and ChatGPT client must share
+            # the same browser identity; never keep a separate session profile.
+            self.client.apply_browser_context(self.browser_context)
+            self.device.ua = self.browser_context.user_agent or self.device.ua
+            self.device.screen_w = int(self.browser_context.viewport_width or self.device.screen_w)
+            self.device.screen_h = int(self.browser_context.viewport_height or self.device.screen_h)
+            self.device.avail_h = max(1, self.device.screen_h - 80)
+            if self.browser_context.sec_ch_ua_platform:
+                self.device.ch_platform = f'"{self.browser_context.sec_ch_ua_platform.strip(chr(34))}"'
 
         self.telemetry = StripeTelemetry(self._m_session(), TelemetryContext(
             device=self.device,
@@ -488,7 +500,7 @@ class PlusHarProtocol:
     # ── 1. checkout create / read ──────────────────────────────────
     def _create_checkout(self) -> Dict[str, Any]:
         body: Dict[str, Any] = {
-            "plan_name": "chatgptplusplan" if self.plan == "plus" else f"chatgpt{self.plan}plan",
+            "plan_name": _PLAN_NAME.get(str(self.plan), "chatgptplusplan"),
             "checkout_source": "chatgpt_web_merged",
             "entry_point": "all_plans_pricing_modal",
             "billing_details": {"country": self.country, "currency": self.currency},
@@ -496,7 +508,7 @@ class PlusHarProtocol:
             "checkout_ui_mode": "custom",
             "checkout_appearance": "light",
             "cancel_url": "https://chatgpt.com/?cta_tab=personal",
-            "purchase_attempt_id": str(uuid.uuid4()),
+            "purchase_attempt_id": self.purchase_attempt_id or str(uuid.uuid4()),
         }
         if self.promo_campaign_id:
             body["promo_campaign"] = {
@@ -784,6 +796,15 @@ class PlusHarProtocol:
 
     def _confirmation_token(self) -> str:
         b = self.billing
+        # A locally generated guid/muid/sid is not a Stripe device identity.
+        # If telemetry was expected but never adopted server IDs, stop before
+        # creating a payment method or touching the intent.
+        if (self.mode != "off" and isinstance(self.telemetry, StripeTelemetry)
+                and not getattr(self.telemetry, "server_ids_adopted", False)):
+            raise DomainError(
+                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                "Stripe 设备指纹未取得服务端 guid/muid/sid，已停止在建单/确认前",
+            )
         radar = self._radar_token()
         time_on_page = int((time.time() - self.t0) * 1000)
         form: Dict[str, Any] = {

@@ -42,7 +42,7 @@ class BrowserContext:
 
     def merged_cookies(self, base: Dict[str, str] | None = None) -> Dict[str, str]:
         result = dict(base or {})
-        result.update({str(k): str(v) for k, v in self.cookies.items() if k and v is not None})
+        result.update(safe_browser_cookies(self.cookies))
         return result
 
     def vault_dict(self) -> dict[str, Any]:
@@ -87,4 +87,20 @@ class BrowserContext:
         )
 
 
-__all__ = ["BrowserContext"]
+# Browser context is captured direct, while checkout uses the order proxy.
+# Never carry IP-bound Cloudflare/device cookies across that boundary.
+BROWSER_COOKIE_DENYLIST = frozenset({
+    "__cf_bm", "cf_clearance", "_cfuvid", "cf_chl_2", "cf_chl_prog",
+    "oai-did", "oai-device-id", "oai-sc", "__Secure-next-auth.session-token",
+})
+
+
+def safe_browser_cookies(cookies: dict[str, str] | None) -> dict[str, str]:
+    return {
+        str(name): str(value)
+        for name, value in (cookies or {}).items()
+        if name and value is not None and str(name) not in BROWSER_COOKIE_DENYLIST
+    }
+
+
+__all__ = ["BrowserContext", "BROWSER_COOKIE_DENYLIST", "safe_browser_cookies"]

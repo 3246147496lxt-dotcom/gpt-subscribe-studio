@@ -74,9 +74,12 @@ class InMemoryStore:
         self.views: Dict[str, OrderView] = {}
         self._idempotency: Dict[str, str] = {}
         self.db = None
+        self._db_loaded = False
 
     def attach_db(self, db) -> None:
-        """Attach SQLite persistence and rehydrate known orders."""
+        """Attach SQLite persistence and rehydrate known orders once per process."""
+        if self.db is db and self._db_loaded:
+            return
         self.db = db
         for order, view, fingerprint in db.load_orders():
             self.orders[order.id] = order
@@ -88,6 +91,7 @@ class InMemoryStore:
         for row in db.load_idempotency():
             if row.get("order_id"):
                 self._idempotency[row["key"]] = row["order_id"]
+        self._db_loaded = True
 
     def persist(self, order_id: str) -> None:
         if self.db is None:

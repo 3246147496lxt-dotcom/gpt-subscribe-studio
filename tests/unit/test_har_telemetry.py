@@ -68,6 +68,7 @@ def test_fingerprint_registration_shape():
     device, telemetry = build(recorder)
     original = (device.guid, device.muid, device.sid)
     telemetry.register()
+    assert telemetry.server_ids_adopted is True
 
     posts = [r for r in recorder.requests if r.url.host == "m.stripe.com" and r.url.path == "/6"]
     assert len(posts) == 4

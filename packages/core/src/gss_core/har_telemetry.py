@@ -98,6 +98,8 @@ class StripeTelemetry:
         self._cursor = 0
         self._tick = 0.0
         self.registered = False
+        self.server_ids_adopted = False
+        self._server_ids_seen = False
         self.guid = ctx.device.guid
         self.muid = ctx.device.muid
         self.sid = ctx.device.sid
@@ -191,6 +193,7 @@ class StripeTelemetry:
                     value = str(body.get(name) or "")
                     if value:
                         setattr(self, name, value)
+                        self._server_ids_seen = True
         except Exception:  # noqa: BLE001 - telemetry must never block payment
             pass
         return payload
@@ -213,6 +216,8 @@ class StripeTelemetry:
         self.device.guid = self.guid
         self.device.muid = self.muid
         self.device.sid = self.sid
+        if self._server_ids_seen:
+            self.server_ids_adopted = True
 
     def beat(self, times: int = 2) -> None:
         """Post-payment beacons (capture: entries 351 and 372)."""

@@ -86,3 +86,62 @@ def test_verify_challenge_uses_session_user_agent():
         user_agent=UA,
     )
     assert session.headers["User-Agent"] == UA
+
+
+def test_plus_har_uses_browser_sentinel_profile_and_correct_plan_name():
+    from types import SimpleNamespace
+    from gss_core.browser_context import BrowserContext
+    from gss_core.chatgpt import ChatGPTClient
+
+    ctx = BrowserContext(
+        user_agent=UA, sec_ch_ua='"Chromium";v="142"', sec_ch_ua_platform="Windows",
+        locale="en-US", timezone_id="America/New_York", viewport_width=1440,
+        viewport_height=900,
+    )
+    client = ChatGPTClient(access_token="tok", user_agent=UA, browser_context=ctx)
+    profile = client.sentinel_profile
+    assert profile["screen_w"] == 1440
+    assert profile["screen_h"] == 900
+    assert profile["platform"] == "Win32"
+
+    protocol = PlusHarProtocol(
+        session=json.dumps({"accessToken": "tok"}),
+        plan="pro_lite",
+        purchase_attempt_id="pa_fixture",
+        user_agent=UA,
+        browser_context=ctx,
+    )
+    captured = {}
+
+    def app(method, route, *, json_body=None, **kwargs):
+        captured["body"] = json_body
+        return type("R", (), {
+            "status_code": 200,
+            "text": "",
+            "json": lambda self: {"checkout_session_id": "oaics_fixture",
+                                  "publishable_key": "pk_fixture"},
+        })()
+
+    protocol._app = app
+    try:
+        protocol._create_checkout()
+    finally:
+        protocol.close()
+    assert captured["body"]["plan_name"] == "chatgptprolite"
+    assert captured["body"]["purchase_attempt_id"] == "pa_fixture"
+
+
+def test_stripe_protocol_fails_closed_without_curl_cffi(monkeypatch):
+    import gss_core.stripe_protocol as stripe_protocol
+
+    monkeypatch.setattr(stripe_protocol, "_HAS_CURL_CFFI", False)
+    protocol = stripe_protocol.StripeProtocol()
+    try:
+        try:
+            protocol._http()
+        except RuntimeError as exc:
+            assert "curl_cffi" in str(exc)
+        else:
+            raise AssertionError("Stripe httpx fallback must not be allowed")
+    finally:
+        protocol.close()

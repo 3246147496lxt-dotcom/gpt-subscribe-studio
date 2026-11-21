@@ -250,11 +250,9 @@ class StripeProtocol:
                 )
                 log("   使用 curl_cffi（Chrome TLS 指纹）")
             else:
-                self._client = httpx.Client(
-                    proxy=self.proxy, timeout=self.timeout,
-                    headers={"User-Agent": self.ua, "Accept": "application/json"},
+                raise RuntimeError(
+                    "Stripe 支付需要 curl_cffi；当前环境缺少浏览器 TLS 指纹能力，已停止"
                 )
-                log("   使用 httpx（默认 TLS 指纹）")
         return self._client
 
     def close(self) -> None:

@@ -653,9 +653,24 @@ class ChatGPTClient:
     @property
     def sentinel_profile(self) -> dict:
         p = self.profile
-        return {"platform": p["platform"], "platform_label": p["label"],
-                "screen_w": p["screen"][0], "screen_h": p["screen"][1],
-                "avail_h": p["screen"][2], "cores": 8}
+        profile = {"platform": p["platform"], "platform_label": p["label"],
+                   "screen_w": p["screen"][0], "screen_h": p["screen"][1],
+                   "avail_h": p["screen"][2], "cores": 8}
+        context = self.browser_context
+        if context is not None:
+            platform = str(getattr(context, "sec_ch_ua_platform", "") or "").strip('"')
+            mapping = {"macOS": ("MacIntel", "macOS"), "Windows": ("Win32", "Windows"),
+                       "Linux": ("Linux x86_64", "Linux")}
+            if platform in mapping:
+                profile["platform"], profile["platform_label"] = mapping[platform]
+            width = int(getattr(context, "viewport_width", 0) or 0)
+            height = int(getattr(context, "viewport_height", 0) or 0)
+            if width >= 800:
+                profile["screen_w"] = width
+            if height >= 600:
+                profile["screen_h"] = height
+                profile["avail_h"] = max(1, height - 80)
+        return profile
 
     def apply_browser_context(self, context: Any) -> None:
         """Apply a Route-C browser environment before create_checkout."""
@@ -672,7 +687,8 @@ class ChatGPTClient:
             self.timezone = str(context.timezone_id)
         cookies = getattr(context, "cookies", None) or {}
         if isinstance(cookies, dict):
-            self.extra_cookies.update({str(k): str(v) for k, v in cookies.items() if k and v is not None})
+            from gss_core.browser_context import safe_browser_cookies
+            self.extra_cookies.update(safe_browser_cookies(cookies))
         if getattr(context, "sentinel_token", ""):
             self.sentinel_token = str(context.sentinel_token)
         if self._http is not None:

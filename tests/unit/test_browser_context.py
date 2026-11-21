@@ -11,7 +11,8 @@ def test_context_headers_and_cookie_merge():
     assert ctx.headers()["User-Agent"] == "UA"
     assert ctx.headers()["sec-ch-ua-platform"] == '"macOS"'
     merged = ctx.merged_cookies({"a": "1"})
-    assert merged == {"a": "1", "__cf_bm": "cf", "oai-did": "DID"}
+    # Direct-browser cookies must not cross into the order proxy session.
+    assert merged == {"a": "1"}
 
 
 def test_repr_does_not_expose_secrets():
