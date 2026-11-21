@@ -2,10 +2,12 @@
 import asyncio
 import json
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -17,7 +19,29 @@ from gss_api.store import InMemoryStore
 from gss_core import chatgpt
 
 
-def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(tmp_path, monkeypatch, verified_us_payer, caplog):
+_RAY = "a1b2c3d4e5f60718-ORD"
+_RID = "req_0123456789abcdef0123456789abcdef"
+_BLOCKED_CODE = "private-code-marker-never-emit"
+_BLOCKED_RID = "private-header-marker-never-emit"
+
+
+@pytest.mark.parametrize(
+    ("status", "wire_code", "wire_request_id", "source", "code_state", "rid_state", "local_code"),
+    [
+        pytest.param(403, "unusual_activity", _RID, "structured_code", "accepted", "accepted",
+                     "unusual_activity", id="code-and-body-structured-wins"),
+        pytest.param(400, None, None, "body_match", "not_found", "not_found",
+                     "unusual_activity", id="missing-code-and-header"),
+        pytest.param(400, _BLOCKED_CODE, _BLOCKED_RID, "body_match", "filtered", "filtered",
+                     "unusual_activity", id="discard-values-but-preserve-rejection-states"),
+        pytest.param(401, "token_revoked", None, None, "accepted", "not_found",
+                     "invalid_session", id="session-refusal-has-no-unusual-activity-origin"),
+    ],
+)
+def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
+    tmp_path, monkeypatch, verified_us_payer, caplog, status, wire_code, wire_request_id,
+    source, code_state, rid_state, local_code,
+):
     caplog.set_level(logging.DEBUG)
     path = tmp_path / "offline.db"
     monkeypatch.setenv("GSS_DATA_DIR", str(tmp_path))
@@ -43,20 +67,31 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(tmp_path, monkey
     monkeypatch.setattr(chatgpt, "_new_session", no_network)
     monkeypatch.setattr(chatgpt.ChatGPTClient, "prepare_risk", lambda *a, **kw: None)
     monkeypatch.setattr(chatgpt.ChatGPTClient, "hydrate", lambda *a, **kw: None)
-    ray = "a1b2c3d4e5f60718-ORD"
-    rid = "req_0123456789abcdef0123456789abcdef"
     canary = "private-body-marker-never-emit"
     session_canary = "offline-private-session-marker"
     cookie_canary = "private-cookie-marker"
-    response = httpx.Response(403, json={"error": {"code": "unusual_activity", "message": canary}},
-                              headers={"CF-Ray": ray, "X-Request-Id": rid, "set-cookie": "name=" + cookie_canary})
+    error = {"message": "Unusual activity: " + canary}
+    headers = {"CF-Ray": _RAY, "set-cookie": "name=" + cookie_canary}
+    if wire_code is not None:
+        error["code"] = wire_code
+    if wire_request_id is not None:
+        headers["X-Request-Id"] = wire_request_id
+    response = httpx.Response(status, json={"error": error}, headers=headers,
+                              request=httpx.Request("POST", "https://checkout.invalid/test"))
     post = Mock(side_effect=[response])  # another POST fails, even before call-count assertions
     monkeypatch.setattr(chatgpt.ChatGPTClient, "http", property(lambda _: SimpleNamespace(post=post, headers={})))
     pan, cvc = "4242" * 4, "CVCX"  # inert synthetic markers, not card credentials
     payload = QuickPayRequest(plan="plus", billing_country="US", exit_country="US", debug_checkout_only=True,
                               card=CardIn(number=pan, cvc=cvc, exp_month="11", exp_year="2030"),
                               session=json.dumps({"accessToken": session_canary}))
-    expected = {"upstream_status": 403, "upstream_code": "unusual_activity", "cf_ray": ray, "request_id": rid}
+    expected = {"upstream_status": status, "cf_ray": _RAY, "upstream_code_state": code_state,
+                "request_id_state": rid_state}
+    if source is not None:
+        expected["unusual_activity_source"] = source
+    if code_state == "accepted":
+        expected["upstream_code"] = wire_code
+    if rid_state == "accepted":
+        expected["request_id"] = wire_request_id
     key = "offline-first-refusal"
     db = persistence.Persistence(str(path))
     monkeypatch.setattr(persistence, "_db", db)
@@ -70,6 +105,15 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(tmp_path, monkey
         pay.assert_not_called()
         lock.assert_not_called()
         assert db._conn.execute("select count(*) from account_locks").fetchone()[0] == 0
+        first = json.loads(db.load_jobs()[0]["diagnostics_json"])
+        assert first == expected
+        # Simulate a stale persistence writer, not another request. It must neither
+        # replace this snapshot nor backfill an originally absent/filtered value.
+        db.save_job(replace(job, diagnostics={
+            "upstream_status": 429, "upstream_code": "rate_limit_error",
+            "upstream_code_state": "accepted", "request_id": _RID, "request_id_state": "accepted",
+        }))
+        assert json.loads(db.load_jobs()[0]["diagnostics_json"]) == first
     finally:
         db.close()
     order_flow._jobs.clear()
@@ -86,8 +130,44 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(tmp_path, monkey
         assert body["status"] == "failed" and body["diagnostics"] == expected and body["order_id"] == job.order_id
         assert not body["lock_id"] and body["proxy_rotations"] == 0
         assert body["events"][-1]["state"] == "failed"
-        assert fresh.load_orders()[0][1].failure_code == "unusual_activity"
+        assert fresh.load_orders()[0][1].failure_code == local_code
         exported = result.text + caplog.text + "\n".join(fresh._conn.iterdump())
-        assert all(x not in exported for x in (canary, cookie_canary, session_canary, pan, cvc))
+        assert all(x not in exported for x in
+                   (canary, cookie_canary, session_canary, _BLOCKED_CODE, _BLOCKED_RID, pan, cvc))
+    finally:
+        fresh.close()
+
+
+@pytest.mark.parametrize("legacy", [
+    {},
+    {"upstream_status": 400, "cf_ray": _RAY},
+    {"upstream_status": 403, "upstream_code": "unusual_activity", "request_id": _RID},
+], ids=["empty", "partial", "values-only"])
+def test_poll_does_not_infer_field_states_for_pre_upgrade_rows(tmp_path, monkeypatch, legacy):
+    path = tmp_path / "historical.db"
+    job = order_flow.QuickPayJob(id="historical", idempotency_key="test-only", status="failed",
+                                 stage="failed", failure_code="checkout_upstream_error")
+    raw = json.dumps(legacy)
+    old = persistence.Persistence(str(path))
+    try:
+        old.save_job(job)
+        # Inject the serialized pre-upgrade representation instead of exercising
+        # the new writer, including the cases of an empty or partial diagnostic.
+        with old._conn:
+            old._conn.execute("UPDATE quick_pay_jobs SET diagnostics_json=? WHERE id=?", (raw, job.id))
+    finally:
+        old.close()
+    monkeypatch.setattr(order_flow, "_jobs", {})
+    monkeypatch.setattr(order_flow, "_by_key", {})
+    fresh = persistence.Persistence(str(path))
+    monkeypatch.setattr(persistence, "_db", fresh)
+    try:
+        app = FastAPI()
+        app.include_router(quick_pay.router)
+        with TestClient(app) as client:
+            result = client.get("/api/payments/quick-pay/" + job.id)
+        assert result.status_code == 200
+        assert result.json()["diagnostics"] == legacy
+        assert fresh.load_jobs()[0]["diagnostics_json"] == raw
     finally:
         fresh.close()

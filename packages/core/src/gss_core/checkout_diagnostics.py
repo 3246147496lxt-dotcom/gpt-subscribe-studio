@@ -42,4 +42,22 @@ def safe_checkout_diagnostics(raw: object) -> dict:
         if (type(val) is str and len(val) <= 48 and pattern.fullmatch(val)
                 and not re.search(r"[0-9]{12,}", val.replace("-", ""))):
             out[key] = val
+    # Only the response parser can distinguish absent from discarded. Never
+    # reconstruct these observations from an older row or combine attempts.
+    if "upstream_status" in out:
+        for field in ("upstream_code", "request_id"):
+            key = field + "_state"
+            state = raw.get(key)
+            if (type(state) is str and state in ("not_found", "accepted", "filtered")
+                    and (state == "accepted") == (field in out)):
+                out[key] = state
+
+        source = raw.get("unusual_activity_source")
+        wire_code = out.get("upstream_code")
+        if (type(source) is str and out["upstream_status"] != 401
+                and wire_code not in ("invalid_session", "token_revoked")
+                and "upstream_code_state" in out):
+            if ((source == "structured_code" and wire_code == "unusual_activity")
+                    or (source == "body_match" and wire_code != "unusual_activity")):
+                out["unusual_activity_source"] = source
     return out

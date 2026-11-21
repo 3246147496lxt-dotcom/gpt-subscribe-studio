@@ -1017,23 +1017,31 @@ class ChatGPTClient:
 
     @staticmethod
     def _checkout_response_detail(response: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Only preserve evidence from the checkout response, never local classifications."""
+        """Capture safe values and whether recognized fields survived validation."""
         wire_code = None
+        code_present = False
         for block in (payload.get("error"), payload.get("detail"), payload):
-            if isinstance(block, dict) and isinstance(block.get("code"), str) and block["code"]:
-                wire_code = block["code"]
-                break
+            if isinstance(block, dict) and "code" in block:
+                code_present = True
+                if isinstance(block["code"], str) and block["code"]:
+                    wire_code = block["code"]
+                    break
         headers = {
             str(key).lower(): value
             for key, value in (getattr(response, "headers", None) or {}).items()
             if str(key).lower() in {"cf-ray", "x-request-id", "request-id"}
         }
-        return safe_checkout_diagnostics({
+        detail = safe_checkout_diagnostics({
             "upstream_status": getattr(response, "status_code", None),
             "upstream_code": wire_code,
             "cf_ray": headers.get("cf-ray"),
             "request_id": headers.get("x-request-id") or headers.get("request-id"),
         })
+        # Only these locally calculated states survive; do not retain rejected values.
+        id_present = "x-request-id" in headers or "request-id" in headers
+        for field, present in (("upstream_code", code_present), ("request_id", id_present)):
+            detail[field + "_state"] = "accepted" if field in detail else ("filtered" if present else "not_found")
+        return detail
 
     def _reject_checkout(self, response: Any, payload: Dict[str, Any], *, fallback: str = "") -> NoReturn:
         detail = self._checkout_response_detail(response, payload)
@@ -1047,6 +1055,7 @@ class ChatGPTClient:
             message = ("Session 已被上游撤销（token_revoked）" if wire_code == "token_revoked"
                        else self._unauthorized_message(response))
         elif wire_code == "unusual_activity" or "unusual activity" in text:
+            detail["unusual_activity_source"] = "structured_code" if wire_code == "unusual_activity" else "body_match"
             message = "ChatGPT 判定异常流量，已停止创建结账。"
         elif "billing country must match" in text:
             code, message = ErrorCode.BILLING_COUNTRY_MISMATCH, "上游拒绝结账：账单国家不匹配。"

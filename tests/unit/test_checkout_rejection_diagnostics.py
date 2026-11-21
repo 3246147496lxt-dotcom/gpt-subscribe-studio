@@ -37,7 +37,11 @@ def test_wire_codes_and_correlation_headers_survive(monkeypatch, caplog, status,
                 headers={"CF-RaY": _RAY, "X-REQUEST-ID": _RID, "Content-Type": "application/json"},
                 payload={"error": {"code": wire, "message": _SECRET}}, message=_SECRET)
     assert e.code is local
-    assert e.detail == dict(upstream_status=status, upstream_code=wire, cf_ray=_RAY, request_id=_RID)
+    expected = dict(upstream_status=status, upstream_code=wire, cf_ray=_RAY, request_id=_RID,
+                    upstream_code_state="accepted", request_id_state="accepted")
+    if wire == "unusual_activity":
+        expected["unusual_activity_source"] = "structured_code"
+    assert e.detail == expected
     assert _SECRET not in str(e.to_payload()) + caplog.text
 
 
@@ -54,7 +58,11 @@ def test_wire_codes_and_correlation_headers_survive(monkeypatch, caplog, status,
 def test_body_and_http_classification_do_not_invent_wire_code(monkeypatch, caplog, status, body, local):
     e = _reject(monkeypatch, status=status, headers={"CF-Ray": _RAY, "x-request-id": _RID},
                 payload={"detail": body, "debug": _SECRET}, message=f"{body} {_SECRET}")
-    assert e.detail == dict(upstream_status=status, cf_ray=_RAY, request_id=_RID)
+    expected = dict(upstream_status=status, cf_ray=_RAY, request_id=_RID,
+                    upstream_code_state="not_found", request_id_state="accepted")
+    if "unusual activity" in body:
+        expected["unusual_activity_source"] = "body_match"
+    assert e.detail == expected
     assert e.code is local
     if "unusual activity" in body:
         assert "异常流量" in str(e)
@@ -65,7 +73,8 @@ def test_body_and_http_classification_do_not_invent_wire_code(monkeypatch, caplo
 def test_unusable_success_response_no_payload_echo(monkeypatch, caplog, plan):
     e = _reject(monkeypatch, status=200, plan=plan, payload={"private_field": _SECRET},
                 headers={"Request-ID": _RID}, message=_SECRET)
-    assert e.detail == dict(upstream_status=200, request_id=_RID)
+    assert e.detail == dict(upstream_status=200, request_id=_RID,
+                            upstream_code_state="not_found", request_id_state="accepted")
     assert _SECRET not in str(e.to_payload()) + caplog.text
 
 
@@ -73,13 +82,13 @@ def test_invalid_wire_fields_are_omitted_not_truncated(monkeypatch, caplog):
     value = _SECRET + "\nAuthorization: Bearer test"
     e = _reject(monkeypatch, status=400, payload={"error": {"code": value}},
                 headers={"cf-ray": value, "X-Request-ID": value}, message=_SECRET)
-    assert e.detail == {"upstream_status": 400}
+    assert e.detail == dict(upstream_status=400, upstream_code_state="filtered", request_id_state="filtered")
     assert _SECRET not in str(e.to_payload()) + caplog.text
 
 def test_error_type_or_message_is_not_an_explicit_provider_code(monkeypatch, caplog):
     e = _reject(monkeypatch, status=401, headers={"Content-Type": "application/json"},
                 payload={"error": {"type": "token_revoked", "message": _SECRET}}, message=_SECRET)
-    assert e.detail == {"upstream_status": 401}
+    assert e.detail == dict(upstream_status=401, upstream_code_state="not_found", request_id_state="not_found")
     assert "upstream_error_code=token_revoked" not in caplog.text
 
 
@@ -93,5 +102,6 @@ def test_billing_conflict_keeps_response_evidence_without_payload(monkeypatch, c
     e = _reject(monkeypatch, status=200, plan="plus", payload={"billing": _SECRET},
                 headers={"request-id": _RID}, message=_SECRET)
     assert isinstance(e, ObservedBillingConflict)
-    assert e.detail == dict(upstream_status=200, request_id=_RID)
+    assert e.detail == dict(upstream_status=200, request_id=_RID,
+                            upstream_code_state="not_found", request_id_state="accepted")
     assert _SECRET not in str(e.to_payload()) + caplog.text
