@@ -342,6 +342,13 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         job.stage = "failed"
         job.failure_code = _error_code(exc)
         job.message = _error_message(exc)
+        if isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
+            raw = exc.detail.get("detail")
+            if isinstance(raw, dict):
+                allowed = {"upstream_status", "upstream_code", "cf_ray", "request_id"}
+                job.diagnostics = {
+                    k: v for k, v in raw.items() if k in allowed and v not in (None, "")
+                }
         job.finished_at = time.time()
         job.timings["total_ms"] = int((time.monotonic() - run_started) * 1000)
         _event(job, "failed", job.message or "")

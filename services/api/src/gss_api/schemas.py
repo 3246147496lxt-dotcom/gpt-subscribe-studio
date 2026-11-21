@@ -208,6 +208,7 @@ class QuickPayJobOut(BaseModel):
     job_id: str
     lock_id: Optional[str] = None
     timings_ms: Dict[str, int] = Field(default_factory=dict)
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
     events: list[QuickPayEventOut] = Field(default_factory=list)
     status: str
     stage: str

@@ -19,6 +19,7 @@ def _out(job) -> QuickPayJobOut:
         job_id=job.id,
         lock_id=getattr(job, "lock_id", None),
         timings_ms={str(k): int(v) for k, v in (getattr(job, "timings", {}) or {}).items()},
+        diagnostics=dict(getattr(job, "diagnostics", {}) or {}),
         events=events,
         status=job.status,
         stage=job.stage,

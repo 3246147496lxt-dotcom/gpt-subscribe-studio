@@ -457,13 +457,18 @@ def _to_out(order: Order) -> OrderOut:
     )
 
 
-def _error(status_code: int, code: ErrorCode, message: str, *, session_reissued: bool = False) -> HTTPException:
+def _error(status_code: int, code: ErrorCode, message: str, *, session_reissued: bool = False,
+           diagnostics: dict | None = None) -> HTTPException:
+    detail = {"session_reissued_for_country": True} if session_reissued else {}
+    if diagnostics:
+        allowed = {"upstream_status", "upstream_code", "cf_ray", "request_id"}
+        detail.update({k: v for k, v in diagnostics.items() if k in allowed and v not in (None, "")})
     return HTTPException(
         status_code=status_code,
         detail=ErrorOut(
             code=str(code),
             message=redact_sensitive(message),
-            detail={"session_reissued_for_country": True} if session_reissued else None,
+            detail=detail or None,
         ).model_dump(),
     )
 
@@ -479,7 +484,8 @@ def _from_domain(exc: DomainError, *, session_reissued: bool = False, nonteam: b
         raw_reason = "上游拒绝建单（凭证内容已隐藏）"
     message = (f"会话已重新签发，但后续步骤失败：{raw_reason}"
                if session_reissued else raw_reason)
-    return _error(status_code, exc.code, read_text(message) if nonteam else message, session_reissued=session_reissued)
+    return _error(status_code, exc.code, read_text(message) if nonteam else message,
+                  session_reissued=session_reissued, diagnostics=exc.detail)
 
 
 def mask_sid(value: Optional[str]) -> Optional[str]:
