@@ -256,7 +256,7 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         )
         def progress(stage: str) -> None:
             now = time.monotonic()
-            if stage in {"reissuing", "browser_decode", "creating_checkout"}:
+            if stage in {"reissuing", "browser_decode", "browser_decoded", "creating_checkout"}:
                 stage_started[stage] = now
             if stage == "reissued":
                 job.timings["reissue_ms"] = int((now - stage_started.get("reissuing", now)) * 1000)
