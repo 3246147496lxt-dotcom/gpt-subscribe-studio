@@ -33,6 +33,7 @@ const FAILURE_LABEL: Record<string, string> = {
   card_declined: "发卡行拒付或卡限额；请换卡或联系发卡行",
   insufficient_funds: "卡片余额不足；请充值或换卡",
   subscription_limit: "账号已达到订阅上限；请换账号或先处理现有订阅",
+  already_subscribed: "当前账号已是有效订阅状态，无需重复开通",
   unusual_activity: "上游判定异常流量；请换同国家 SID 或换干净 Session",
   sentinel_challenge_failed: "安全验证失败；已熔断，未继续扣款",
   proxy_tunnel_failed: "代理连接失败；请检查出口节点是否可用",

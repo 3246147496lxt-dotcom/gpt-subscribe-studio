@@ -60,6 +60,10 @@ def classify_upstream_failure(
             "card_velocity_exceeded", "do_not_honor", "generic_decline",
             "pickup_card", "发卡行拒付", "卡片被拒")):
         code = UpstreamFailureCode.CARD_DECLINED
+    elif ("already paid" in text or "already subscribed" in text
+          or "already_subscribed" in text or "已是付费订阅" in text
+          or "已有订阅" in text):
+        code = UpstreamFailureCode.ALREADY_SUBSCRIBED
     elif "subscription_limit" in text or "subscription limit" in text:
         code = UpstreamFailureCode.SUBSCRIPTION_LIMIT
     elif "billing_country" in text or "billing country" in text:

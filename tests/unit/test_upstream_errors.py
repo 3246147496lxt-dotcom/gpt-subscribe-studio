@@ -32,6 +32,11 @@ def test_unusual_activity_without_http_status():
     assert result.code is UpstreamFailureCode.UNUSUAL_ACTIVITY
 
 
+def test_already_subscribed_is_terminal_not_retryable():
+    for body in ("The account is already paid", "该账号已是付费订阅"):
+        assert classify_upstream_failure(status=400, body=body).code is UpstreamFailureCode.ALREADY_SUBSCRIBED
+
+
 def test_insufficient_funds_and_card_declined():
     assert classify_upstream_failure(
         status=402, body='{"code":"insufficient_funds"}'
