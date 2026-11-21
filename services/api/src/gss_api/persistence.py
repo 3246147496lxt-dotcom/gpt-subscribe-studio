@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from gss_contracts import Mode, Order, OrderStatus, Plan
+from gss_core.checkout_diagnostics import safe_checkout_diagnostics
 
 # Imported lazily in save_order to avoid a store <-> persistence import cycle.
 from typing import TYPE_CHECKING
@@ -54,12 +55,30 @@ def resolve_db_path() -> str:
     return str(Path.cwd() / "gss.db")
 
 
+def load_checkout_diagnostics(value: Any) -> dict:
+    """Database content (including historical rows) is not a trusted diagnostic."""
+    if not isinstance(value, str) or len(value) > 8192:
+        return {}
+    try:
+        return safe_checkout_diagnostics(json.loads(value))
+    except (ValueError, RecursionError):
+        return {}
+
+
+def _existing_diagnostics_json(value: Any) -> Optional[str]:
+    saved = load_checkout_diagnostics(value)
+    return json.dumps(saved) if saved else None
+
+
 class Persistence:
     def __init__(self, path: Optional[str] = None) -> None:
         self.path = path or resolve_db_path()
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False, timeout=5)
         self._conn.row_factory = sqlite3.Row
+        # Choose the first *valid* recorded snapshot within the atomic UPSERT,
+        # including when another worker saved its snapshot before this writer.
+        self._conn.create_function("gss_existing_diag", 1, _existing_diagnostics_json)
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
@@ -340,7 +359,7 @@ class Persistence:
             job.order_id, job.status, job.stage, job.failure_code, job.message,
             job.amount, job.currency, job.purchase_attempt_id, getattr(job, "lock_id", None),
             json.dumps(getattr(job, "timings", {}) or {}, ensure_ascii=False),
-            json.dumps(getattr(job, "diagnostics", {}) or {}, ensure_ascii=False),
+            json.dumps(safe_checkout_diagnostics(getattr(job, "diagnostics", None))),
             getattr(job, "locked_by", None), getattr(job, "lease_until", None),
             datetime.fromtimestamp(job.started_at, timezone.utc).isoformat()
             if getattr(job, "started_at", None) else _utcnow(),
@@ -358,12 +377,13 @@ class Persistence:
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status, stage=excluded.stage,
+                    order_id=COALESCE(NULLIF(quick_pay_jobs.order_id,''), excluded.order_id),
                     failure_code=excluded.failure_code, message=excluded.message,
                     amount=excluded.amount, currency=excluded.currency,
                     purchase_attempt_id=excluded.purchase_attempt_id,
                     lock_id=excluded.lock_id,
                     timings_json=excluded.timings_json,
-                    diagnostics_json=excluded.diagnostics_json,
+                    diagnostics_json=COALESCE(gss_existing_diag(quick_pay_jobs.diagnostics_json), excluded.diagnostics_json),
                     updated_at=excluded.updated_at, finished_at=excluded.finished_at""",
                 payload,
             )

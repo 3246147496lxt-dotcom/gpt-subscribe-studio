@@ -32,6 +32,7 @@ from gss_contracts.adapter import receipt_matches_order, team_entitlement_matche
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_account import FakeAccountAdapter
 from gss_checkout import FakeCheckoutAdapter
+from gss_core.checkout_diagnostics import safe_checkout_diagnostics
 from gss_core.billing import address_for
 from gss_core.config import ORDER_HTTP_TIMEOUT_S, load_settings, use_fake_adapters
 from gss_core.browser_context import BrowserContext
@@ -460,9 +461,7 @@ def _to_out(order: Order) -> OrderOut:
 def _error(status_code: int, code: ErrorCode, message: str, *, session_reissued: bool = False,
            diagnostics: dict | None = None) -> HTTPException:
     detail = {"session_reissued_for_country": True} if session_reissued else {}
-    if diagnostics:
-        allowed = {"upstream_status", "upstream_code", "cf_ray", "request_id"}
-        detail.update({k: v for k, v in diagnostics.items() if k in allowed and v not in (None, "")})
+    detail.update(safe_checkout_diagnostics(diagnostics))
     return HTTPException(
         status_code=status_code,
         detail=ErrorOut(
@@ -515,11 +514,36 @@ def _mark(progress: Callable[[str], None] | None, stage: str) -> None:
             pass
 
 
-def _safe_exc_summary(exc: BaseException, limit: int = 240) -> str:
-    try:
-        return redact_sensitive(str(exc))[:limit]
-    except Exception:  # noqa: BLE001
-        return type(exc).__name__
+def _checkout_failure_code(exc: DomainError) -> str:
+    # An explicit rejection outranks incidental transport words in its message.
+    detail = safe_checkout_diagnostics(exc.detail)
+    upstream = str(detail.get("upstream_code", "")).lower()
+    text = exc.message.lower()
+    if (exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED}
+            or detail.get("upstream_status") == 401
+            or upstream in {"invalid_session", "token_revoked", "invalid_token", "session_expired"}
+            or any(x in text for x in ("token_revoked", "invalidated oauth token", "invalid_session"))):
+        return "invalid_session"
+    if upstream == "unusual_activity" or any(x in text for x in ("unusual_activity", "unusual activity", "异常流量")):
+        return "unusual_activity"
+    if exc.code is not ErrorCode.CHECKOUT_UPSTREAM_ERROR:
+        return str(exc.code)
+    if upstream in {"already_subscribed", "subscription_limit", "billing_country_mismatch"}:
+        return upstream
+    inferred = str(classify_upstream_failure(exc=exc, stage="checkout").code)
+    if exc.detail and inferred == "proxy_tunnel_failed":
+        return "unknown_upstream"  # presence of a response is not a transport diagnosis
+    return inferred
+
+
+def _is_retryable_checkout_tunnel(exc: DomainError) -> bool:
+    # Do not replay a checkout POST after a reply (even a partial/malformed one).
+    # "proxy" by itself is not evidence that a connection was never established.
+    if exc.code is not ErrorCode.CHECKOUT_UPSTREAM_ERROR or exc.detail or _checkout_failure_code(exc) != "proxy_tunnel_failed":
+        return False
+    return any(marker in exc.message.lower() for marker in (
+        "proxy_tunnel_failed", "proxy tunnel failed", "connect tunnel failed",
+    ))
 
 
 def _release_create_failure(claim_dir, order_id: str, idempotency_key: str | None) -> None:
@@ -553,17 +577,11 @@ async def _create_checkout_once(pipeline, *, proxy: str, **kwargs):
         return await pipeline.create_checkout(proxy=proxy, pin_proxy=True, **kwargs)
     except DomainError as exc:
         logger.warning(
-            "create_checkout_domain_error type=%s code=%s detail=%s",
-            type(exc).__name__, str(exc.code), _safe_exc_summary(exc),
+            "create_checkout_domain_error type=%s code=%s", type(exc).__name__, str(exc.code),
         )
         raise
     except Exception as exc:  # noqa: BLE001
-        status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
-        logger.warning(
-            "create_checkout_exception type=%s status=%s detail=%s",
-            type(exc).__name__, status_code if status_code is not None else "-",
-            _safe_exc_summary(exc),
-        )
+        logger.warning("create_checkout_exception type=%s", type(exc).__name__)
         raise DomainError(
             ErrorCode.CHECKOUT_UPSTREAM_ERROR, "建单请求未获确认，已停止且不自动重试。",
         ) from None
@@ -937,11 +955,9 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                 )
                 break
             except DomainError as exc:
-                failure = classify_upstream_failure(exc=exc, stage="checkout")
-                retryable = str(failure.code) in {"unusual_activity", "proxy_tunnel_failed"}
-                rotate_enabled = _env_on("GSS_CHECKOUT_ROTATE")
-                if checkout_attempt == 0 and retryable and exit_proxy and rotate_enabled:
-                    logger.warning("checkout_proxy_rotating code=%s", failure.code)
+                if (checkout_attempt == 0 and exit_proxy and _env_on("GSS_CHECKOUT_ROTATE")
+                        and _is_retryable_checkout_tunnel(exc)):
+                    logger.warning("checkout_proxy_rotating code=proxy_tunnel_failed")
                     exit_proxy = rotate_proxy_sid(exit_proxy, force=True)
                     item.proxy = exit_proxy
                     item.session = raw_session
@@ -960,12 +976,20 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         raise
     except DomainError as exc:
         logger.info("stage_timing stage=create_checkout duration_ms=%.1f", (time.perf_counter() - checkout_started) * 1000)
-        store.update_status(order.id, OrderStatus.REJECTED)
-        store.view(order.id).failure_code = str(
-            classify_upstream_failure(exc=exc, stage="checkout").code
-        )
-        error = _from_domain(exc, session_reissued=session_reissued, nonteam=plan is not Plan.TEAM)
-        store.view(order.id).last_error = error.detail["message"]
+        view = store.view(order.id)
+        view.failure_code = _checkout_failure_code(exc)
+        if view.failure_code in {"unusual_activity", "invalid_session"}:
+            # Never persist upstream prose or advice to replay a rejected session.
+            invalid = view.failure_code == "invalid_session"
+            error = _error(401 if invalid else 400,
+                           ErrorCode.INVALID_SESSION if invalid else ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                           "会话已失效，已停止建单。" if invalid else "上游报告异常流量，已停止建单。",
+                           session_reissued=session_reissued, diagnostics=exc.detail)
+        else:
+            error = _from_domain(exc, session_reissued=session_reissued, nonteam=plan is not Plan.TEAM)
+        error._checkout_order_id = order.id  # internal correlation only; not in the HTTP body
+        view.last_error = error.detail["message"]
+        store.update_status(order.id, OrderStatus.REJECTED)  # persists failure fields together
         logger.info(
             "checkout_failed id=%s plan=%s country=%s code=%s",
             order.id,

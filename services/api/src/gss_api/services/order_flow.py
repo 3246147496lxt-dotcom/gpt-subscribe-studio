@@ -17,12 +17,13 @@ from fastapi import HTTPException
 
 from gss_contracts.errors import DomainError
 from gss_core.chatgpt import ChatGPTClient
+from gss_core.checkout_diagnostics import safe_checkout_diagnostics
 from gss_core.redaction import redact_sensitive
 
 from ..schemas import BillingIn, OrderCreateRequest, QuickPayRequest
 from ..routers import orders, protocol_cards
 from .. import locks
-from ..persistence import get_db_optional
+from ..persistence import get_db_optional, load_checkout_diagnostics
 
 logger = logging.getLogger("gss.quick_pay")
 
@@ -76,7 +77,8 @@ def _error_code(exc: Exception) -> str:
 
 def _error_message(exc: Exception) -> str:
     if isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
-        return _safe_message(exc.detail.get("message") or exc.detail)
+        message = exc.detail.get("message")
+        return _safe_message(message) if isinstance(message, str) and message else "请求失败"
     return _safe_message(exc)
 
 
@@ -115,12 +117,15 @@ def get_job_by_key(key: str) -> Optional[QuickPayJob]:
 def _persist_job(job: QuickPayJob) -> None:
     db = get_db_optional()
     if db is not None:
+        operation = "save_job"
         try:
             db.save_job(job)
+            operation = "save_idempotency"
             db.save_idempotency(job.idempotency_key, "quick_pay", order_id=job.order_id or "",
                                 job_id=job.id, state=job.status)
         except Exception:
-            pass
+            # Database errors may contain values. Never log the exception or retry payment.
+            logger.warning("quick_pay_persistence_failed operation=%s", operation)
 
 
 def _event(job: QuickPayJob, stage: str, message: str = "") -> None:
@@ -130,7 +135,7 @@ def _event(job: QuickPayJob, stage: str, message: str = "") -> None:
             db.add_event(stage=stage, event=job.status, order_id=job.order_id or "",
                          job_id=job.id, message=message)
         except Exception:
-            pass
+            logger.warning("quick_pay_persistence_failed operation=add_event")
 
 
 def _set_stage(job: QuickPayJob, stage: str, message: str = "", *, event: bool = True) -> None:
@@ -149,8 +154,35 @@ def _from_db_job(row: dict) -> QuickPayJob:
         amount=row.get("amount"), currency=row.get("currency"),
         failure_code=row.get("failure_code"), message=row.get("message"),
         lock_id=row.get("lock_id"), timings=json.loads(row.get("timings_json") or "{}"),
+        diagnostics=load_checkout_diagnostics(row.get("diagnostics_json")),
         started_at=0, finished_at=None,
     )
+
+
+def _capture_checkout_failure(job: QuickPayJob, exc: Exception) -> None:
+    if isinstance(exc, DomainError):
+        incoming = safe_checkout_diagnostics(exc.detail)
+    elif isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
+        incoming = (safe_checkout_diagnostics(exc.detail.get("detail"))
+                    or safe_checkout_diagnostics(exc.detail))
+    else:
+        incoming = {}
+    # Do not combine fields/traces from different upstream requests.
+    job.diagnostics = safe_checkout_diagnostics(job.diagnostics) or incoming
+
+    # The order router sets this private attribute only after order creation.
+    # Never accept an order identifier from upstream data or an HTTP payload.
+    candidate = getattr(exc, "_checkout_order_id", None)
+    if job.order_id or not isinstance(candidate, str) or len(candidate) != 36:
+        return
+    try:
+        parsed = uuid.UUID(candidate)
+    except ValueError:
+        return
+    if parsed.version == 4 and str(parsed) == candidate:
+        order = orders.store.get_order(candidate)
+        if order and job.idempotency_key and order.idempotency_key == job.idempotency_key:
+            job.order_id = candidate
 
 
 def _new_job(idempotency_key: str, account_fingerprint: str = "") -> QuickPayJob:
@@ -342,13 +374,7 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         job.stage = "failed"
         job.failure_code = _error_code(exc)
         job.message = _error_message(exc)
-        if isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
-            raw = exc.detail.get("detail")
-            if isinstance(raw, dict):
-                allowed = {"upstream_status", "upstream_code", "cf_ray", "request_id"}
-                job.diagnostics = {
-                    k: v for k, v in raw.items() if k in allowed and v not in (None, "")
-                }
+        _capture_checkout_failure(job, exc)
         job.finished_at = time.time()
         job.timings["total_ms"] = int((time.monotonic() - run_started) * 1000)
         _event(job, "failed", job.message or "")

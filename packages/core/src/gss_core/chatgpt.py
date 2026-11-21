@@ -12,11 +12,12 @@ import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from http.cookiejar import CookieJar
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, NoReturn, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.verified_payer import checkout_address, check_observed_billing
+from gss_core.checkout_diagnostics import safe_checkout_diagnostics
 from gss_core.config import ORDER_HTTP_TIMEOUT_S
 from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.money import quote_from_payload
@@ -1014,6 +1015,56 @@ class ChatGPTClient:
                     return value.strip()[:80]
         return ""
 
+    @staticmethod
+    def _checkout_response_detail(response: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Only preserve evidence from the checkout response, never local classifications."""
+        wire_code = None
+        for block in (payload.get("error"), payload.get("detail"), payload):
+            if isinstance(block, dict) and isinstance(block.get("code"), str) and block["code"]:
+                wire_code = block["code"]
+                break
+        headers = {
+            str(key).lower(): value
+            for key, value in (getattr(response, "headers", None) or {}).items()
+            if str(key).lower() in {"cf-ray", "x-request-id", "request-id"}
+        }
+        return safe_checkout_diagnostics({
+            "upstream_status": getattr(response, "status_code", None),
+            "upstream_code": wire_code,
+            "cf_ray": headers.get("cf-ray"),
+            "request_id": headers.get("x-request-id") or headers.get("request-id"),
+        })
+
+    def _reject_checkout(self, response: Any, payload: Dict[str, Any], *, fallback: str = "") -> NoReturn:
+        detail = self._checkout_response_detail(response, payload)
+        status = detail.get("upstream_status")
+        wire_code = detail.get("upstream_code")
+        # Classification may consult text locally; neither logs nor exceptions carry that text.
+        text = str(getattr(response, "text", "") or "")[:500].lower()
+        code = ErrorCode.CHECKOUT_UPSTREAM_ERROR
+        if status == 401 or wire_code in {"invalid_session", "token_revoked"}:
+            code = ErrorCode.INVALID_SESSION
+            message = ("Session 已被上游撤销（token_revoked）" if wire_code == "token_revoked"
+                       else self._unauthorized_message(response))
+        elif wire_code == "unusual_activity" or "unusual activity" in text:
+            message = "ChatGPT 判定异常流量，已停止创建结账。"
+        elif "billing country must match" in text:
+            code, message = ErrorCode.BILLING_COUNTRY_MISMATCH, "上游拒绝结账：账单国家不匹配。"
+        elif "already paid" in text:
+            code, message = ErrorCode.ALREADY_SUBSCRIBED, "该账号已是付费订阅。"
+        elif "only for internal checkout sessions" in text:
+            message = "上游只接受内部结账会话。"
+        elif fallback:
+            message = fallback
+        elif status == 403:
+            message = "上游拒绝创建结账（HTTP 403）。"
+        elif status is not None and status >= 500:
+            message = f"创建结账失败：ChatGPT 暂时返回 {status}。"
+        else:
+            message = f"上游拒绝创建结账（HTTP {status}）。" if status is not None else "上游拒绝创建结账。"
+        logger.warning("upstream_error where=/backend-api/payments/checkout status=%s", status)
+        raise DomainError(code, message, detail=detail)
+
     def _raise(self, code: ErrorCode, response: Any, prefix: str) -> None:
         _log_upstream_failure(prefix, response)
         body = redact_sensitive(str(getattr(response, "text", ""))[:500])
@@ -1168,13 +1219,15 @@ class ChatGPTClient:
         response_status = int(getattr(response, "status_code", 0) or 0)
         if response_status == 401:
             _log_checkout_unauthorized(response, checkout_url, self.http.headers)
-            _log_upstream_failure("/backend-api/payments/checkout", response)
-            raise DomainError(ErrorCode.INVALID_SESSION, self._unauthorized_message(response))
-        if response_status >= 400:
-            self._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "创建结账")
         payload = _json(response)
+        if response_status >= 400:
+            self._reject_checkout(response, payload)
         if billing is not None:
-            check_observed_billing(payload, billing)
+            try:
+                check_observed_billing(payload, billing)
+            except DomainError as exc:
+                exc.detail = self._checkout_response_detail(response, payload)
+                raise
         raw_url = str(payload.get("url") or payload.get("checkout_url") or "").strip()
         checkout_id = public_checkout_id(
             payload.get("checkout_session_id") or payload.get("session_id") or payload.get("id") or ""
@@ -1184,16 +1237,13 @@ class ChatGPTClient:
         if hosted:
             url = hosted_checkout_url(raw_url, stripe_id or checkout_id)
             if not url:
-                raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "未拿到 Team 托管长链")
+                self._reject_checkout(response, payload, fallback="未拿到 Team 托管长链")
             session_id = stripe_id or checkout_id
         else:
             # 官方晚间 SPA 常把 cs_live 放在顶层 id；内部 confirm 仍要 oaics_（若响应里有）。
             session_id = internal_id or checkout_id or stripe_id
             if not session_id:
-                raise DomainError(
-                    ErrorCode.CHECKOUT_UPSTREAM_ERROR,
-                    f"结账响应缺少 session id: {redact_sensitive(str(payload)[:240])}",
-                )
+                self._reject_checkout(response, payload, fallback="结账响应缺少 session id")
             processor = str(payload.get("processor_entity") or _processor(country))
             path_id = stripe_id if (session_id.startswith("oaics_") and stripe_id) else session_id
             url = raw_url if raw_url.startswith("http") else f"{APP_BASE}/checkout/{processor}/{path_id}"
@@ -2272,7 +2322,7 @@ def _log_checkout_unauthorized(response: Any, checkout_url: str, configured_head
         for error in (payload.get("error"), payload.get("detail"), payload):
             if not isinstance(error, dict):
                 continue
-            code = error.get("code") or error.get("type")
+            code = error.get("code")
             if isinstance(code, str) and code in _CHECKOUT_AUTH_ERROR_CODES:
                 error_code = code
                 break

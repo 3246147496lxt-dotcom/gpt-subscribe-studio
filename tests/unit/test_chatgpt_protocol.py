@@ -364,9 +364,10 @@ def test_checkout_401_records_safe_diagnostics(monkeypatch, caplog, content_type
     assert "header_source=request has_oai_device_id=True has_user_agent=False" in caplog.text
     assert f"body_kind={expected_kind} body_bytes={len(response.content)}" in caplog.text
     assert f"upstream_error_code={expected_code}" in caplog.text
-    # 新策略：>=400 必须落原始响应体（脱敏后），URL 里的 secret 仍要打码。
+    # Checkout error logs contain safe metadata only, even for unknown body shapes.
     assert "upstream_error where=/backend-api/payments/checkout status=401" in caplog.text
-    assert "body=private-diagnostic-marker" in caplog.text
+    assert "body=" not in caplog.text
+    assert "private-diagnostic-marker" not in caplog.text
     assert "secret=private-diagnostic-marker" not in caplog.text
 
 
