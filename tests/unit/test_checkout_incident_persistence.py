@@ -56,7 +56,7 @@ def test_failure_before_payment_has_same_safe_projection_after_cache_loss(db, mo
     monkeypatch.setattr(flow.protocol_cards, "bind_and_pay_protocol", forbidden)
     monkeypatch.setattr(flow.locks, "hold_order_unknown", forbidden)
     payload = SimpleNamespace(plan="plus", billing_country="US", exit_country="US", session="offline",
-        card=SimpleNamespace(model_dump=lambda: {}), mode=ModeIn(), promo_code="", promo_campaign_id="",
+        mode=ModeIn(), promo_code="", promo_campaign_id="",
         workspace_name="", seat_quantity=None, price_interval="month", debug_checkout_only=True)
     result = asyncio.run(flow.run_quick_pay(job.id, payload, job.idempotency_key))
     assert result.status == "failed" and result.diagnostics == SNAPSHOT

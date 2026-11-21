@@ -58,7 +58,7 @@ GET  /api/payments/quick-pay/{job_id}
 }
 ```
 
-同一 `Idempotency-Key` 再次请求返回同一个 job。
+同一合法请求使用同一 `Idempotency-Key` 时返回原 job。HTTP 202 仅表示任务已受理，不等于上游已建单、付款或开通。
 
 ## GET /api/payments/quick-pay/{job_id}
 
@@ -134,13 +134,21 @@ browser_decode_unavailable
 }
 ```
 
-只建单，不提交卡；返回：
+在正常建单字段中设置上面的开关。**必须省略整个 `card` 字段**（包括 `null` 与旧版占位卡）；携带时返回脱敏 422，不入队。普通付款请求（开关为 false 或省略）仍须提供有效的 `card`。
+
+仅建单成功时返回：
 
 ```text
 status=succeeded
 stage=checkout_created
 message=仅建单完成，未提交卡
 ```
+
+### 建单失败后由本人办理
+
+状态 API 的可选字段 `checkout_outcome` 不是上游字段。只有数据库能关联到同一账户、作业及被拒的订单，确认首次响应是明确的 HTTP 拒绝，且没有结账成功、付款尝试、未决状态、现存锁或冲突订单时，才可能为 `rejected_before_payment`。缺证据时为空；不靠超时、错误文字或前端推测赋值。
+
+界面仅对证据明确的拒单显示“未创建结账单，未提交付款”。本人办理是独立前往官方入口，不传递卡、Session、订单号或返回令牌，不重放原作业，也不会因用户点击而把原单改为成功。已有订阅、后续付款失败和 `unknown` 不使用该入口。旧客户端请随新版后端同步更新：仅建单请求不再接受占位卡。
 
 ## 安全约束
 
@@ -214,7 +222,7 @@ POST /api/orders/{order_id}/auto-renew/cancel
 
 ## 建单 SID 轮换
 
-仅建单阶段遇到 `unusual_activity` / `proxy_tunnel_failed` 时：
+明确拒绝（包括 `unusual_activity` 和会话失效）是终态，不二发。仅既有开关已启用且能确认未获上游响应的隧道连接失败时：
 
 ```text
 最多自动重试 1 次

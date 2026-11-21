@@ -271,7 +271,6 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         job.timings["queue_ms"] = max(0, int((time.time() - job.started_at) * 1000))
     _set_stage(job, "creating_order", "已接受任务，开始建单")
     _event(job, "running", job.stage)
-    card = payload.card.model_dump()  # local only; never assigned to job
     stage_started: Dict[str, float] = {"creating_order": run_started}
     try:
         create_payload = OrderCreateRequest(
@@ -384,9 +383,6 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             job.id, job.order_id or "-", job.failure_code, type(exc).__name__,
         )
         return job
-    finally:
-        # Drop the only card-bearing reference as soon as the flow exits.
-        card = None
 
 
 __all__ = ["QuickPayJob", "start_quick_pay", "run_quick_pay", "get_job", "get_job_by_key"]

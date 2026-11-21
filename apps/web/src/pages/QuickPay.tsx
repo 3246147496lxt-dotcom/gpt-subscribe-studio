@@ -25,24 +25,24 @@ const STAGE_LABEL: Record<string, string> = {
   canceling_auto_renew: "正在关闭自动续费",
   auto_renew_canceled: "自动续费已关闭",
   succeeded: "充值成功",
-  failed: "充值失败",
+  failed: "任务未完成",
   unknown: "扣款结果待核对",
 };
 
 const FAILURE_LABEL: Record<string, string> = {
-  card_declined: "发卡行拒付或卡限额；请换卡或联系发卡行",
-  insufficient_funds: "卡片余额不足；请充值或换卡",
-  subscription_limit: "账号已达到订阅上限；请换账号或先处理现有订阅",
+  card_declined: "发卡行拒绝付款；请核对银行记录",
+  insufficient_funds: "卡片余额不足",
+  subscription_limit: "账号已达到订阅上限；请核对现有订阅",
   already_subscribed: "当前账号已是有效订阅状态，无需重复开通",
-  unusual_activity: "上游判定异常流量；请换同国家 SID 或换干净 Session",
+  unusual_activity: "上游拒绝了本次请求",
   sentinel_challenge_failed: "安全验证失败；已熔断，未继续扣款",
   proxy_tunnel_failed: "代理连接失败；请检查出口节点是否可用",
   proxy_authentication_failed: "代理认证失败；请检查代理账号或权限",
   upstream_timeout: "上游超时；请勿自动重复扣款，先核对账单",
   browser_decode_unavailable: "浏览器解码不可用；请检查 Chromium/Playwright 环境",
-  checkout_upstream_error: "建单被上游拒绝；请查看阶段日志和 failure_code",
-  invalid_session: "Session 无效或缺少必要凭证；请重新导出完整 Session JSON",
-  session_expired: "Session 已过期；请重新登录并导出新 Session",
+  checkout_upstream_error: "建单未完成；请核对订单记录",
+  invalid_session: "会话无效，本次请求已停止",
+  session_expired: "会话已过期，本次请求已停止",
   payment_unknown_state: "扣款结果待核对；已锁定，请人工确认账单",
   unknown_upstream: "未分类上游错误；请保留订单号和阶段日志排查",
 };
@@ -76,6 +76,34 @@ function readLock(): StoredLock | null {
   } catch {
     return null;
   }
+}
+
+// The outcome flag is produced by the server. Block contradictory or legacy
+// results rather than offering a new checkout while payment might be in flight.
+function confirmedRejection(job: QuickPayJob, locked: boolean): boolean {
+  return job.checkout_outcome === "rejected_before_payment" && job.status === "failed"
+    && job.stage === "failed" && Boolean(job.order_id) && !locked && !job.lock_id
+    && ["checkout_upstream_error", "unusual_activity", "already_subscribed", "subscription_limit",
+      "invalid_session", "session_expired"].includes(job.failure_code ?? "")
+    && !job.events?.some(e => ["checkout_created", "confirming_payment", "verifying_delivery",
+      "unknown", "succeeded", "canceling_auto_renew", "auto_renew_canceled"].includes(e.stage)
+      || e.state === "unknown" || e.state === "succeeded");
+}
+
+export function QuickPayFailure({ job, locked }: { job: QuickPayJob; locked: boolean }) {
+  if (job.status !== "failed") return null;
+  if (confirmedRejection(job, locked)) {
+    const offerOfficial = job.failure_code === "checkout_upstream_error" || job.failure_code === "unusual_activity";
+    return <Alert color="red" title="未创建结账单，未提交付款">
+      {offerOfficial ? <>
+        <Text size="sm">本地订单已停止。账户本人可以在 ChatGPT 中查看或办理订阅；这是独立操作，不会恢复本单或将其标为付款成功。</Text>
+        <a href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">本人前往 ChatGPT 查看订阅</a>
+      </> : <Text size="sm">{FAILURE_LABEL[job.failure_code || ""] || "本地订单已停止。"}</Text>}
+    </Alert>;
+  }
+  return <Alert color="red" title={FAILURE_LABEL[job.failure_code || ""] || "任务未完成"}>
+    请保留作业编号，核对订单记录。
+  </Alert>;
 }
 
 export function QuickPay() {
@@ -172,7 +200,6 @@ export function QuickPay() {
     try {
       const created = await startQuickPay({
         plan, exit_country: exitCountry, billing_country: "US", session: session.trim(),
-        card: { number: "0000000000000000", cvc: "000", exp_month: "01", exp_year: "2030" },
         mode: { account_source: "customer_session", card_source: "customer", billing_mode: "standard", risk_acknowledged: false },
         auto_cancel_renew: autoCancelRenew,
         debug_checkout_only: true,
@@ -214,7 +241,7 @@ export function QuickPay() {
         <Stack gap="md">
           <div>
             <Title order={2}>一键充值</Title>
-            <Text c="dimmed" size="sm" mt={4}>Session、套餐和银行卡一次提交；账单地址由服务端固定为已核验的美国免税地址。</Text>
+            <Text c="dimmed" size="sm" mt={4}>仅建单不收集银行卡资料；选择付款时才需填写银行卡。</Text>
           </div>
           <Textarea label="ChatGPT Session JSON" placeholder="粘贴完整 session JSON" rows={8} value={session}
             onChange={(event) => setSession(event.currentTarget.value)} disabled={busy}
@@ -228,7 +255,11 @@ export function QuickPay() {
             <Select label="出口国家 / 币种" value={exitCountry} onChange={(value) => setExitCountry(value || "PH")} searchable disabled={busy}
               data={REGIONS.map((item) => ({ value: item.code, label: `${item.label} (${item.code})` }))} />
           </Group>
-          <Switch checked={debugOnly} onChange={(event) => setDebugOnly(event.currentTarget.checked)} disabled={busy}
+          <Switch checked={debugOnly} onChange={(event) => {
+            const next = event.currentTarget.checked;
+            if (next) { setNumber(""); setExpiry(""); setCvc(""); }
+            setDebugOnly(next);
+          }} disabled={busy}
             label="仅建单调试（不提交卡）" description="开发测试用：只创建结账单，不执行扣款。" />
           {!debugOnly && (
             <Stack gap="sm">
@@ -253,7 +284,7 @@ export function QuickPay() {
         <Card withBorder radius="lg" p="lg" className="workspace-panel">
           <Stack gap="sm">
             <Group justify="space-between">
-              <Title order={3}>{STAGE_LABEL[job.stage] || job.stage}</Title>
+              <Title order={3}>{confirmedRejection(job, Boolean(locked)) ? "建单被拒" : STAGE_LABEL[job.stage] || job.stage}</Title>
               <Badge color={job.status === "succeeded" ? "green" : job.status === "failed" ? "red" : "blue"}>
                 {job.status}
               </Badge>
@@ -270,24 +301,25 @@ export function QuickPay() {
               </Group>
             )}
             <Group gap="lg">
+              <Text size="sm">作业：<Code>{job.job_id}</Code></Text>
               {job.order_id && <Text size="sm">订单：<Code>{job.order_id}</Code></Text>}
               {job.amount && <Text size="sm">金额：<strong>{job.amount} {job.currency}</strong></Text>}
               {job.purchase_attempt_id && <Text size="sm">尝试：<Code>{job.purchase_attempt_id}</Code></Text>}
               {job.auto_renew_status === "canceled" && <Badge color="green">自动续费已关闭</Badge>}
               {job.auto_renew_status === "manual_required" && <Badge color="orange">自动续费待人工处理</Badge>}
             </Group>
-            {job.failure_code && <Alert color="red" title={FAILURE_LABEL[job.failure_code] || "充值失败"}>{job.message}</Alert>}
+            <QuickPayFailure job={job} locked={Boolean(locked)} />
             {job.events && job.events.length > 0 && (
               <Stack gap={4}>
                 <Text size="sm" fw={600}>阶段时间线</Text>
                 {job.events.slice(-8).map((event, index) => (
                   <Text key={`${event.created_at}-${index}`} size="xs" c="dimmed">
-                    {new Date(event.created_at).toLocaleTimeString()} · {STAGE_LABEL[event.stage] || event.stage} · {event.message}
+                    {new Date(event.created_at).toLocaleTimeString()} · {STAGE_LABEL[event.stage] || event.stage}{event.stage !== "failed" && event.state !== "failed" && event.message ? ` · ${event.message}` : ""}
                   </Text>
                 ))}
               </Stack>
             )}
-            {job.status === "succeeded" && <Alert color="green" icon={<IconCheck size={18} />}>{job.message || "充值成功"}</Alert>}
+            {job.status === "succeeded" && <Alert color="green" icon={<IconCheck size={18} />}>{job.stage === "checkout_created" ? "仅建单完成，未提交付款。" : job.message || "充值成功"}</Alert>}
             {job.status === "unknown" && <Alert color="orange" icon={<IconX size={18} />}>扣款结果待核对，请勿重复提交。</Alert>}
           </Stack>
         </Card>

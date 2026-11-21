@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from gss_api import persistence
 from gss_api.routers import orders, quick_pay
-from gss_api.schemas import CardIn, QuickPayRequest
+from gss_api.schemas import QuickPayRequest
 from gss_api.services import order_flow
 from gss_api.store import InMemoryStore
 from gss_core import chatgpt
@@ -70,7 +70,8 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
     canary = "private-body-marker-never-emit"
     session_canary = "offline-private-session-marker"
     cookie_canary = "private-cookie-marker"
-    error = {"message": "Unusual activity: " + canary}
+    pan, cvc = "4242" * 4, "CVCX"  # synthetic response-body leak canaries
+    error = {"message": "Unusual activity: " + canary, "private_extra": [pan, cvc]}
     headers = {"CF-Ray": _RAY, "set-cookie": "name=" + cookie_canary}
     if wire_code is not None:
         error["code"] = wire_code
@@ -80,9 +81,7 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
                               request=httpx.Request("POST", "https://checkout.invalid/test"))
     post = Mock(side_effect=[response])  # another POST fails, even before call-count assertions
     monkeypatch.setattr(chatgpt.ChatGPTClient, "http", property(lambda _: SimpleNamespace(post=post, headers={})))
-    pan, cvc = "4242" * 4, "CVCX"  # inert synthetic markers, not card credentials
     payload = QuickPayRequest(plan="plus", billing_country="US", exit_country="US", debug_checkout_only=True,
-                              card=CardIn(number=pan, cvc=cvc, exp_month="11", exp_year="2030"),
                               session=json.dumps({"accessToken": session_canary}))
     expected = {"upstream_status": status, "cf_ray": _RAY, "upstream_code_state": code_state,
                 "request_id_state": rid_state}
@@ -92,12 +91,14 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
         expected["upstream_code"] = wire_code
     if rid_state == "accepted":
         expected["request_id"] = wire_request_id
+    fingerprint = "synthetic-owner"
+    monkeypatch.setattr(order_flow.locks, "account_fingerprint", lambda _session: fingerprint)
     key = "offline-first-refusal"
     db = persistence.Persistence(str(path))
     monkeypatch.setattr(persistence, "_db", db)
     store.attach_db(db)
     try:
-        job = order_flow._new_job(key)
+        job = order_flow._new_job(key, fingerprint)
         job = asyncio.run(order_flow.run_quick_pay(job.id, payload, key))
         assert job.status == "failed" and job.diagnostics == expected and job.order_id
         assert post.call_count == 1 and post.call_args.args[0].endswith("/backend-api/payments/checkout")
@@ -128,6 +129,7 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
         assert result.status_code == 200
         body = result.json()
         assert body["status"] == "failed" and body["diagnostics"] == expected and body["order_id"] == job.order_id
+        assert body["checkout_outcome"] == "rejected_before_payment"
         assert not body["lock_id"] and body["proxy_rotations"] == 0
         assert body["events"][-1]["state"] == "failed"
         assert fresh.load_orders()[0][1].failure_code == local_code

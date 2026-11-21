@@ -389,6 +389,53 @@ class Persistence:
             )
             self._conn.commit()
 
+    def rejected_before_payment(self, job_id: str, order_id: str) -> bool:
+        """A conservative read-only UI hint, never payment authority.
+
+        The job links its order *before* returning from creation only on our
+        verified rejection path. Require the matching persisted order, explicit
+        HTTP rejection, pre-payment event history and no unresolved funds.
+        Missing or inconsistent evidence means no handoff.
+        """
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    """SELECT j.diagnostics_json FROM quick_pay_jobs j
+                       JOIN orders o ON o.id=j.order_id AND o.idempotency_key=j.idempotency_key
+                                    AND o.account_fingerprint=j.account_fingerprint
+                       WHERE j.id=? AND o.id=? AND j.status='failed' AND j.stage='failed'
+                         AND COALESCE(j.account_fingerprint,'')!=''
+                         AND COALESCE(j.lock_id,'')='' AND COALESCE(j.purchase_attempt_id,'')=''
+                         AND j.failure_code IN ('checkout_upstream_error','invalid_session')
+                         AND o.status='rejected' AND o.payment_status='unpaid' AND o.delivery_status='pending'
+                         AND o.failure_code IN ('unusual_activity','invalid_session')
+                         AND COALESCE(o.checkout_session_id,'')='' AND COALESCE(o.payment_intent_id,'')=''
+                         AND CASE WHEN json_valid(o.view_json) THEN
+                             json_extract(o.view_json,'$.checkout_url') IS NULL AND
+                             json_extract(o.view_json,'$.observed_payment_id') IS NULL AND
+                             json_extract(o.view_json,'$.paid_amount') IS NULL AND
+                             json_extract(o.view_json,'$.receipt') IS NULL ELSE 0 END
+                         AND EXISTS (SELECT 1 FROM order_events WHERE job_id=j.id AND stage='creating_checkout')
+                         AND (SELECT stage FROM order_events WHERE job_id=j.id ORDER BY id DESC LIMIT 1)='failed'
+                         AND NOT EXISTS (SELECT 1 FROM order_events WHERE job_id=j.id AND stage NOT IN
+                             ('creating_order','running','reissuing','reissued','session_refresh',
+                              'session_refreshed','browser_decode','browser_decoded','browser_decode_skipped',
+                              'creating_checkout','failed'))
+                         AND NOT EXISTS (SELECT 1 FROM account_locks l WHERE l.state='held' AND
+                             (l.lock_key='account:' || j.account_fingerprint OR l.order_id=o.id OR l.job_id=j.id))
+                         AND NOT EXISTS (SELECT 1 FROM quick_pay_jobs other
+                             WHERE other.account_fingerprint=j.account_fingerprint AND other.id!=j.id
+                               AND (other.created_at>=j.created_at OR other.status IN ('running','queued','unknown')))
+                         AND NOT EXISTS (SELECT 1 FROM orders other WHERE other.id!=o.id
+                             AND other.account_fingerprint=j.account_fingerprint
+                             AND (other.created_at>=o.created_at OR other.status NOT IN ('failed','rejected')
+                                  OR other.payment_status NOT IN ('unpaid','failed')))""",
+                    (job_id, order_id),
+                ).fetchone()
+            except sqlite3.Error:
+                return False
+        return row is not None and load_checkout_diagnostics(row[0]).get("upstream_status") in (400, 401, 403)
+
     def load_jobs(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM quick_pay_jobs ORDER BY created_at").fetchall()

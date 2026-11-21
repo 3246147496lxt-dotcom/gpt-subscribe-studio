@@ -17,6 +17,11 @@ def _out(job) -> QuickPayJobOut:
     events = db.list_events(job_id=job.id) if db is not None else []
     return QuickPayJobOut(
         job_id=job.id,
+        checkout_outcome=(
+            "rejected_before_payment" if db is not None and job.status == "failed"
+            and job.stage == "failed" and not job.lock_id and job.order_id
+            and db.rejected_before_payment(job.id, job.order_id) else None
+        ),
         lock_id=getattr(job, "lock_id", None),
         timings_ms={str(k): int(v) for k, v in (getattr(job, "timings", {}) or {}).items()},
         diagnostics=dict(getattr(job, "diagnostics", {}) or {}),

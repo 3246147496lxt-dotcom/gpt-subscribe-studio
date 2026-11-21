@@ -9,6 +9,8 @@ export type QuickPayEvent = {
 
 export type QuickPayJob = {
   job_id: string;
+  /** Server evidence, never inferred from a local timeout or an error string. */
+  checkout_outcome?: "rejected_before_payment" | null;
   lock_id?: string | null;
   timings_ms?: Record<string, number>;
   events?: QuickPayEvent[];
@@ -28,16 +30,19 @@ export type QuickPayJob = {
   proxy_last_exit_ip?: string | null;
 };
 
-export type QuickPayInput = {
+type CommonQuickPayInput = {
   plan: Plan;
   billing_country?: string;
   exit_country?: string;
   session: string;
-  card: { number: string; cvc: string; exp_month: string; exp_year: string };
   mode: { account_source: "customer_session"; card_source: "customer"; billing_mode: "standard"; risk_acknowledged: boolean };
   auto_cancel_renew: boolean;
-  debug_checkout_only: boolean;
 };
+
+export type QuickPayInput = CommonQuickPayInput & (
+  | { debug_checkout_only: true; card?: never }
+  | { debug_checkout_only: false; card: { number: string; cvc: string; exp_month: string; exp_year: string } }
+);
 
 async function parse<T>(response: Response): Promise<T> {
   const body = await response.json().catch(() => null);
@@ -50,6 +55,12 @@ async function parse<T>(response: Response): Promise<T> {
 }
 
 export async function startQuickPay(input: QuickPayInput, idempotencyKey: string): Promise<QuickPayJob> {
+  if (input.debug_checkout_only === true && "card" in input) {
+    throw new Error("仅建单请求不能包含银行卡资料");
+  }
+  if (input.debug_checkout_only !== true && !input.card) {
+    throw new Error("付款请求必须提供银行卡资料");
+  }
   const response = await fetch("/api/payments/quick-pay", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },

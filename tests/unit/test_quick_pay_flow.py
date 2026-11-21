@@ -26,7 +26,7 @@ def _payload(debug=False):
         billing_country="US",
         exit_country="PH",
         session="session-fixture",
-        card=CardIn(number="4242424242424242", cvc="123", exp_month="11", exp_year="2028"),
+        **({} if debug else {"card": CardIn(number="4242424242424242", cvc="123", exp_month="11", exp_year="2028")}),
         billing=BillingIn(name="Payer", email="p@example.com", line1="1 Main",
                           city="Portland", state="OR", postal_code="97201", country="US"),
         mode=ModeIn(),

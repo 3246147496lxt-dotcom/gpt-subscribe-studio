@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, field_validator, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationInfo, field_validator, model_serializer, model_validator
 
 
 class AddressedRequest(BaseModel):
@@ -179,13 +179,22 @@ class ErrorOut(BaseModel):
 
 
 class QuickPayRequest(AddressedRequest):
-    """One-call quick-pay input. The card is request-memory only."""
+    """Checkout-only forbids card data; combined checkout/payment requires it."""
+
+    model_config = ConfigDict(
+        hide_input_in_errors=True,
+        json_schema_extra={
+            "if": {"required": ["debug_checkout_only"], "properties": {"debug_checkout_only": {"const": True}}},
+            "then": {"not": {"required": ["card"]}},
+            "else": {"required": ["card"], "properties": {"card": {"type": "object"}}},
+        },
+    )
 
     plan: str
     billing_country: Optional[str] = None
     exit_country: Optional[str] = None
     session: str = Field(repr=False)
-    card: CardIn = Field(repr=False)
+    card: Optional[CardIn] = Field(default=None, repr=False)
     billing: Optional[BillingIn] = None
     mode: ModeIn = Field(default_factory=ModeIn)
     promo_code: str = ""
@@ -194,7 +203,18 @@ class QuickPayRequest(AddressedRequest):
     seat_quantity: Optional[int] = None
     price_interval: str = "month"
     auto_cancel_renew: bool = True
-    debug_checkout_only: bool = False
+    debug_checkout_only: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _card_boundary(cls, data):
+        if isinstance(data, dict):
+            if data.get("debug_checkout_only") is True:
+                if "card" in data:  # Reject even null before parsing nested card fields.
+                    raise ValueError("仅建单请求不可携带 card。")
+            elif data.get("card") is None:
+                raise ValueError("付款请求必须提供 card。")
+        return data
 
 
 class QuickPayEventOut(BaseModel):
@@ -206,6 +226,7 @@ class QuickPayEventOut(BaseModel):
 
 class QuickPayJobOut(BaseModel):
     job_id: str
+    checkout_outcome: Optional[Literal["rejected_before_payment"]] = None
     lock_id: Optional[str] = None
     timings_ms: Dict[str, int] = Field(default_factory=dict)
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
