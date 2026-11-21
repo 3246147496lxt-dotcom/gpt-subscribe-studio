@@ -1046,7 +1046,7 @@ class ChatGPTClient:
                 "账单国家必须与出口代理国家一致，请用所选地区的 SID 重试。",
             )
         if "already paid" in lowered:
-            raise DomainError(code, f"{prefix}: 该账号已是付费订阅", detail=detail)
+            raise DomainError(ErrorCode.ALREADY_SUBSCRIBED, f"{prefix}: 该账号已是付费订阅", detail=detail)
         if "only for internal checkout sessions" in lowered:
             raise DomainError(
                 code,
