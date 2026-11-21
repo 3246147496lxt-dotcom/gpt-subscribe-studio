@@ -61,6 +61,7 @@ from gss_core.chatgpt import (
     _intent_object,
     _PLAN_NAME,
     _json,
+    _log_upstream_failure,
     payment_intent_from_confirm,
     public_checkout_id,
     redact_sensitive,
@@ -523,8 +524,11 @@ class PlusHarProtocol:
         if status == 401:
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         if status >= 400:
+            _log_upstream_failure("/backend-api/payments/checkout", response)
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
-                              f"创建结账失败 HTTP {status}")
+                              f"创建结账失败 HTTP {status}",
+                              detail={"upstream_status": status,
+                                      "upstream_code": str(payload.get("code") or payload.get("type") or "")})
         check_observed_billing(payload, self.billing)
         self.checkout_id = public_checkout_id(str(payload.get("checkout_session_id") or ""))
         self.publishable_key = str(payload.get("publishable_key") or self.publishable_key)
@@ -542,8 +546,11 @@ class PlusHarProtocol:
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         payload = _json(response)
         if status >= 400:
+            _log_upstream_failure(route, response)
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
-                              f"读取结账失败 HTTP {status}")
+                              f"读取结账失败 HTTP {status}",
+                              detail={"upstream_status": status,
+                                      "upstream_code": str(payload.get("code") or payload.get("type") or "")})
         if payload.get("publishable_key"):
             self.publishable_key = str(payload["publishable_key"])
         if payload.get("customer_session_client_secret"):

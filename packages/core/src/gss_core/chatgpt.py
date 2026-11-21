@@ -1004,21 +1004,41 @@ class ChatGPTClient:
             return "Session 已被上游撤销（token_revoked），请重新登录 ChatGPT 后导出新 session"
         return "Session 无效或已过期"
 
+    @staticmethod
+    def _upstream_error_code(response: Any) -> str:
+        payload = _json(response)
+        for block in (payload.get("error"), payload.get("detail"), payload):
+            if isinstance(block, dict):
+                value = block.get("code") or block.get("type")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()[:80]
+        return ""
+
     def _raise(self, code: ErrorCode, response: Any, prefix: str) -> None:
         _log_upstream_failure(prefix, response)
         body = redact_sensitive(str(getattr(response, "text", ""))[:500])
         status = int(getattr(response, "status_code", 0) or 0)
+        headers = getattr(response, "headers", {}) or {}
+        detail = {
+            "upstream_status": status,
+            "upstream_code": self._upstream_error_code(response),
+            "cf_ray": str(headers.get("cf-ray") or headers.get("CF-Ray") or "")[:80],
+            "request_id": str(headers.get("x-request-id") or headers.get("X-Request-Id") or "")[:120],
+        }
+        detail = {key: value for key, value in detail.items() if value not in (None, "", "-")}
         lowered = body.lower()
         if status == 401:
             raise DomainError(
                 ErrorCode.INVALID_SESSION,
                 f"{prefix}: {self._unauthorized_message(response)}",
+                detail=detail,
             )
         if "unusual activity" in lowered:
             raise DomainError(
                 ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                 "ChatGPT 判定异常流量。请换一个同国家 SID 节点，"
                 "或用与账单国家相同网络导出的新 session 再试。",
+                detail=detail,
             )
         if "billing country must match" in lowered:
             raise DomainError(
@@ -1026,17 +1046,17 @@ class ChatGPTClient:
                 "账单国家必须与出口代理国家一致，请用所选地区的 SID 重试。",
             )
         if "already paid" in lowered:
-            raise DomainError(code, f"{prefix}: 该账号已是付费订阅")
+            raise DomainError(code, f"{prefix}: 该账号已是付费订阅", detail=detail)
         if "only for internal checkout sessions" in lowered:
             raise DomainError(
                 code,
                 "ChatGPT 内部确认只接受 oaics_ 会话。当前是 Stripe cs_ 自定义结账，不能调用 /payments/checkout/confirm。",
             )
         if status == 403:
-            raise DomainError(code, f"{prefix}: 被拦截（HTTP 403），请检查出口代理是否可用")
+            raise DomainError(code, f"{prefix}: 被拦截（HTTP 403），请检查出口代理是否可用", detail=detail)
         if status >= 500:
-            raise DomainError(code, f"{prefix}失败：ChatGPT 暂时返回 {status}，请换档位或稍后重试")
-        raise DomainError(code, f"{prefix}: HTTP {status} {body}")
+            raise DomainError(code, f"{prefix}失败：ChatGPT 暂时返回 {status}，请换档位或稍后重试", detail=detail)
+        raise DomainError(code, f"{prefix}: HTTP {status} {body}", detail=detail)
 
     def hydrate(self) -> None:
         if not self.account_id:
