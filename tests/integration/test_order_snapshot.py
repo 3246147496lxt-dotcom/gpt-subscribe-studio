@@ -47,7 +47,7 @@ def test_rotation_is_checkpointed_before_client_close_and_failed_checkout(monkey
     client = SimpleNamespace(
         access_token="new-fixture-access", session_token="old-fixture-cookie",
         device_id="", user_agent="", oai_session_id="",
-        extra_cookies={cookie_name: "new-fixture-cookie"}, close=closed, refresh_session=lambda: True,
+        extra_cookies={cookie_name: "new-fixture-cookie"}, close=closed, refresh_session=lambda **kwargs: True,
     )
     monkeypatch.setattr(orders.ChatGPTClient, "from_raw_session", lambda *a, **kw: client)
     monkeypatch.setattr(orders.ChatGPTClient, "reauthorize_for_country", lambda *a, **kw: client)

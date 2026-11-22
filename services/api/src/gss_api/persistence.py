@@ -240,13 +240,18 @@ class Persistence:
                 self._conn.execute(statement)
             except sqlite3.OperationalError:
                 pass
-        # Historical jobs have no comparable intent. Keep NULL; do not infer
-        # one from incomplete inputs, and do not suppress migration I/O errors.
-        try:
-            self._conn.execute("ALTER TABLE quick_pay_jobs ADD COLUMN intent_digest TEXT")
-        except sqlite3.OperationalError as exc:
-            if str(exc).lower() != "duplicate column name: intent_digest":
-                raise
+        # CREATE TABLE IF NOT EXISTS does not upgrade deployed schemas. Old
+        # jobs have no comparable intent or recorded diagnostics; do not infer
+        # history. Ignore only a column already present, never I/O errors.
+        for column, definition in (
+            ("intent_digest", "TEXT"),
+            ("diagnostics_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            try:
+                self._conn.execute(f"ALTER TABLE quick_pay_jobs ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError as exc:
+                if str(exc).lower() != f"duplicate column name: {column}":
+                    raise
         self._conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
             (str(SCHEMA_VERSION),),
@@ -446,12 +451,17 @@ class Persistence:
                 return created, True
 
     def save_job(self, job: Any) -> None:
+        diagnostics = safe_checkout_diagnostics(getattr(job, "diagnostics", None))
+        if job.status == "failed" and not diagnostics:
+            # All writers share this boundary. No wire evidence is not the
+            # same as no failure; record only an allowlisted local stage.
+            diagnostics = safe_checkout_diagnostics({"stage": job.stage}) or {"stage": "failed"}
         payload = (
             job.id, job.idempotency_key, getattr(job, "account_fingerprint", None),
             job.order_id, job.status, job.stage, job.failure_code, job.message,
             job.amount, job.currency, job.purchase_attempt_id, getattr(job, "lock_id", None),
             json.dumps(getattr(job, "timings", {}) or {}, ensure_ascii=False),
-            json.dumps(safe_checkout_diagnostics(getattr(job, "diagnostics", None))),
+            json.dumps(diagnostics),
             getattr(job, "locked_by", None), getattr(job, "lease_until", None),
             datetime.fromtimestamp(job.started_at, timezone.utc).isoformat()
             if getattr(job, "started_at", None) else _utcnow(),
@@ -459,7 +469,7 @@ class Persistence:
             datetime.fromtimestamp(job.finished_at, timezone.utc).isoformat()
             if getattr(job, "finished_at", None) else None,
         )
-        with self._lock:
+        with self._lock, self._conn:
             self._conn.execute(
                 """INSERT INTO quick_pay_jobs(
                     id, idempotency_key, account_fingerprint, order_id, status, stage,

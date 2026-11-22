@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from gss_core.captcha import verify_challenge
 from gss_core.plus_har_protocol import PlusHarProtocol
 from gss_core.plus_protocol import PlusProtocol
@@ -133,15 +135,16 @@ def test_plus_har_uses_browser_sentinel_profile_and_correct_plan_name():
 
 def test_stripe_protocol_fails_closed_without_curl_cffi(monkeypatch):
     import gss_core.stripe_protocol as stripe_protocol
+    from gss_contracts.errors import DomainError
 
     monkeypatch.setattr(stripe_protocol, "_HAS_CURL_CFFI", False)
+    monkeypatch.setattr(stripe_protocol, "curl_requests", None)
     protocol = stripe_protocol.StripeProtocol()
     try:
-        try:
+        with pytest.raises(DomainError) as caught:
             protocol._http()
-        except RuntimeError as exc:
-            assert "curl_cffi" in str(exc)
-        else:
-            raise AssertionError("Stripe httpx fallback must not be allowed")
+        assert "curl_cffi" in str(caught.value)
+        assert caught.value.detail["code"] == "curl_cffi_unavailable"
+        assert protocol._client is None
     finally:
         protocol.close()

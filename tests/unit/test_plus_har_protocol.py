@@ -438,7 +438,10 @@ def test_generic_processor_error_is_not_a_confirmed_decline(field):
 @pytest.mark.parametrize(("intent", "state"), [
     ({"id": "pi_fixture", "status": "succeeded", "amount_received": 1363, "currency": "jpy"}, "pending"),
     ({"id": "pi_fixture", "status": "succeeded"}, "unknown"),
-    ({"id": "pi_fixture", "status": "requires_payment_method"}, "card_declined"),
+    ({"id": "pi_fixture", "status": "requires_payment_method"}, "unknown"),
+    ({"id": "pi_fixture", "status": "canceled"}, "unknown"),
+    ({"id": "pi_fixture", "status": "requires_payment_method",
+      "last_payment_error": {"code": "card_declined", "decline_code": "generic_decline"}}, "card_declined"),
     ({"id": "pi_unrelated", "status": "succeeded"}, "unknown"),
     ({}, "unknown"),
 ])
@@ -450,7 +453,12 @@ def test_read_only_known_payment_intent_evidence_keeps_payment_stage(monkeypatch
     monkeypatch.setattr(engine.client, "retrieve_stripe_intent", lambda **_: intent)
     result = engine._read_only_settle()
     assert (engine.stage, result.state) == ("payment", state)
-    assert result.intent_status == (intent.get("status") if state != "unknown" else None)
+    observed_status = intent.get("status")
+    has_reportable_status = (state != "unknown" or observed_status in {"requires_payment_method", "canceled"})
+    expected_status = observed_status if has_reportable_status and intent.get("id") == "pi_fixture" else None
+    assert result.intent_status == expected_status
+    if expected_status in {"requires_payment_method", "canceled"}:
+        assert result.code == ("card_declined" if state == "card_declined" else "intent_status_unconfirmed")
     assert not engine.app.calls and not engine.stripe.calls
 
 
@@ -593,3 +601,97 @@ def test_string_payment_intent_is_retrieved_and_confirmed():
     assert engine.intent_secret == "pi_fixture_secret_fixture"
     assert engine.raw["intent"]["status"] == "succeeded"
     assert engine.confirmed["payment_intent"]["id"] == "pi_fixture"
+
+
+# ── telemetry gate before any Stripe write ─────────────────────────
+class _OfflineBeacon:
+    """m.stripe.com is unreachable; no server-issued device ids exist."""
+
+    def __init__(self):
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append(url)
+        raise OSError("offline")
+
+
+class _BeaconServer:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append(url)
+        return FakeResponse(self.payload)
+
+
+def _telemetry(engine, http, **overrides):
+    from gss_core.har_telemetry import StripeTelemetry, TelemetryContext
+
+    ctx = TelemetryContext(
+        device=engine.device, key="pk_live_fixture", currency="jpy", amount=100,
+        account_id="account_fixture", email="fixture@example.test", country="US",
+    )
+    telemetry = StripeTelemetry(http, ctx)
+    for name, value in overrides.items():
+        setattr(telemetry, name, value)
+    return telemetry
+
+
+@pytest.mark.parametrize(("registered", "adopted"), [(False, False), (True, False)])
+def test_confirmation_fails_closed_without_server_device_ids(registered, adopted):
+    from gss_contracts.errors import DomainError
+
+    engine = build_harness()
+    engine._prepare()
+    http = _OfflineBeacon()
+    engine.telemetry = _telemetry(engine, http, registered=registered, server_ids_adopted=adopted)
+
+    with pytest.raises(DomainError) as caught:
+        engine._confirmation_token()
+
+    assert caught.value.detail["code"] == "telemetry_unavailable"
+    assert caught.value.detail["stage"] == "confirmation_token"
+    assert engine.stripe.calls == []
+    assert engine.ctoken == ""
+    assert not engine.confirmation_started
+
+
+def test_confirmation_stops_after_failed_register_without_local_ids():
+    from gss_contracts.errors import DomainError
+
+    engine = build_harness()
+    engine._prepare()
+    telemetry = _telemetry(engine, _OfflineBeacon())
+    telemetry.register()
+
+    assert telemetry.registered is True
+    assert telemetry.server_ids_adopted is False
+    engine.telemetry = telemetry
+
+    with pytest.raises(DomainError) as caught:
+        engine._confirmation_token()
+    assert caught.value.detail["code"] == "telemetry_unavailable"
+    assert engine.stripe.calls == []
+
+
+def test_confirmation_proceeds_with_server_issued_device_ids():
+    engine = build_harness()
+    engine._prepare()
+    http = _BeaconServer({"guid": "guid_server", "muid": "muid_server", "sid": "sid_server"})
+    telemetry = _telemetry(engine, http)
+    telemetry.register()
+    engine.telemetry = telemetry
+
+    assert telemetry.server_ids_adopted is True
+    assert engine._confirmation_token() == "ctoken_fixture"
+    assert engine.device.guid == "guid_server"
+    assert [call[0] for call in engine.stripe.calls] == ["POST"]
+
+
+def test_telemetry_gate_is_skipped_only_when_the_mode_is_off():
+    engine = build_harness(telemetry="off")
+    engine._prepare()
+    engine.telemetry = _telemetry(engine, _OfflineBeacon())
+
+    assert engine._confirmation_token() == "ctoken_fixture"

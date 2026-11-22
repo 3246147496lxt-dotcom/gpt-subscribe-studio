@@ -197,6 +197,8 @@ os._exit(0 if created else 1)
             lookup = http.get(f"{PATH}/{job}")
             replay = post(http)
         assert lookup.status_code == 200 and lookup.json()["job_id"] == job
+        assert lookup.json()["status"] == replay.json()["status"] == "failed"
+        assert lookup.json()["failure_code"] == "crash_before_payment"
         assert replay.status_code == 202 and replay.json()["job_id"] == job
         worker.assert_not_called()
     finally:

@@ -233,7 +233,7 @@ def test_payment_adapter_never_rotates_session(monkeypatch: pytest.MonkeyPatch, 
     assert stub.calls.index("warmup") < stub.calls.index("confirm")
 
 
-def test_refresh_session_logs_upstream_status_and_body(caplog) -> None:
+def test_refresh_session_logs_status_but_no_response_or_url(caplog) -> None:
     class ErrorResponse:
         status_code = 503
         text = '{"error":"upstream-body-marker"}'
@@ -254,5 +254,29 @@ def test_refresh_session_logs_upstream_status_and_body(caplog) -> None:
     with caplog.at_level("WARNING"):
         assert client.refresh_session() is False
     assert "upstream_error where=/api/auth/session status=503" in caplog.text
-    assert "body={\"error\":\"upstream-body-marker\"}" in caplog.text
+    assert "body=" not in caplog.text
+    assert "upstream-body-marker" not in caplog.text
+    assert "url=" not in caplog.text
     assert "secret=should-not-leak" not in caplog.text
+
+
+def test_refresh_transport_exception_is_not_an_audit_record(caplog):
+    from unittest.mock import Mock
+
+    client = _client_with_session_token()
+    client._http = Mock(headers={}, cookies={})
+    client._http.get.side_effect = RuntimeError("unlabelled-private-canary")
+    assert client.refresh_session() is False
+    assert "session_refresh_transport_error" in caplog.text
+    assert "unlabelled-private-canary" not in caplog.text
+
+
+def test_failure_logger_rejects_dynamic_paths_and_body(caplog):
+    from types import SimpleNamespace
+    from gss_core.chatgpt import _log_upstream_failure
+
+    canary = "unlabelled-private-canary"
+    url = f"https://test.invalid/checkout/{canary}?{canary}=1"
+    _log_upstream_failure(url, SimpleNamespace(status_code=403, text=canary, url=url))
+    assert "where=upstream status=403" in caplog.text
+    assert canary not in caplog.text

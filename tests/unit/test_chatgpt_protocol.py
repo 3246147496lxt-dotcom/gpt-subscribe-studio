@@ -360,7 +360,7 @@ def test_checkout_401_records_safe_diagnostics(monkeypatch, caplog, content_type
         client.create_checkout(plan="plus", country="PH")
 
     assert exc.value.code is ErrorCode.INVALID_SESSION
-    assert "checkout_unauthorized status_code=401 url=https://chatgpt.com/" in caplog.text
+    assert "checkout_unauthorized status_code=401 header_source=" in caplog.text
     assert "header_source=request has_oai_device_id=True has_user_agent=False" in caplog.text
     assert f"body_kind={expected_kind} body_bytes={len(response.content)}" in caplog.text
     assert f"upstream_error_code={expected_code}" in caplog.text

@@ -423,7 +423,159 @@ __all__ = [
     "exit_country_for",
     "proxy_exit_region",
     "align_proxy_region",
+    "ProxyLeaseError",
+    "proxy_sid",
+    "proxy_lease_path",
+    "claim_sid_lease",
+    "release_sid_lease",
+    "cool_proxy",
+    "proxy_cooldown",
 ]
+
+
+# ── single-order SID lease + cooldown ─────────────────────────────────
+# Gateways that cannot rotate SIDs hand out one sticky exit. That exit is the
+# account's observable identity, so it is leased to one order at a time and
+# quarantined after a risk rejection instead of being reused immediately.
+_LEASE_LOCK = RLock()
+
+
+class ProxyLeaseError(ValueError):
+    """The bound SID is cooling down or already leased to another order."""
+
+
+def proxy_lease_path() -> Path:
+    return Path(
+        os.environ.get(
+            "GSS_PROXY_LEASE_FILE",
+            str(proxy_config_path().parent / "proxy-leases.json"),
+        )
+    )
+
+
+def proxy_sid(proxy: str | None) -> str:
+    username = unquote(urlsplit(str(proxy or "")).username or "")
+    match = _SID.search(username)
+    return match[2] if match else ""
+
+
+def _lease_read(path: Path) -> dict:
+    if not path.exists():
+        return {"version": 1, "leases": [], "cooldowns": []}
+    try:
+        with path.open(encoding="utf-8") as stream:
+            data = json.load(stream)
+    except (OSError, ValueError):
+        return {"version": 1, "leases": [], "cooldowns": []}
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return {"version": 1, "leases": [], "cooldowns": []}
+    leases = data.get("leases") if isinstance(data.get("leases"), list) else []
+    cooldowns = data.get("cooldowns") if isinstance(data.get("cooldowns"), list) else []
+    return {"version": 1, "leases": leases, "cooldowns": cooldowns}
+
+
+def _lease_write(path: Path, data: dict) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=".leases-")
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _prune(data: dict, now: float) -> dict:
+    data["leases"] = [row for row in data["leases"] if float(row.get("expires_at") or 0) > now]
+    data["cooldowns"] = [row for row in data["cooldowns"] if float(row.get("until") or 0) > now]
+    return data
+
+
+def claim_sid_lease(proxy: str | None, *, order_id: str, role: str = "checkout",
+                    ttl_s: int = 1800) -> dict:
+    """Bind one sticky SID to one order until it finishes or is released."""
+    sid = proxy_sid(proxy)
+    if not sid:
+        return {"leased": False, "reason": "no_sid"}
+    if not str(order_id or "").strip():
+        raise ProxyLeaseError("订单号为空，无法租用出口")
+    path = proxy_lease_path()
+    with _LEASE_LOCK:
+        now = time.time()
+        data = _prune(_lease_read(path), now)
+        for row in data["cooldowns"]:
+            if str(row.get("sid")) == sid:
+                raise ProxyLeaseError("该出口正在冷却，请更换 SID 后再建单")
+        for row in data["leases"]:
+            if str(row.get("sid")) == sid and str(row.get("order_id")) != str(order_id):
+                raise ProxyLeaseError("该出口已绑定另一笔进行中的订单")
+        for row in data["leases"]:
+            if str(row.get("sid")) == sid and str(row.get("order_id")) == str(order_id):
+                row["expires_at"] = now + ttl_s
+                _lease_write(path, data)
+                return {"leased": True, "lease_id": row["id"], "sid": sid,
+                        "expires_at": row["expires_at"], "reused": True}
+        lease = {
+            "id": secrets.token_hex(16),
+            "role": role,
+            "sid": sid,
+            "order_id": str(order_id),
+            "created_at": now,
+            "expires_at": now + ttl_s,
+        }
+        data["leases"].append(lease)
+        _lease_write(path, data)
+        return {"leased": True, "lease_id": lease["id"], "sid": sid,
+                "expires_at": lease["expires_at"], "reused": False}
+
+
+def release_sid_lease(order_id: str, *, role: str = "checkout") -> bool:
+    path = proxy_lease_path()
+    with _LEASE_LOCK:
+        data = _prune(_lease_read(path), time.time())
+        kept = [row for row in data["leases"]
+                if not (str(row.get("order_id")) == str(order_id)
+                        and str(row.get("role") or role) == role)]
+        if len(kept) == len(data["leases"]):
+            return False
+        data["leases"] = kept
+        _lease_write(path, data)
+        return True
+
+
+def cool_proxy(proxy: str | None, *, reason: str, seconds: int = 1800) -> dict:
+    """Quarantine an exit that the upstream rejected on risk grounds."""
+    sid = proxy_sid(proxy)
+    if not sid:
+        return {"cooled": False, "reason": "no_sid"}
+    path = proxy_lease_path()
+    with _LEASE_LOCK:
+        now = time.time()
+        data = _prune(_lease_read(path), now)
+        data["leases"] = [row for row in data["leases"] if str(row.get("sid")) != sid]
+        entry = {"sid": sid, "reason": str(reason or "risk_rejected")[:120],
+                 "created_at": now, "until": now + max(1, int(seconds))}
+        data["cooldowns"] = [row for row in data["cooldowns"] if str(row.get("sid")) != sid]
+        data["cooldowns"].append(entry)
+        _lease_write(path, data)
+    return {"cooled": True, **entry}
+
+
+def proxy_cooldown(proxy: str | None) -> dict | None:
+    sid = proxy_sid(proxy)
+    if not sid:
+        return None
+    with _LEASE_LOCK:
+        data = _prune(_lease_read(proxy_lease_path()), time.time())
+    for row in data["cooldowns"]:
+        if str(row.get("sid")) == sid:
+            return row
+    return None
 
 
 def parse_proxy_input(raw: str) -> dict:

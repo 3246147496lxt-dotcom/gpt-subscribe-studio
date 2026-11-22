@@ -105,3 +105,37 @@ def test_billing_conflict_keeps_response_evidence_without_payload(monkeypatch, c
     assert e.detail == dict(upstream_status=200, request_id=_RID,
                             upstream_code_state="not_found", request_id_state="accepted")
     assert _SECRET not in str(e.to_payload()) + caplog.text
+
+
+@pytest.mark.parametrize("preflight", ["me", "accounts_check", "warm_account", "checkout_warmup", "key_lookup"])
+def test_401_before_or_outside_checkout_post_keeps_safe_original_response(monkeypatch, caplog, preflight):
+    from unittest.mock import Mock
+
+    response = SimpleNamespace(
+        status_code=401,
+        headers={"CF-Ray": _RAY, "REQUEST-ID": _RID, "set-cookie": _SECRET},
+        text=_SECRET,
+        json=lambda: {"detail": {"code": "token_revoked"}, "accessToken": _SECRET},
+    )
+    first = SimpleNamespace(status_code=404, text=_SECRET)
+    http = Mock(headers={})
+    http.get.side_effect = [first, response] if preflight == "accounts_check" else [response]
+    client = chatgpt.ChatGPTClient("local-fixture", _http=http)
+    if preflight != "checkout_warmup":
+        monkeypatch.setattr(client, "prepare_risk", lambda **kwargs: None)
+    monkeypatch.setattr(client, "mint_sentinel", lambda **_: pytest.fail("continued after 401"))
+    with pytest.raises(DomainError) as caught:
+        if preflight == "key_lookup":
+            client._publishable_key()
+        elif preflight == "warm_account":
+            client.warm_account()
+        else:
+            client.create_checkout(plan="team", country="US")
+    http.post.assert_not_called()
+    assert http.get.call_count == (2 if preflight == "accounts_check" else 1)
+    assert caught.value.code is ErrorCode.INVALID_SESSION
+    assert caught.value.detail == {
+        "upstream_status": 401, "upstream_code": "token_revoked", "cf_ray": _RAY, "request_id": _RID,
+        "upstream_code_state": "accepted", "request_id_state": "accepted",
+    }
+    assert _SECRET not in caplog.text + str(caught.value.to_payload())

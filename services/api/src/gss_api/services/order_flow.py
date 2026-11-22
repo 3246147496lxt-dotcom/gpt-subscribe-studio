@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
-from gss_contracts.errors import DomainError
+from gss_contracts.errors import DomainError, ErrorCode, UpstreamFailureCode
 from gss_core.chatgpt import ChatGPTClient
 from gss_core.checkout_diagnostics import safe_checkout_diagnostics
 from gss_core.redaction import redact_sensitive
@@ -68,21 +68,27 @@ def _safe_message(value: Any) -> str:
     return redact_sensitive(str(value or ""))[:300]
 
 
-def _error_code(exc: Exception) -> str:
+# Only these local contract values may enter failure_code (and hence the log).
+_JOB_ERROR_CODES = {code.value for group in (ErrorCode, UpstreamFailureCode) for code in group} | {
+    "payment_unknown_lock", "BILLING_PROFILE_UNAVAILABLE", "token_revoked", "payment_state_unavailable",
+}
+_PUBLIC_CHECKOUT_REFUSALS = {
+    "会话已失效，已停止建单。", "上游报告异常流量，已停止建单。", "该账号已有订阅，已停止建单。",
+}
+
+
+def _job_error(exc: Exception) -> tuple[str, str]:
+    # An exception's message can contain an unlabelled token/PAN; regex
+    # redaction cannot identify those reliably. Do not store arbitrary prose.
+    code, message = None, None
     if isinstance(exc, DomainError):
-        return str(exc.code)
-    if isinstance(exc, HTTPException):
-        detail = exc.detail
-        if isinstance(detail, dict):
-            return str(detail.get("code") or "quick_pay_failed")
-    return "quick_pay_failed"
-
-
-def _error_message(exc: Exception) -> str:
-    if isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
-        message = exc.detail.get("message")
-        return _safe_message(message) if isinstance(message, str) and message else "请求失败"
-    return _safe_message(exc)
+        code, message = exc.code, exc.message
+    elif isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
+        code, message = exc.detail.get("code"), exc.detail.get("message")
+    code = str(code) if isinstance(code, str) and code in _JOB_ERROR_CODES else "quick_pay_failed"
+    if not isinstance(message, str) or message not in _PUBLIC_CHECKOUT_REFUSALS:
+        message = f"请求失败（{code}），请查看作业诊断。"
+    return code, message
 
 
 def get_job(job_id: str) -> Optional[QuickPayJob]:
@@ -148,13 +154,13 @@ def _from_db_job(row: dict) -> QuickPayJob:
 
 
 def _capture_checkout_failure(job: QuickPayJob, exc: Exception) -> None:
-    if isinstance(exc, DomainError):
-        incoming = safe_checkout_diagnostics(exc.detail)
-    elif isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
-        incoming = (safe_checkout_diagnostics(exc.detail.get("detail"))
-                    or safe_checkout_diagnostics(exc.detail))
-    else:
-        incoming = {}
+    detail = exc.detail if isinstance(exc, (DomainError, HTTPException)) else None
+    incoming = {}
+    if isinstance(detail, dict):
+        incoming = safe_checkout_diagnostics(detail.get("detail")) or safe_checkout_diagnostics(detail)
+    # Capture the workflow stage *before* transitioning to "failed". If there
+    # was no HTTP response, retain where we failed without inventing wire data.
+    incoming.setdefault("stage", safe_checkout_diagnostics({"stage": job.stage}).get("stage", "failed"))
     # Do not combine fields/traces from different upstream requests.
     job.diagnostics = safe_checkout_diagnostics(job.diagnostics) or incoming
 
@@ -338,7 +344,16 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             _persist_job(job)
             return job
 
-        _set_stage(job, "confirming_payment", "正在提交卡片并确认支付")
+        job.stage = "confirming_payment"
+        try:
+            db = get_db_optional()
+            if db is None:
+                raise sqlite3.DatabaseError("job storage unavailable")
+            db.save_job(job)
+        except Exception:
+            job.stage = "checkout_created"
+            raise HTTPException(503, detail={"code": "payment_state_unavailable"}) from None
+        _event(job, job.stage, "正在提交卡片并确认支付")
         payment_started = time.monotonic()
         order_billing = BillingIn(**order.billing) if getattr(order, "billing", None) else None
         bind_payload = protocol_cards.BindProtocolRequest(
@@ -355,13 +370,16 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         job.failure_code = str(result.get("code") or "") or None
         job.message = _safe_message(result.get("message") or result.get("status_summary"))
         if status == "succeeded" or state == "paid":
-            job.status = "succeeded"
-            job.stage = "succeeded"
+            delivered = result.get("delivery_status") == "delivered"
+            job.status = "succeeded" if delivered else "paid_pending_delivery"
+            job.stage = job.status
+            if not delivered:
+                job.message = "已付款，待核验订阅交付。请勿重复付款。"
+            _persist_job(job)
             await _cancel_auto_renew(job, order_id=job.order_id or order.id, plan=payload.plan)
-            job.stage = "auto_renew_canceled" if job.auto_renew_status == "canceled" else "succeeded"
+            job.stage = "auto_renew_canceled" if delivered and job.auto_renew_status == "canceled" else job.status
         elif state in {"failed", "rejected", "card_declined"}:
             job.status = "failed"
-            job.stage = "failed"
         elif state == "unknown" or status == "processing":
             job.status = "unknown"
             _set_stage(job, "unknown", "扣款结果待核对，已锁定")
@@ -371,6 +389,8 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             job.lock_id = (held or {}).get("id")
         else:
             job.status = "failed"
+        if job.status == "failed":
+            job.diagnostics = safe_checkout_diagnostics(job.diagnostics) or {"stage": job.stage}
             job.stage = "failed"
         job.finished_at = time.time()
         job.timings["total_ms"] = int((time.monotonic() - run_started) * 1000)
@@ -378,11 +398,10 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
         _persist_job(job)
         return job
     except Exception as exc:  # noqa: BLE001
+        _capture_checkout_failure(job, exc)
         job.status = "failed"
         job.stage = "failed"
-        job.failure_code = _error_code(exc)
-        job.message = _error_message(exc)
-        _capture_checkout_failure(job, exc)
+        job.failure_code, job.message = _job_error(exc)
         job.finished_at = time.time()
         job.timings["total_ms"] = int((time.monotonic() - run_started) * 1000)
         _event(job, "failed", job.message or "")

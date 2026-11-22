@@ -22,6 +22,7 @@ const STAGE_LABEL: Record<string, string> = {
   checkout_created: "结账单已生成",
   confirming_payment: "正在完成扣款确认",
   verifying_delivery: "正在核验订阅交付",
+  paid_pending_delivery: "已付款，待交付",
   canceling_auto_renew: "正在关闭自动续费",
   auto_renew_canceled: "自动续费已关闭",
   succeeded: "充值成功",
@@ -62,7 +63,7 @@ function sleep(ms: number) {
 }
 
 function terminal(job: QuickPayJob) {
-  return job.status === "succeeded" || job.status === "failed" || job.status === "unknown";
+  return ["succeeded", "failed", "unknown", "paid_pending_delivery"].includes(job.status);
 }
 
 const LOCK_KEY = "gss.quickpay.unknown_lock";
@@ -320,6 +321,7 @@ export function QuickPay() {
               </Stack>
             )}
             {job.status === "succeeded" && <Alert color="green" icon={<IconCheck size={18} />}>{job.stage === "checkout_created" ? "仅建单完成，未提交付款。" : job.message || "充值成功"}</Alert>}
+            {job.status === "paid_pending_delivery" && <Alert color="orange">已付款，待核验订阅交付。请保留订单号，勿重复付款。</Alert>}
             {job.status === "unknown" && <Alert color="orange" icon={<IconX size={18} />}>扣款结果待核对，请勿重复提交。</Alert>}
           </Stack>
         </Card>

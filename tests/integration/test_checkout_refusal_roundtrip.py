@@ -36,6 +36,8 @@ _BLOCKED_RID = "private-header-marker-never-emit"
                      "unusual_activity", id="discard-values-but-preserve-rejection-states"),
         pytest.param(401, "token_revoked", None, None, "accepted", "not_found",
                      "invalid_session", id="session-refusal-has-no-unusual-activity-origin"),
+        pytest.param(401, "token_revoked", _RID, None, "accepted", "accepted",
+                     "invalid_session", id="session-refusal-all-four-fields"),
     ],
 )
 def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
@@ -82,7 +84,7 @@ def test_checkout_refusal_survives_cache_loss_and_sqlite_reopen(
     monkeypatch.setattr(chatgpt.ChatGPTClient, "http", property(lambda _: SimpleNamespace(post=post, headers={})))
     payload = QuickPayRequest(plan="plus", billing_country="US", exit_country="US", debug_checkout_only=True,
                               session=json.dumps({"accessToken": session_canary}))
-    expected = {"upstream_status": status, "cf_ray": _RAY, "upstream_code_state": code_state,
+    expected = {"stage": "creating_checkout", "upstream_status": status, "cf_ray": _RAY, "upstream_code_state": code_state,
                 "request_id_state": rid_state}
     if source is not None:
         expected["unusual_activity_source"] = source

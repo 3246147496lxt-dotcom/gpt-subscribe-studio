@@ -5,6 +5,7 @@ Sentinel values so a stray log line cannot leak a session.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
@@ -48,7 +49,7 @@ class BrowserContext:
     def vault_dict(self) -> dict[str, Any]:
         """In-memory vault form. Never log or serialize this to API output."""
         data = self.to_dict()
-        data["cookies"] = dict(self.cookies)
+        data["cookies"] = safe_browser_cookies(self.cookies)
         data["sentinel_token"] = self.sentinel_token
         return data
 
@@ -92,14 +93,24 @@ class BrowserContext:
 BROWSER_COOKIE_DENYLIST = frozenset({
     "__cf_bm", "cf_clearance", "_cfuvid", "cf_chl_2", "cf_chl_prog",
     "oai-did", "oai-device-id", "oai-sc", "__Secure-next-auth.session-token",
+    "session-token", "sessionToken", "accessToken",
 })
+
+# Auth.js / NextAuth can split an authentication cookie into numbered chunks.
+# A direct browser is not a source of checkout credentials, even for a chunk.
+_SESSION_COOKIE = re.compile(r"(?:__(?:Secure|Host)-)?(?:next-auth|authjs)\.session-token(?:\.\d+)?", re.I)
+_COOKIE_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+# Unquoted cookie-octet: no separators, whitespace or control characters.
+_COOKIE_VALUE = re.compile(r"[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]*")
 
 
 def safe_browser_cookies(cookies: dict[str, str] | None) -> dict[str, str]:
     return {
-        str(name): str(value)
+        name: value
         for name, value in (cookies or {}).items()
-        if name and value is not None and str(name) not in BROWSER_COOKIE_DENYLIST
+        if isinstance(name, str) and _COOKIE_NAME.fullmatch(name)
+        and name not in BROWSER_COOKIE_DENYLIST and not _SESSION_COOKIE.fullmatch(name)
+        and isinstance(value, str) and _COOKIE_VALUE.fullmatch(value)
     }
 
 

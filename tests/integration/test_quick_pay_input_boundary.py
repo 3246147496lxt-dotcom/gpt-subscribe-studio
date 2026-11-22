@@ -68,6 +68,14 @@ def test_valid_inputs_reach_only_stubbed_job_start(fields, card_present, api):
     assert (payload.card is not None) == card_present
 
 
+def test_team_order_validation_does_not_echo_input(api):
+    client, _, _ = api
+    response = client.post("/api/orders", json={"plan": "team", "session": {"secret": SESSION}})
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "INVALID_ORDER_INPUT"
+    assert SESSION not in response.text
+
+
 def test_conditional_schema_and_validation_errors_do_not_print_secrets():
     schema = QuickPayRequest.model_json_schema()
     assert schema["then"]["not"]["required"] == ["card"]

@@ -31,7 +31,9 @@ def _payload(debug=False):
     )
 
 
-def test_quick_pay_runs_create_then_pay(monkeypatch):
+@pytest.mark.parametrize("delivery, expected", [("delivered", "succeeded"),
+                                                ("verify_delayed", "paid_pending_delivery")])
+def test_quick_pay_runs_create_then_pay(monkeypatch, delivery, expected):
     calls = []
 
     async def create_order(payload, key, progress=None):
@@ -47,19 +49,44 @@ def test_quick_pay_runs_create_then_pay(monkeypatch):
 
     async def bind(order_id, payload):
         calls.append(("bind", order_id, payload.expected_amount, payload.expected_currency))
-        return {"state": "paid", "payment_status": "succeeded", "code": None, "message": "ok"}
+        return {"state": "paid", "payment_status": "succeeded", "delivery_status": delivery,
+                "code": None, "message": "ok"}
 
     monkeypatch.setattr(order_flow.orders, "_create_order", create_order)
     monkeypatch.setattr(order_flow.protocol_cards, "bind_and_pay_protocol", bind)
     job, _ = order_flow._reserve_job(_payload(), "quick-key", "test-owner")
     result = asyncio.run(order_flow.run_quick_pay(job.id, _payload(), "quick-key"))
-    assert result.status == "succeeded"
+    assert result.status == expected
     assert [c[0] for c in calls] == ["create", "bind"]
     assert calls[1][1] == "order-1"
     assert calls[1][2:] == ("982.14", "PHP")
     assert "create_order_ms" in result.timings
     assert "create_checkout_ms" in result.timings
     assert result.timings.get("total_ms", 0) >= 0
+
+
+def test_payment_does_not_start_when_checkpoint_write_fails(monkeypatch):
+    import sqlite3
+    from unittest.mock import AsyncMock
+    from gss_api.persistence import get_db_optional
+
+    order = SimpleNamespace(id="order-db-fault", purchase_attempt_id="pa_db", amount="20", currency="USD")
+    monkeypatch.setattr(order_flow.orders, "_create_order", AsyncMock(return_value=order))
+    bind = AsyncMock()
+    monkeypatch.setattr(order_flow.protocol_cards, "bind_and_pay_protocol", bind)
+    db = get_db_optional()
+    save = db.save_job
+
+    def fail_checkpoint(job):
+        if job.stage == "confirming_payment":
+            raise sqlite3.OperationalError("checkpoint failed")
+        save(job)
+
+    monkeypatch.setattr(db, "save_job", fail_checkpoint)
+    job, _ = order_flow._reserve_job(_payload(), "db-fault", "test-owner")
+    asyncio.run(order_flow.run_quick_pay(job.id, _payload(), "db-fault"))
+    bind.assert_not_called()
+    assert db.get_quick_pay_by_id(job.id)["failure_code"] == "payment_state_unavailable"
 
 
 def test_quick_pay_card_is_not_stored_on_job(monkeypatch):

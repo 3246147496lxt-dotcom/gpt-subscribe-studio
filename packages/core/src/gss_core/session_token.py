@@ -20,13 +20,24 @@ class SessionBundle:
     # statsigContext 是 Session 签发时浏览器上报的真实身份，优先级高于任何伪造档案。
     user_agent: str = ""
     country: str = ""
+    # OAuth refresh token (Codex/CLI exports). It is a credential, so it
+    # survives strip_ambient even though every ambient field is dropped.
+    refresh_token: str = ""
 
 
 def parse_session(raw: str) -> str:
     return parse_session_bundle(raw).access_token
 
 
-def parse_session_bundle(raw: str) -> SessionBundle:
+def parse_session_bundle(raw: str, *, strip_ambient: bool = False) -> SessionBundle:
+    """Parse a pasted session. ``strip_ambient`` keeps only the credentials.
+
+    A session exported in another country carries that browser's device id,
+    statsigContext and cookies. Replaying them from a different exit is the
+    cross-region mismatch the upstream rejects, so callers that will run on a
+    new exit pass ``strip_ambient=True`` and let the new exit mint its own
+    device identity.
+    """
     text = (raw or "").strip()
     if not text:
         raise ValueError("session 为空")
@@ -42,7 +53,7 @@ def parse_session_bundle(raw: str) -> SessionBundle:
             data: Any = json.loads(text)
         except json.JSONDecodeError as exc:
             raise ValueError("session JSON 无法解析") from exc
-        return _from_mapping(data)
+        return _from_mapping(data, strip_ambient=strip_ambient)
     if ";" in text and "=" in text and not text.lstrip().startswith("eyJ"):
         cookies = _parse_cookie_header(text)
         if "__Secure-next-auth.session-token" in cookies or "oai-did" in cookies:
@@ -60,14 +71,14 @@ def parse_session_bundle(raw: str) -> SessionBundle:
     return SessionBundle(access_token=text)
 
 
-def _from_mapping(data: Any) -> SessionBundle:
+def _from_mapping(data: Any, *, strip_ambient: bool = False) -> SessionBundle:
     if isinstance(data, list) and data:
-        return _from_mapping(data[0])
+        return _from_mapping(data[0], strip_ambient=strip_ambient)
     if not isinstance(data, dict):
         return SessionBundle(access_token="")
     nested = data.get("session")
     if isinstance(nested, dict):
-        inner = _from_mapping(nested)
+        inner = _from_mapping(nested, strip_ambient=strip_ambient)
     else:
         inner = SessionBundle(access_token="")
     token = _first_string(data, ("accessToken", "access_token", "token", "at")) or inner.access_token
@@ -80,24 +91,37 @@ def _from_mapping(data: Any) -> SessionBundle:
         or cookies.get("__Secure-next-auth.session-token")
         or inner.session_token
     )
+    refresh_token = (
+        _first_string(data, ("refresh_token", "refreshToken", "oauth_refresh_token"))
+        or inner.refresh_token
+    )
     # statsigContext 优先：它是 Session 签发时真实浏览器的 deviceId / UA / 国家，
     # 顶层字段和 cookie 可能是旧导出里残留的值。
     statsig = parse_statsig_context(data)
-    device_id = (
-        statsig["device_id"]
-        or _first_string(data, ("oai-did", "oai_did", "deviceId", "device_id"))
-        or cookies.get("oai-did")
-        or inner.device_id
-    )
-    user_agent = statsig["user_agent"] or inner.user_agent
-    country = statsig["country"] or inner.country
-    session_id = (
-        _first_string(data, ("sessionId", "session_id", "oai-session-id", "oai_session_id"))
-        or inner.oai_session_id
-    )
-    if not session_id:
-        statsig_mapping = _statsig_mapping(data)
-        session_id = _first_string(statsig_mapping, ("sessionId", "session_id"))
+    if strip_ambient:
+        # Only credentials cross the import boundary. The exit this order binds
+        # to mints the device id, UA, session id and cookie jar itself.
+        device_id = ""
+        user_agent = ""
+        country = ""
+        session_id = ""
+        cookies = {}
+    else:
+        device_id = (
+            statsig["device_id"]
+            or _first_string(data, ("oai-did", "oai_did", "deviceId", "device_id"))
+            or cookies.get("oai-did")
+            or inner.device_id
+        )
+        user_agent = statsig["user_agent"] or inner.user_agent
+        country = statsig["country"] or inner.country
+        session_id = (
+            _first_string(data, ("sessionId", "session_id", "oai-session-id", "oai_session_id"))
+            or inner.oai_session_id
+        )
+        if not session_id:
+            statsig_mapping = _statsig_mapping(data)
+            session_id = _first_string(statsig_mapping, ("sessionId", "session_id"))
     if not token and isinstance(nested, str) and len(nested) > 20:
         token = nested.strip()
     if not token:
@@ -115,6 +139,7 @@ def _from_mapping(data: Any) -> SessionBundle:
         cookies=cookies,
         user_agent=user_agent,
         country=country,
+        refresh_token=refresh_token,
     )
 
 

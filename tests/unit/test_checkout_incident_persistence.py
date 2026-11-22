@@ -1,6 +1,7 @@
 """Offline, synthetic checkout failure diagnostics; no payment request or credentials."""
 import asyncio
 import json
+import sqlite3
 import uuid
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from gss_contracts.errors import DomainError, ErrorCode
 
 
 SNAPSHOT = {
+    "stage": "create_checkout",
     "upstream_status": 403, "upstream_code": "unusual_activity",
     "cf_ray": "a1bcde98a7cdef12-SJC", "request_id": "req_" + "ab1dc8ef" * 4,
 }
@@ -31,7 +33,7 @@ def db(monkeypatch):
     db._conn.close()
 
 
-@pytest.mark.parametrize("shape", ["domain", "http_nested", "http_flat"])
+@pytest.mark.parametrize("shape", ["domain", "domain_nested", "http_nested", "http_flat"])
 def test_failure_before_payment_has_same_safe_projection_after_cache_loss(db, monkeypatch, shape):
     job, _ = flow._reserve_job(QuickPayRequest(plan="plus", session="offline", debug_checkout_only=True),
                                "offline-key", "test-owner")
@@ -42,8 +44,9 @@ def test_failure_before_payment_has_same_safe_projection_after_cache_loss(db, mo
 
     async def reject(*_a, progress, **_kw):
         progress("creating_checkout")
-        if shape == "domain":
-            raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "已拒绝", raw)
+        if shape.startswith("domain"):
+            detail = {"detail": raw} if shape == "domain_nested" else raw
+            raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "已拒绝", detail)
         detail = {"code": "checkout_upstream_error", **({"detail": raw} if shape == "http_nested" else raw)}
         error = HTTPException(502, detail=detail)
         error._checkout_order_id = oid
@@ -64,7 +67,7 @@ def test_failure_before_payment_has_same_safe_projection_after_cache_loss(db, mo
     flow._jobs.clear()
     out = asyncio.run(quick_pay.quick_pay_status(job.id))
     assert out.diagnostics == SNAPSHOT and out.status == "failed"
-    assert out.order_id == (None if shape == "domain" else oid)
+    assert out.order_id == (None if shape.startswith("domain") else oid)
     assert flow.get_job_by_key(job.idempotency_key).diagnostics == SNAPSHOT
     assert MARKER not in repr(out)
 
@@ -124,3 +127,75 @@ def test_storage_fault_is_visible_without_exception_payload(db, monkeypatch, cap
         flow._persist_job(job)
     assert "quick_pay_persistence_failed operation=" + operation in caplog.text
     assert MARKER not in caplog.text
+
+
+@pytest.mark.parametrize("detail", [{}, {"stage": MARKER}, {"detail": {"stage": [MARKER]}}])
+def test_no_upstream_metadata_keeps_only_local_stage(db, monkeypatch, detail):
+    payload = QuickPayRequest(plan="plus", session="offline", debug_checkout_only=True)
+    job, _ = flow._reserve_job(payload, "stage-only", "fixture-owner")
+
+    async def reject(*_args, progress, **_kwargs):
+        progress("session_refresh")
+        raise DomainError(ErrorCode.INVALID_SESSION, "已拒绝", detail)
+
+    monkeypatch.setattr(flow.orders, "_create_order", reject)
+    asyncio.run(flow.run_quick_pay(job.id, payload, job.idempotency_key))
+    flow._jobs.clear()
+    [row] = db.load_jobs()
+    assert row["stage"] == "failed" and json.loads(row["diagnostics_json"]) == {"stage": "session_refresh"}
+    assert asyncio.run(quick_pay.quick_pay_status(job.id)).diagnostics == {"stage": "session_refresh"}
+
+
+def test_failed_job_written_directly_never_serializes_empty_or_untrusted_diagnostics(db):
+    job = flow.QuickPayJob(id="db-fallback", idempotency_key="db-fallback", status="failed",
+                           stage="failed", diagnostics={"stage": MARKER})
+    db.save_job(job)
+    assert json.loads(db.get_quick_pay_by_id(job.id)["diagnostics_json"]) == {"stage": "failed"}
+
+
+def test_database_missing_diagnostics_column_can_persist_first_failure(tmp_path):
+    path = str(tmp_path / "old.sqlite")
+    # Recreate the legacy jobs table without relying on SQLite DROP COLUMN.
+    with sqlite3.connect(path) as conn:
+        conn.execute("""CREATE TABLE quick_pay_jobs (
+            id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, account_fingerprint TEXT,
+            order_id TEXT, status TEXT NOT NULL, stage TEXT NOT NULL, failure_code TEXT,
+            message TEXT, amount TEXT, currency TEXT, purchase_attempt_id TEXT,
+            timings_json TEXT NOT NULL DEFAULT '{}', locked_by TEXT, lease_until TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT
+        )""")
+        conn.execute("INSERT INTO quick_pay_jobs(id,idempotency_key,status,stage,created_at,updated_at) "
+                     "VALUES('j','k','running','creating_checkout','t','t')")
+    conn.close()
+    upgraded = Persistence(path)
+    try:
+        job = flow._from_db_job(upgraded.get_quick_pay_by_id("j"))
+        assert job.diagnostics == {}
+        flow._capture_checkout_failure(job, DomainError(ErrorCode.INVALID_SESSION, "已拒绝", SNAPSHOT))
+        job.status = job.stage = "failed"
+        upgraded.save_job(job)
+    finally:
+        upgraded.close()
+    fresh = Persistence(path)
+    try:
+        assert flow._from_db_job(fresh.get_quick_pay_by_id("j")).diagnostics == SNAPSHOT
+    finally:
+        fresh.close()
+
+
+@pytest.mark.parametrize("shape", ["http", "domain", "unexpected"])
+def test_exception_free_text_and_unknown_code_cannot_reach_job_event_or_log(db, monkeypatch, caplog, shape):
+    payload = QuickPayRequest(plan="plus", session="offline", debug_checkout_only=True)
+    job, _ = flow._reserve_job(payload, "free-text", "fixture-owner")
+
+    async def reject(*_args, **_kwargs):
+        if shape == "http":
+            raise HTTPException(502, {"message": MARKER, "code": MARKER})
+        if shape == "domain":
+            raise DomainError(ErrorCode.INVALID_SESSION, MARKER, SNAPSHOT)
+        raise RuntimeError(MARKER)
+
+    monkeypatch.setattr(flow.orders, "_create_order", reject)
+    asyncio.run(flow.run_quick_pay(job.id, payload, job.idempotency_key))
+    assert job.failure_code == ("invalid_session" if shape == "domain" else "quick_pay_failed")
+    assert MARKER not in repr(job) + caplog.text + "\n".join(db._conn.iterdump())

@@ -197,7 +197,7 @@ class StripeProtocol:
         self.card = card or {}
         self.billing = billing or {}
         self.timeout = timeout
-        self._client: httpx.Client | None = None
+        self._client: Any | None = None
         self._geo: dict[str, str] = {}
         self.order_factory = None  # 可选：返回新 checkout_url 的 callable
         self._captcha_client: httpx.Client | None = None
@@ -236,23 +236,29 @@ class StripeProtocol:
 
     # ── HTTP ────────────────────────────────────────────────
     def _http(self):
-        """返回一个会话；优先 curl_cffi（可模拟 Chrome 的 TLS/JA3 指纹）。"""
+        """返回 curl_cffi 会话（Chrome TLS/JA3 指纹）。
+
+        Fail closed: there is no httpx fallback. A Python TLS handshake is not
+        the identity this checkout was created under, so sending the card on it
+        would submit a payment the caller cannot attribute afterwards.
+        """
         if self._client is None:
-            if _HAS_CURL_CFFI and curl_requests is not None:
-                proxies = None
-                if self.proxy:
-                    proxies = {"http": self.proxy, "https": self.proxy}
-                self._client = curl_requests.Session(
-                    impersonate="chrome150",
-                    proxies=proxies,
-                    timeout=self.timeout,
-                    headers={"User-Agent": self.ua, "Accept": "application/json"},
+            if not (_HAS_CURL_CFFI and curl_requests is not None):
+                raise DomainError(
+                    ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                    "Stripe 支付需要 curl_cffi；当前环境缺少浏览器 TLS 指纹能力，已停止",
+                    detail={"code": "curl_cffi_unavailable", "stage": "transport"},
                 )
-                log("   使用 curl_cffi（Chrome TLS 指纹）")
-            else:
-                raise RuntimeError(
-                    "Stripe 支付需要 curl_cffi；当前环境缺少浏览器 TLS 指纹能力，已停止"
-                )
+            proxies = None
+            if self.proxy:
+                proxies = {"http": self.proxy, "https": self.proxy}
+            self._client = curl_requests.Session(
+                impersonate="chrome150",
+                proxies=proxies,
+                timeout=self.timeout,
+                headers={"User-Agent": self.ua, "Accept": "application/json"},
+            )
+            log("   使用 curl_cffi（Chrome TLS 指纹）")
         return self._client
 
     def close(self) -> None:
@@ -275,10 +281,7 @@ class StripeProtocol:
         if not self.credentials_current():
             raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
         c = self._http()
-        if _HAS_CURL_CFFI and curl_requests is not None and hasattr(c, "post"):
-            response = c.post(url, data=data, headers=headers)
-        else:
-            response = c.post(url, content=data, headers=headers)
+        response = c.post(url, data=data, headers=headers)
         _log_http_failure(url, response)
         return response
 

@@ -118,3 +118,41 @@ def test_ambiguous_authentication_failure_is_never_replayed(monkeypatch):
     })
     assert response.status_code == 401
     fail.assert_called_once()
+
+
+@pytest.mark.parametrize("original_country", ["US", "JP"])
+def test_order_reissue_401_exports_only_safe_response_fields(monkeypatch, caplog, original_country):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from gss_core import chatgpt
+
+    secret = "private-auth-response-canary"
+    ray = "abcdef0123456789-IAD"
+    rid = "req_0123456789abcdef0123456789abcdef"
+    refusal = SimpleNamespace(status_code=401, text=secret,
+                              headers={"Set-Cookie": secret, "CF-Ray": ray, "X-Request-ID": rid},
+                              json=lambda: {"error": {"code": "token_revoked", "message": secret}})
+    transport = Mock(headers={}, cookies={})
+    transport.get.return_value = refusal
+    monkeypatch.setattr(chatgpt, "_new_session", lambda **kw: transport)
+    monkeypatch.setattr(orders, "_guard_refresh_egress", AsyncMock())
+    monkeypatch.setattr(orders, "checkout_proxy_for", lambda *a, **kw: "http://unused.invalid")
+    monkeypatch.setattr(orders, "build_pipeline", lambda: pytest.fail("checkout after 401"))
+    stages = []
+    monkeypatch.setattr(orders, "_mark", lambda _progress, stage: stages.append(stage))
+    session = ("eyJ-fixture..iv.cipher.tag" if original_country == "US" else json.dumps({
+        "sessionToken": "fixture-only", "accessToken": "fixture-old", "statsigContext": {"country": original_country},
+    }))
+    result = TestClient(create_app()).post("/api/orders", json={
+        "session": session, "billing_country": "US", "plan": "plus",
+    })
+    assert result.status_code == 401
+    assert result.json()["detail"]["code"] == "invalid_session"
+    assert result.json()["detail"]["detail"] == {
+        "upstream_status": 401, "upstream_code": "token_revoked", "cf_ray": ray, "request_id": rid,
+        "upstream_code_state": "accepted", "request_id_state": "accepted",
+    }
+    transport.get.assert_called_once()
+    transport.close.assert_called_once()
+    assert stages == ["session_refresh" if original_country == "US" else "reissuing"]
+    assert secret not in result.text + caplog.text

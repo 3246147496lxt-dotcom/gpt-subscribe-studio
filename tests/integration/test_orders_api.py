@@ -293,7 +293,8 @@ def test_session_token_only_is_exchanged_before_checkout(monkeypatch) -> None:
 
     seen = {}
 
-    def fake_refresh(self) -> bool:
+    def fake_refresh(self, *, reject_unauthorized) -> bool:
+        assert reject_unauthorized is True
         seen["auth"] = "Authorization" in self._identity_headers()
         seen["session_token"] = self.session_token
         self.access_token = "exchanged-at"
@@ -313,7 +314,7 @@ def test_expired_session_token_is_rejected(monkeypatch) -> None:
     from gss_core.chatgpt import ChatGPTClient
 
     monkeypatch.setattr("gss_api.routers.orders._guard_refresh_egress", AsyncMock())
-    monkeypatch.setattr(ChatGPTClient, "refresh_session", lambda self: False)
+    monkeypatch.setattr(ChatGPTClient, "refresh_session", lambda self, **kwargs: False)
     store.clear()
     created = _order_with_session(TestClient(create_app()), _JWE)
     assert created.status_code == 401

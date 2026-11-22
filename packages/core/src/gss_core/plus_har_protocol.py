@@ -88,11 +88,13 @@ from gss_core.har_telemetry import (
 )
 from gss_core.saved_cards import restore_account
 from gss_core.saved_card_protocol import _factor, _stripe_error, outcome
+from gss_core.session_token import parse_session_bundle
+from gss_core.proxies import ProxyLeaseError, claim_sid_lease, cool_proxy, release_sid_lease
 from gss_core.stripe_protocol import PaymentOutcome
 
 logger = logging.getLogger("gss.plus_har")
 
-_DECLINED_INTENT_STATES = {"requires_payment_method", "canceled", "cancelled"}
+_UNSETTLED_INTENT_STATES = {"requires_payment_method", "canceled", "cancelled"}
 _CARD_REJECTION_CODES = {"card_declined", "expired_card", "incorrect_cvc", "incorrect_number"}
 
 
@@ -135,8 +137,16 @@ def active_plus_entitlement(payload: dict, account_id: str = "") -> bool:
 
 
 def _confirmed_decline(out: PaymentOutcome) -> bool:
-    return bool(out.decline_code or out.code in _CARD_REJECTION_CODES
-                or ((out.intent_id or "").startswith("pi_") and out.intent_status in _DECLINED_INTENT_STATES))
+    return bool(out.decline_code or out.code in _CARD_REJECTION_CODES)
+
+
+def _classify_unsuccessful_intent(out: PaymentOutcome) -> None:
+    if _confirmed_decline(out):
+        out.state = "card_declined"
+    else:
+        out.state = "unknown"
+        if out.intent_status in _UNSETTLED_INTENT_STATES and not out.code:
+            out.code = "intent_status_unconfirmed"
 
 
 _SESSION = re.compile(r"(oaics_[A-Za-z0-9]+|cs_(?:live|test)_[A-Za-z0-9]+)")
@@ -245,6 +255,8 @@ class PlusHarProtocol:
 
         self.mode = (telemetry or os.environ.get("GSS_HAR_TELEMETRY", "full")).lower()
         self.read_only = bool(read_only)
+        # True when this attempt re-issued the session for a different country.
+        self.session_reissued = False
         self.confirmation_started = False
         self.on_confirmation_start = lambda: None
         self.receipt_expected_minor: int | None = None
@@ -267,6 +279,10 @@ class PlusHarProtocol:
         self.elements_session_id = ""
         self.passive_captcha: Dict[str, str] = {}
         self.ctoken = ""
+        # One cached read after the stale-checkout probe, so the same snapshot
+        # is not fetched twice in one attempt.
+        self._checkout_snapshot: Optional[Dict[str, Any]] = None
+        self.discarded_checkout_id = ""
         self._radar_cached = ""
         self.confirmed: Dict[str, Any] = {}
         self.intent_id = ""
@@ -353,8 +369,19 @@ class PlusHarProtocol:
         return self._web
 
     def _browser_session(self, headers: Dict[str, str]) -> Any:
-        """curl_cffi session so api.stripe.com sees the same TLS as chatgpt.com."""
-        from curl_cffi.requests import Session as CurlSession
+        """curl_cffi session so api.stripe.com sees the same TLS as chatgpt.com.
+
+        Fail closed: without curl_cffi there is no session with this identity,
+        so nothing may be sent to the payment endpoints.
+        """
+        try:
+            from curl_cffi.requests import Session as CurlSession
+        except ImportError:
+            raise DomainError(
+                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                "缺少 curl_cffi，无法建立与结账身份一致的 Stripe 传输，已停止",
+                detail={"code": "curl_cffi_unavailable", "stage": "transport"},
+            ) from None
 
         session = CurlSession(impersonate=self.device.impersonate, timeout=self.timeout)
         if hasattr(session, "trust_env"):
@@ -419,14 +446,77 @@ class PlusHarProtocol:
         return self._web_session().request(method, url, **kwargs)
 
     # ── 0. account + sentinel ──────────────────────────────────────
+    def _claim_exit(self) -> None:
+        """One sticky exit serves one order; a quarantined SID stops here."""
+        if not self.proxy or not self.purchase_attempt_id:
+            return
+        try:
+            claim_sid_lease(self.proxy, order_id=self.purchase_attempt_id, role="checkout")
+        except ProxyLeaseError as exc:
+            raise DomainError(
+                ErrorCode.CHECKOUT_UPSTREAM_ERROR, str(exc),
+                detail={"code": "proxy_sid_unavailable", "stage": "prepare"},
+            ) from None
+
+    def _note_exit_rejection(self, status: int, payload: Dict[str, Any],
+                             response: Any = None) -> None:
+        """Quarantine the bound exit after a risk rejection, before any retry."""
+        code = str((payload or {}).get("code") or (payload or {}).get("type") or "")
+        # Some upstream refusals carry no structured code, only prose. Classify
+        # locally; the text itself is never stored or logged.
+        text = str(getattr(response, "text", "") or "")[:600].lower()
+        risk = (status in {401, 403}
+                or code in {"unusual_activity", "token_revoked", "invalid_session"}
+                or "unusual activity" in text or "token_revoked" in text)
+        if risk and self.proxy:
+            try:
+                seconds = int(os.environ.get("GSS_PROXY_COOLDOWN_SECONDS", "1800") or 1800)
+            except ValueError:
+                seconds = 1800
+            cool_proxy(self.proxy, reason=f"{status}:{code or 'risk'}", seconds=max(1, seconds))
+
     def _prepare(self) -> None:
+        self._claim_exit()
         if self.client is None:
-            self.client = ChatGPTClient.from_raw_session(self.session, proxy=self.proxy)
+            imported = parse_session_bundle(self.session)
+            cross_country = bool(
+                imported.country and self.exit_country
+                and imported.country.upper() != self.exit_country.upper()
+            )
+            if imported.refresh_token:
+                # OAuth credentials are portable: one refresh exchange on this
+                # exit replaces both the web cookie and the login country.
+                self.client = ChatGPTClient.from_raw_session(
+                    self.session, proxy=self.proxy, strip_ambient=True)
+                self.session_reissued = True
+            elif cross_country and imported.session_token:
+                # Cross-region takeover: keep only the session cookie and
+                # re-issue the token on this order's exit with a new device.
+                self.client = ChatGPTClient.reauthorize_for_country(
+                    self.session, proxy=self.proxy, country=self.exit_country)
+                self.session_reissued = True
+            else:
+                # Same region or no session cookie: drop the exported device,
+                # statsig country and cookie jar, then warm on this exit.
+                self.client = ChatGPTClient.from_raw_session(
+                    self.session, proxy=self.proxy, strip_ambient=True)
+                self.session_reissued = False
             self.client.timeout = self.timeout
             self.client.language = self.device.locale
             self.client.timezone = self.device.timezone
+            if not self.client.user_agent:
+                self.client.user_agent = self.device.ua
+            if not self.read_only:
+                try:
+                    self.client.warm_exit_session(
+                        oauth=bool(imported.refresh_token),
+                        reissue=not self.session_reissued,
+                    )
+                except DomainError as exc:
+                    raise DomainError(exc.code, exc.message, detail=exc.detail) from None
             try:
-                restore_account(self.client, self.expected_account, credentials_current=self.credentials_current)
+                restore_account(self.client, self.expected_account,
+                                credentials_current=self.credentials_current)
             except DomainError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -522,8 +612,10 @@ class PlusHarProtocol:
         payload = _json(response)
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 401:
+            self._note_exit_rejection(status, payload, response)
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         if status >= 400:
+            self._note_exit_rejection(status, payload, response)
             _log_upstream_failure("/backend-api/payments/checkout", response)
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                               f"创建结账失败 HTTP {status}",
@@ -539,13 +631,18 @@ class PlusHarProtocol:
         return payload
 
     def _read_checkout(self) -> Dict[str, Any]:
+        if self._checkout_snapshot is not None:
+            payload, self._checkout_snapshot = self._checkout_snapshot, None
+            return payload
         route = f"/backend-api/payments/checkout/{self.processor}/{self.checkout_id}"
         response = self._app("GET", route, params={"supports_business_seat_offer": "true"})
         status = int(getattr(response, "status_code", 0) or 0)
-        if status == 401:
-            raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         payload = _json(response)
+        if status == 401:
+            self._note_exit_rejection(status, payload, response)
+            raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         if status >= 400:
+            self._note_exit_rejection(status, payload, response)
             _log_upstream_failure(route, response)
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                               f"读取结账失败 HTTP {status}",
@@ -559,6 +656,50 @@ class PlusHarProtocol:
             self.confirm_return_url = str(payload["confirm_return_url"])
         self.raw["checkout"] = payload
         return payload
+
+    def _reset_checkout(self) -> None:
+        self.checkout_id = ""
+        self.checkout_url = ""
+        self.cuss_secret = ""
+        self.confirm_return_url = ""
+
+    def _discard_stale_checkout(self) -> None:
+        """Do not reuse an open checkout minted for another exit or currency.
+
+        A checkout is bound to the country that created it. Reading it again
+        under a different exit is what the upstream reports as cross-region
+        activity, so an incompatible session is dropped before any new order
+        is created. Missing or expired sessions are dropped as well; only a
+        credential failure (401/403) stops the attempt.
+        """
+        if not self.checkout_id:
+            return
+        try:
+            payload = self._read_checkout()
+        except DomainError as exc:
+            status = (exc.detail or {}).get("upstream_status")
+            if status in {400, 404, 410}:
+                self.discarded_checkout_id = self.checkout_id
+                self._reset_checkout()
+                return
+            raise
+        state = payload.get("checkout_state") if isinstance(payload.get("checkout_state"), dict) else {}
+        total = state.get("total") if isinstance(state.get("total"), dict) else {}
+        inner = total.get("total") if isinstance(total.get("total"), dict) else {}
+        currency = str(inner.get("currency") or payload.get("currency") or "").upper()
+        billing = payload.get("billing_details") if isinstance(payload.get("billing_details"), dict) else {}
+        country = str(billing.get("country") or "").upper()
+        status = str(payload.get("status") or "")
+        stale = (status not in {"", "open"}
+                 or (currency and currency != self.currency.upper())
+                 or (country and country != self.country.upper()))
+        if stale:
+            self.discarded_checkout_id = self.checkout_id
+            logger.info("plus_har_checkout_discarded status=%s currency=%s country=%s",
+                        status or "-", currency or "-", country or "-")
+            self._reset_checkout()
+            return
+        self._checkout_snapshot = payload
 
     @staticmethod
     def _total_minor(payload: Dict[str, Any]) -> int:
@@ -804,14 +945,21 @@ class PlusHarProtocol:
     def _confirmation_token(self) -> str:
         b = self.billing
         # A locally generated guid/muid/sid is not a Stripe device identity.
-        # If telemetry was expected but never adopted server IDs, stop before
-        # creating a payment method or touching the intent.
-        if (self.mode != "off" and isinstance(self.telemetry, StripeTelemetry)
-                and not getattr(self.telemetry, "server_ids_adopted", False)):
-            raise DomainError(
-                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
-                "Stripe 设备指纹未取得服务端 guid/muid/sid，已停止在建单/确认前",
-            )
+        # Fail closed before the confirmation token, payment method or intent:
+        # nothing has been sent at this point, so no charge can be in flight.
+        if self.mode != "off" and isinstance(self.telemetry, StripeTelemetry):
+            if not getattr(self.telemetry, "registered", False):
+                raise DomainError(
+                    ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                    "Stripe 设备指纹未完成注册，已停止在建单/确认前",
+                    detail={"code": "telemetry_unavailable", "stage": "confirmation_token"},
+                )
+            if not getattr(self.telemetry, "server_ids_adopted", False):
+                raise DomainError(
+                    ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                    "Stripe 设备指纹未取得服务端 guid/muid/sid，已停止在建单/确认前",
+                    detail={"code": "telemetry_unavailable", "stage": "confirmation_token"},
+                )
         radar = self._radar_token()
         time_on_page = int((time.time() - self.t0) * 1000)
         form: Dict[str, Any] = {
@@ -1217,14 +1365,14 @@ class PlusHarProtocol:
                 out.state = "unknown"
                 out.message = f"Intent 金额 {amount} 与结账应付额 {self.amount_minor} 不一致；{out.message}"
                 return out
-            out.state = "card_declined" if _confirmed_decline(out) else "unknown"
+            _classify_unsuccessful_intent(out)
             return out
         if self.last_error:
             out.code = self.last_error.get("code") or ""
             out.decline_code = self.last_error.get("decline_code") or ""
             out.message = self.last_error.get("message") or ""
             out.intent_status = intent_status or None
-            out.state = "card_declined" if _confirmed_decline(out) else "unknown"
+            _classify_unsuccessful_intent(out)
             return out
 
         page: Dict[str, Any] = {}
@@ -1336,6 +1484,11 @@ class PlusHarProtocol:
         self._prelude()
         self._sentinel("chatgpt_checkout")
 
+        if self.checkout_id and self.session_reissued:
+            # Never reuse an open session minted for another exit/currency.
+            # Same-region attempts keep the bound session; cross-region and
+            # OAuth takeovers must not carry the old checkout across.
+            self._discard_stale_checkout()
         if not self.checkout_id:
             self._create_checkout()
         payload = self._read_checkout()
@@ -1508,10 +1661,15 @@ class PlusHarProtocol:
                 out.intent_status = state
                 out.message = "付款已确认，等待结账状态更新"
                 return out
-            if state in _DECLINED_INTENT_STATES:
-                out.state = "card_declined"
+            if state in _UNSETTLED_INTENT_STATES:
+                error = intent.get("last_payment_error")
+                if isinstance(error, dict):
+                    out.code = str(error.get("code") or "") or None
+                    out.decline_code = str(error.get("decline_code") or "") or None
                 out.intent_status = state
-                out.message = "Stripe 未完成本次付款"
+                _classify_unsuccessful_intent(out)
+                out.message = ("Stripe 拒绝本次付款" if out.state == "card_declined"
+                               else "原付款结果待核对，请勿重复支付")
                 return out
             out.state = "pending" if state in {"processing", "requires_capture"} else "unknown"
             out.intent_status = state or None
@@ -1536,7 +1694,13 @@ class PlusHarProtocol:
 
     def pay_from_url(self, retries: int = 3) -> PaymentOutcome:
         """Run a single attempt; a transport exception must never replay a payment."""
-        return self.pay()
+        try:
+            return self.pay()
+        finally:
+            # The exit is leased for this attempt only. A risk rejection has
+            # already moved it into cooldown, which also drops the lease.
+            if self.proxy and self.purchase_attempt_id:
+                release_sid_lease(self.purchase_attempt_id, role="checkout")
 
 
 

@@ -83,12 +83,8 @@ def create_app() -> FastAPI:
             or path == "/api/payments/quick-pay"
         )
         if request.method == "POST" and private_create:
-            order = store.get_order(request.path_params.get("order_id", ""))
-            is_team = ((order is not None and order.plan.value == "team")
-                       or (path == "/api/orders" and isinstance(exc.body, dict) and exc.body.get("plan") == "team"))
-            if not is_team:
-                return JSONResponse(status_code=422, content={"detail": {
-                    "code": "INVALID_ORDER_INPUT", "message": "订单请求字段无效，未提交。"}})
+            return JSONResponse(status_code=422, content={"detail": {
+                "code": "INVALID_ORDER_INPUT", "message": "订单请求字段无效，未提交。"}})
         return await request_validation_exception_handler(request, exc)
 
     app.include_router(orders.router)

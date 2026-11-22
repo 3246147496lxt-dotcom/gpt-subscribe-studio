@@ -140,29 +140,30 @@ def recover_incomplete_jobs() -> None:
     db = get_db_optional()
     if db is None:
         return
+    from .services.order_flow import _from_db_job
+
     for row in db.load_jobs():
-        if row.get("status") != "running":
+        if row.get("status") not in {"queued", "running"}:
             continue
-        stage = str(row.get("stage") or "")
-        job_id = str(row.get("id") or "")
-        order_id = str(row.get("order_id") or "")
-        if stage in {"confirming_payment", "verifying_delivery"}:
-            db.save_job(type("RecoveredJob", (), {
-                "id": job_id, "idempotency_key": row.get("idempotency_key") or "",
-                "account_fingerprint": row.get("account_fingerprint"),
-                "order_id": order_id, "status": "unknown", "stage": "unknown",
-                "failure_code": "crash_recovery", "message": "服务重启时支付阶段未完成，已锁定待人工核对",
-                "amount": row.get("amount"), "currency": row.get("currency"),
-                "purchase_attempt_id": row.get("purchase_attempt_id"),
-                "timings": {}, "diagnostics": {}, "started_at": 0, "finished_at": None,
-            })())
-            hold_unknown(
-                fingerprint=str(row.get("account_fingerprint") or ""),
-                order_id=order_id, job_id=job_id, reason="crash_recovery",
-            )
+        job = _from_db_job(row)
+        order_id = job.order_id or ""
+        if job.stage in {"confirming_payment", "verifying_delivery", "unknown"}:
+            held = hold_unknown(fingerprint=job.account_fingerprint or "", order_id=order_id,
+                                job_id=job.id, reason="crash_recovery")
+            job.lock_id = (held or {}).get("id")
+            job.status = job.stage = "unknown"
+            job.failure_code = "crash_recovery"
+            job.message = "服务重启时支付阶段未完成，请人工核对。"
         else:
-            db.add_event(stage="recovery", event="job_failed_safely", order_id=order_id,
-                         job_id=job_id, code="crash_before_payment")
+            job.status = job.stage = "failed"
+            job.failure_code = "crash_before_payment"
+            job.message = "作业在提交付款前中断，未自动重放。请保留作业编号并核对订单。"
+        job.finished_at = datetime.now(timezone.utc).timestamp()
+        db.save_job(job)
+        db.save_idempotency(job.idempotency_key, "quick_pay", order_id=order_id,
+                            job_id=job.id, state=job.status)
+        db.add_event(stage="recovery", event=job.status, order_id=order_id,
+                     job_id=job.id, code=job.failure_code)
 
 
 __all__ = [

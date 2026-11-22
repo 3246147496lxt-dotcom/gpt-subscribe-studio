@@ -14,7 +14,7 @@ export type QuickPayJob = {
   lock_id?: string | null;
   timings_ms?: Record<string, number>;
   events?: QuickPayEvent[];
-  status: "queued" | "running" | "succeeded" | "failed" | "unknown";
+  status: "queued" | "running" | "succeeded" | "failed" | "unknown" | "paid_pending_delivery";
   stage: string;
   order_id?: string | null;
   purchase_attempt_id?: string | null;

@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import time
 import uuid
@@ -13,7 +14,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from http.cookiejar import CookieJar
 from typing import Any, Callable, Dict, NoReturn, Optional
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, urlencode
 
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.verified_payer import checkout_address, check_observed_billing
@@ -33,6 +34,9 @@ from gss_core.session_token import (
 APP_BASE = "https://chatgpt.com"
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
 STRIPE_BASE = "https://api.stripe.com"
+# OAuth token endpoint for refresh_token-granted sessions (Codex/CLI exports).
+OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+OAUTH_CLIENT_ID = os.environ.get("GSS_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
 _IMPERSONATE = "chrome150"
 _CLIENT_VERSION = "prod-db390ebea64862bf1899c420a4c736e0cf639747"
 _CLIENT_BUILD = "7904904"
@@ -525,6 +529,8 @@ class ChatGPTClient:
     client_version: str = _CLIENT_VERSION
     oai_session_id: str = ""
     session_token: str = ""
+    # OAuth refresh token; never serialized, logged or persisted.
+    refresh_token: str = field(default="", repr=False)
     device_id: str = ""
     user_agent: str = ""
     session_country: str = ""
@@ -543,18 +549,27 @@ class ChatGPTClient:
     _elements_session_id: str = field(default="", repr=False)
 
     @classmethod
-    def from_raw_session(cls, raw: str, proxy: Optional[str] = None) -> "ChatGPTClient":
-        bundle: SessionBundle = parse_session_bundle(raw)
+    def from_raw_session(
+        cls, raw: str, proxy: Optional[str] = None, *, strip_ambient: bool = False
+    ) -> "ChatGPTClient":
+        bundle: SessionBundle = parse_session_bundle(raw, strip_ambient=strip_ambient)
         token = bundle.access_token
         # 只粘贴 session token 时 accessToken 为空，改用 session token 派生设备标识，避免所有用户撞同一个 id。
         seed = token or bundle.session_token
-        device = bundle.device_id or str(uuid.uuid5(uuid.NAMESPACE_URL, "dcp-did:" + seed))
-        session_id = bundle.oai_session_id or str(uuid.uuid5(uuid.NAMESPACE_URL, "dcp-sid:" + seed))
+        if strip_ambient:
+            # A fresh device per attempt: the imported one belongs to the exit
+            # that exported the session, not to this order's proxy.
+            device = str(uuid.uuid4())
+            session_id = str(uuid.uuid4())
+        else:
+            device = bundle.device_id or str(uuid.uuid5(uuid.NAMESPACE_URL, "dcp-did:" + seed))
+            session_id = bundle.oai_session_id or str(uuid.uuid5(uuid.NAMESPACE_URL, "dcp-sid:" + seed))
         return cls(
             access_token=token,
             proxy=proxy,
             account_id=jwt_account_id(token),
             session_token=bundle.session_token,
+            refresh_token=bundle.refresh_token,
             device_id=device,
             user_agent=bundle.user_agent,
             session_country=bundle.country,
@@ -596,7 +611,7 @@ class ChatGPTClient:
             ),
         )
         try:
-            if not client.refresh_session(trust_statsig=False):
+            if not client.refresh_session(trust_statsig=False, reject_unauthorized=True):
                 raise DomainError(
                     ErrorCode.INVALID_SESSION,
                     f"无法在目标国家 {country} 重签发 Session，请检查该国家出口代理是否可用",
@@ -690,8 +705,7 @@ class ChatGPTClient:
         if isinstance(cookies, dict):
             from gss_core.browser_context import safe_browser_cookies
             self.extra_cookies.update(safe_browser_cookies(cookies))
-        if getattr(context, "sentinel_token", ""):
-            self.sentinel_token = str(context.sentinel_token)
+        # Anonymous browser attestations are not credentials for this session.
         if self._http is not None:
             self._http.headers.update(self._identity_headers())
 
@@ -793,7 +807,7 @@ class ChatGPTClient:
                 self.extra_cookies[str(name)] = str(value)
         self.http.headers.update(self._identity_headers())
 
-    def refresh_session(self, *, trust_statsig: bool = True) -> bool:
+    def refresh_session(self, *, trust_statsig: bool = True, reject_unauthorized: bool = False) -> bool:
         """用当前出口 IP 请求 /api/auth/session，换取与本批次出口一致的 accessToken 与 cookie。
 
         结账地区由出口代理决定（align_proxy_region），session 本身不绑定国家；
@@ -801,7 +815,7 @@ class ChatGPTClient:
         同批次，降低 Cloudflare 403 与 unusual activity 概率。
 
         软失败：session-token 缺失/失效、上游报错都返回 False，调用方沿用原
-        session 继续，不阻断结账。刷新结果只在内存，不落库。
+        session 继续。建单方显式要求在 HTTP 401 时以脱敏诊断立即终止。刷新结果只在内存，不落库。
         """
         if not self.session_token:
             return False
@@ -812,10 +826,16 @@ class ChatGPTClient:
                 headers=self._route_headers("/api/auth/session"),
                 timeout=self.timeout,
             )
-        except Exception as exc:
-            logger.warning("session 刷新失败（继续用原 session）: %s", redact_sensitive(str(exc))[:200])
+        except Exception:
+            # Exception strings can contain complete proxy URLs or request headers.
+            logger.warning("session_refresh_transport_error")
             return False
         status = int(getattr(response, "status_code", 0) or 0)
+        if status == 401:
+            if reject_unauthorized:
+                self._reject_unauthorized(response)
+            logger.warning("session 刷新失败（HTTP 401）")
+            return False
         if status >= 400:
             _log_upstream_failure("/api/auth/session", response)
             logger.warning("session 刷新失败（HTTP %s），继续用原 session", status)
@@ -842,7 +862,74 @@ class ChatGPTClient:
         logger.info("session 刷新成功，已与本批次出口对齐")
         return True
 
-    def warmup(self, *, page_url: str = "") -> None:
+    def refresh_oauth_token(self, *, client_id: str = "") -> bool:
+        """Exchange an OAuth refresh token on this exit for a new access token.
+
+        This path is independent of the web session cookie: the token is bound
+        to the client that requested it, not to the browser's login country.
+        The refresh token is rotated in memory when the server returns a new
+        one; nothing is written to disk.
+        """
+        if not self.refresh_token:
+            return False
+        client_id = (client_id or os.environ.get("GSS_OAUTH_CLIENT_ID", OAUTH_CLIENT_ID)).strip()
+        if not client_id:
+            raise DomainError(ErrorCode.INVALID_SESSION, "缺少 OAuth client_id，无法刷新。",
+                              detail={"code": "oauth_refresh_rejected"})
+        form = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token,
+            "client_id": client_id,
+        }
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": self.ua,
+        }
+        try:
+            session = _new_session(proxy=self.proxy, timeout=self.timeout)
+            try:
+                response = session.post(OAUTH_TOKEN_URL, data=form, headers=headers)
+            finally:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    close()
+        except DomainError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise DomainError(
+                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                "OAuth 刷新请求未完成，未创建结账。",
+                detail={"code": "oauth_refresh_transport", "reason": type(exc).__name__},
+            ) from None
+        status = int(getattr(response, "status_code", 0) or 0)
+        payload = _json(response)
+        if status >= 400:
+            wire = str(payload.get("error") or "")[:40]
+            raise DomainError(
+                ErrorCode.INVALID_SESSION,
+                "OAuth refresh_token 刷新被上游拒绝，请重新登录导出凭据。",
+                detail={"code": "oauth_refresh_rejected", "upstream_status": status,
+                        "upstream_code": wire},
+            )
+        token = str(payload.get("access_token") or "").strip()
+        if not token:
+            raise DomainError(
+                ErrorCode.INVALID_SESSION,
+                "OAuth 刷新未返回 access_token，请重新登录导出凭据。",
+                detail={"code": "oauth_refresh_rejected", "upstream_status": status},
+            )
+        self.access_token = token
+        rotated = str(payload.get("refresh_token") or "").strip()
+        if rotated:
+            self.refresh_token = rotated
+        account = jwt_account_id(token)
+        if account:
+            self.account_id = account
+        logger.info("oauth_refresh_ok rotated=%s", bool(rotated))
+        return True
+
+    def warmup(self, *, page_url: str = "", reject_unauthorized: bool = False) -> None:
         url = page_url or f"{APP_BASE}/"
         headers = self._identity_headers()
         headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -855,6 +942,8 @@ class ChatGPTClient:
             home = self.http.get(url, headers=headers, timeout=self.timeout)
         except Exception:
             return
+        if reject_unauthorized and getattr(home, "status_code", None) == 401:
+            self._reject_unauthorized(home)
         html = str(getattr(home, "text", "") or "")
         version, build, session_id = extract_build(html)
         if version:
@@ -876,7 +965,7 @@ class ChatGPTClient:
         latency and is not used in the order hot path.
         """
         if full:
-            self.warmup()
+            self.warmup(reject_unauthorized=True)
         endpoints = (("/backend-api/me", None),)
         if full:
             endpoints += ((ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),)
@@ -899,14 +988,86 @@ class ChatGPTClient:
                 continue
             status = int(getattr(response, "status_code", 0) or 0)
             if status == 401:
-                _log_upstream_failure(path, response)
-                raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
+                self._reject_unauthorized(response)
             if status >= 400:
                 _log_upstream_failure(path, response)
                 continue
             self._merge_cookies()
             logger.info("warmup ok path=%s status=%s", path, status)
         self.http.headers.update(self._identity_headers())
+
+    def warm_exit_session(self, *, reissue: bool = True, oauth: bool = False,
+                          interval: tuple[float, float] = (1.5, 2.5)) -> None:
+        """Bring an imported session up to date on the exit it will run on.
+
+        Order matters: the edge handshake creates cookie state for this exit,
+        the credential is re-issued for this exit (OAuth refresh token when
+        present, otherwise the web session), and the account probes prove the
+        credentials are accepted from here. Nothing financial is called before
+        all three succeed.
+        """
+        self.warmup(reject_unauthorized=True)
+        self._warm_wait(interval)
+        if oauth and self.refresh_token:
+            self.refresh_oauth_token()
+            self._warm_wait(interval)
+        elif reissue and self.session_token:
+            if not self.refresh_session(trust_statsig=True, reject_unauthorized=True):
+                raise DomainError(
+                    ErrorCode.INVALID_SESSION,
+                    "目标出口下 Session 刷新未获确认，未创建结账。",
+                    detail={"code": "warmup_rejected", "stage": "auth_session"},
+                )
+            self._warm_wait(interval)
+        self._warm_probe("/backend-api/me", None, stage="me")
+        self._warm_wait(interval)
+        self._warm_probe(ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"},
+                         stage="accounts_check")
+
+    @staticmethod
+    def _warm_wait(interval: tuple[float, float]) -> None:
+        configured = os.environ.get("GSS_WARMUP_INTERVAL", "").strip()
+        if configured:
+            try:
+                delay = max(0.0, float(configured))
+            except ValueError:
+                delay = random.uniform(*interval)
+        else:
+            delay = random.uniform(*interval)
+        if delay:
+            time.sleep(delay)
+
+    def _warm_probe(self, path: str, params: Optional[Dict[str, str]], *, stage: str) -> None:
+        headers = self._route_headers(path)
+        headers.update(self._identity_headers())
+        try:
+            response = self.http.get(f"{APP_BASE}{path}", params=params, headers=headers,
+                                     timeout=self.timeout)
+        except Exception as exc:  # noqa: BLE001
+            raise DomainError(
+                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                "预热阶段无法连接 ChatGPT，未创建结账。",
+                detail={"code": "warmup_transport_error", "stage": stage,
+                        "reason": type(exc).__name__},
+            ) from None
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status == 401:
+            detail = self._checkout_response_detail(response, _json(response))
+            detail.update({"code": "warmup_rejected", "stage": stage})
+            message = ("预热阶段 Session 已被上游撤销（token_revoked），未创建结账。"
+                       if detail.get("upstream_code") == "token_revoked"
+                       else "预热阶段 Session 被上游拒绝，未创建结账。")
+            raise DomainError(ErrorCode.INVALID_SESSION, message, detail=detail)
+        if status >= 400:
+            detail = self._checkout_response_detail(response, _json(response))
+            detail.update({"code": "warmup_rejected", "stage": stage})
+            _log_upstream_failure(path, response)
+            raise DomainError(
+                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                f"预热阶段上游拒绝（HTTP {status}），未创建结账。",
+                detail=detail,
+            )
+        self._merge_cookies()
 
     def mint_sentinel(self, *, flow: str, page_url: str = "") -> None:
         token = mint(
@@ -939,7 +1100,7 @@ class ChatGPTClient:
             self.language = locale_for(effective_country)
             self.timezone = timezone_for(effective_country)
         url = page_url or f"{APP_BASE}/"
-        self.warmup(page_url=url)
+        self.warmup(page_url=url, reject_unauthorized=flow == "chatgpt_checkout")
         self.mint_sentinel(flow=flow, page_url=url)
 
     def _check_credentials(self) -> None:
@@ -1043,6 +1204,15 @@ class ChatGPTClient:
             detail[field + "_state"] = "accepted" if field in detail else ("filtered" if present else "not_found")
         return detail
 
+    def _reject_unauthorized(self, response: Any) -> NoReturn:
+        # Pre-checkout account/bootstrap requests can fail before the checkout
+        # POST exists. Preserve only this response, never its headers or body.
+        detail = self._checkout_response_detail(response, _json(response))
+        message = self._unauthorized_message(response)
+        if detail.get("upstream_code") == "token_revoked":
+            message = "Session 已被上游撤销（token_revoked），请重新登录 ChatGPT 后导出新 session"
+        raise DomainError(ErrorCode.INVALID_SESSION, message, detail=detail)
+
     def _reject_checkout(self, response: Any, payload: Dict[str, Any], *, fallback: str = "") -> NoReturn:
         detail = self._checkout_response_detail(response, payload)
         status = detail.get("upstream_status")
@@ -1075,9 +1245,11 @@ class ChatGPTClient:
         raise DomainError(code, message, detail=detail)
 
     def _raise(self, code: ErrorCode, response: Any, prefix: str) -> None:
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status == 401:
+            self._reject_unauthorized(response)
         _log_upstream_failure(prefix, response)
         body = redact_sensitive(str(getattr(response, "text", ""))[:500])
-        status = int(getattr(response, "status_code", 0) or 0)
         headers = getattr(response, "headers", {}) or {}
         detail = {
             "upstream_status": status,
@@ -1087,12 +1259,6 @@ class ChatGPTClient:
         }
         detail = {key: value for key, value in detail.items() if value not in (None, "", "-")}
         lowered = body.lower()
-        if status == 401:
-            raise DomainError(
-                ErrorCode.INVALID_SESSION,
-                f"{prefix}: {self._unauthorized_message(response)}",
-                detail=detail,
-            )
         if "unusual activity" in lowered:
             raise DomainError(
                 ErrorCode.CHECKOUT_UPSTREAM_ERROR,
@@ -1129,10 +1295,9 @@ class ChatGPTClient:
             timeout=self.timeout,
         )
         if int(getattr(me, "status_code", 0) or 0) == 401:
-            _log_upstream_failure("/backend-api/me", me)
-            raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
+            self._reject_unauthorized(me)
         if int(getattr(me, "status_code", 0) or 0) >= 400:
-            _log_upstream_failure("/backend-api/me", me)
+            logger.warning("account lookup unsuccessful status=%s", int(me.status_code))
             check = self.http.get(
                 f"{APP_BASE}{ACCOUNTS_CHECK_PATH}",
                 params={"timezone_offset_min": "0"},
@@ -1140,8 +1305,7 @@ class ChatGPTClient:
                 timeout=self.timeout,
             )
             if int(getattr(check, "status_code", 0) or 0) == 401:
-                _log_upstream_failure(ACCOUNTS_CHECK_PATH, check)
-                raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
+                self._reject_unauthorized(check)
             if int(getattr(check, "status_code", 0) or 0) >= 400:
                 self._raise(ErrorCode.INVALID_SESSION, check, "读取账号")
             payload = _json(check)
@@ -1227,7 +1391,7 @@ class ChatGPTClient:
         )
         response_status = int(getattr(response, "status_code", 0) or 0)
         if response_status == 401:
-            _log_checkout_unauthorized(response, checkout_url, self.http.headers)
+            _log_checkout_unauthorized(response, self.http.headers)
         payload = _json(response)
         if response_status >= 400:
             self._reject_checkout(response, payload)
@@ -1257,12 +1421,7 @@ class ChatGPTClient:
             path_id = stripe_id if (session_id.startswith("oaics_") and stripe_id) else session_id
             url = raw_url if raw_url.startswith("http") else f"{APP_BASE}/checkout/{processor}/{path_id}"
         processor = str(payload.get("processor_entity") or _processor(country))
-        logger.info(
-            "checkout_session_kind=%s processor=%s hosted=%s",
-            session_id.split("_", 1)[0] + "_" if "_" in session_id else "?",
-            processor,
-            hosted,
-        )
+        logger.info("checkout_created hosted=%s", hosted)
         confirm_return = str(payload.get("confirm_return_url") or "").strip()
         if not hosted and not confirm_return:
             confirm_return = stripe_verify_url(session_id, processor=processor, plan=plan)
@@ -2283,31 +2442,23 @@ _CHECKOUT_AUTH_ERROR_CODES = frozenset({
 })
 
 
-def _log_upstream_failure(
-    where: str, response: Any, *, limit: int = 4000, level: int = logging.WARNING
-) -> None:
-    """记录上游 >=400 的原始状态码和响应体（脱敏后），方便实测定位。"""
+# A caller may pass a per-session path or an entire URL as `where`. Retain
+# only fixed labels; neither response text nor a cleaned-up URL is safe to log.
+_LOGGABLE_ENDPOINTS = frozenset({
+    "/api/auth/session", "/backend-api/me", ACCOUNTS_CHECK_PATH,
+    "/backend-api/payments/checkout", "/backend-api/payments/checkout/taxes",
+    "/backend-api/payments/payment_method", "/backend-api/subscriptions", "/v1/confirmation_tokens",
+})
+
+
+def _log_upstream_failure(where: str, response: Any, *, level: int = logging.WARNING) -> None:
     status = int(getattr(response, "status_code", 0) or 0)
-    if status < 400:
-        return
-    url = str(getattr(response, "url", "") or "")
-    parts = urlsplit(url)
-    if parts.query:
-        # 查询参数里常带 secret/token/client_secret，统一打码后再落日志。
-        masked = "&".join(f"{key}=***" for key, _ in parse_qsl(parts.query, keep_blank_values=True))
-        url = urlunsplit((parts.scheme, parts.netloc, parts.path, masked, parts.fragment))
-    body = redact_sensitive(str(getattr(response, "text", "") or "")[:limit])
-    logger.log(
-        level,
-        "upstream_error where=%s status=%s url=%s body=%s",
-        where,
-        status,
-        url,
-        body,
-    )
+    if status >= 400:
+        logger.log(level, "upstream_error where=%s status=%s",
+                   where if where in _LOGGABLE_ENDPOINTS else "upstream", status)
 
 
-def _log_checkout_unauthorized(response: Any, checkout_url: str, configured_headers: Any) -> None:
+def _log_checkout_unauthorized(response: Any, configured_headers: Any) -> None:
     observed_headers = getattr(getattr(response, "request", None), "headers", None)
     header_source = "request" if observed_headers is not None else "configured"
     headers = observed_headers if observed_headers is not None else configured_headers
@@ -2337,9 +2488,9 @@ def _log_checkout_unauthorized(response: Any, checkout_url: str, configured_head
                 break
 
     logger.warning(
-        "checkout_unauthorized status_code=401 url=%s header_source=%s "
+        "checkout_unauthorized status_code=401 header_source=%s "
         "has_oai_device_id=%s has_user_agent=%s body_kind=%s body_bytes=%s upstream_error_code=%s",
-        checkout_url, header_source, "oai-device-id" in present, "user-agent" in present,
+        header_source, "oai-device-id" in present, "user-agent" in present,
         body_kind, body_bytes, error_code,
     )
 

@@ -54,8 +54,13 @@ def run_refusal(checkout, errors):
     (ErrorCode.CHECKOUT_UPSTREAM_ERROR, "proxy tunnel failed",
      {"request_id": "req_abcdef0123456789abcdef0123456789"}, "unknown_upstream"),
     (ErrorCode.INVALID_SESSION, "proxy tunnel failed", {}, "invalid_session"),
+    (ErrorCode.CHECKOUT_UPSTREAM_ERROR, "proxy tunnel failed: token revoked", {}, "invalid_session"),
+    (ErrorCode.CHECKOUT_UPSTREAM_ERROR, "proxy tunnel failed: invalid session", {}, "invalid_session"),
     (ErrorCode.CHECKOUT_UPSTREAM_ERROR, "proxy tunnel failed: 异常流量", {}, "unusual_activity"),
     (ErrorCode.CHECKOUT_UPSTREAM_ERROR, "proxy tunnel failed", {"upstream_code": "already_subscribed"}, "already_subscribed"),
+    (ErrorCode.CHECKOUT_UPSTREAM_ERROR, "proxy tunnel failed: already_subscribed private-canary", {}, "already_subscribed"),
+    (ErrorCode.CHECKOUT_UPSTREAM_ERROR, "proxy tunnel failed", {"upstream_code": "already_paid"}, "already_subscribed"),
+    (ErrorCode.ALREADY_SUBSCRIBED, "proxy tunnel failed", {}, "already_subscribed"),
 ])
 def test_refusal_is_terminal_and_persisted(isolated, monkeypatch, rotation, business, prose, diag, expected):
     db, checkout, rotate = isolated
@@ -69,6 +74,9 @@ def test_refusal_is_terminal_and_persisted(isolated, monkeypatch, rotation, busi
     assert order.id == err._checkout_order_id
     assert str(order.status) == "rejected" and view.failure_code == expected
     assert view.last_error == err.detail["message"]
+    if expected == "already_subscribed":
+        assert err.detail["code"] == "already_subscribed"
+        assert "private-canary" not in view.last_error
 
 
 def test_connection_only_then_first_upstream_refusal(isolated, monkeypatch):

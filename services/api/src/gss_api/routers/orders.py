@@ -522,7 +522,8 @@ def _checkout_failure_code(exc: DomainError) -> str:
     if (exc.code in {ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED}
             or detail.get("upstream_status") == 401
             or upstream in {"invalid_session", "token_revoked", "invalid_token", "session_expired"}
-            or any(x in text for x in ("token_revoked", "invalidated oauth token", "invalid_session"))):
+            or any(x in text for x in ("token_revoked", "token revoked", "invalidated oauth token",
+                                       "invalid_session", "invalid session"))):
         return "invalid_session"
     if upstream == "unusual_activity" or any(x in text for x in ("unusual_activity", "unusual activity", "异常流量")):
         return "unusual_activity"
@@ -530,6 +531,12 @@ def _checkout_failure_code(exc: DomainError) -> str:
         return str(exc.code)
     if upstream in {"already_subscribed", "subscription_limit", "billing_country_mismatch"}:
         return upstream
+    # Some adapters report only a message. A subscription refusal is still
+    # terminal even when the same message also mentions a proxy tunnel.
+    if upstream == "already_paid" or any(x in text for x in (
+        "already_subscribed", "already subscribed", "already paid", "已是付费订阅", "已有订阅",
+    )):
+        return "already_subscribed"
     inferred = str(classify_upstream_failure(exc=exc, stage="checkout").code)
     if exc.detail and inferred == "proxy_tunnel_failed":
         return "unknown_upstream"  # presence of a response is not a transport diagnosis
@@ -816,8 +823,8 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     browser_context: BrowserContext | None = None
     access_token = bundle.access_token
     stage_started = time.perf_counter()
-    _mark(progress, "reissuing" if cross_country else "session_refresh")
     if bundle.session_token and (cross_country or not access_token):
+        _mark(progress, "reissuing" if cross_country else "session_refresh")
         try:
             await _guard_refresh_egress(exit_proxy, exit_country)
         except HTTPException:
@@ -836,8 +843,13 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         else:
             client = ChatGPTClient.from_raw_session(raw_session, proxy=exit_proxy)
         try:
-            if not cross_country and not await asyncio.to_thread(client.refresh_session):
-                raise _error(401, ErrorCode.INVALID_SESSION, "session token 刷新未获确认，已停止。")
+            if not cross_country:
+                try:
+                    refreshed = await asyncio.to_thread(client.refresh_session, reject_unauthorized=True)
+                except DomainError as exc:
+                    raise _from_domain(exc, nonteam=plan is not Plan.TEAM)
+                if not refreshed:
+                    raise _error(401, ErrorCode.INVALID_SESSION, "session token 刷新未获确认，已停止。")
             access_token = client.access_token
             if not access_token:
                 raise _error(401, ErrorCode.INVALID_SESSION, "会话刷新未返回 accessToken")
@@ -866,7 +878,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         finally:
             client.close()
             logger.info("stage_timing stage=reissue duration_ms=%.1f", (time.perf_counter() - stage_started) * 1000)
-            _mark(progress, "reissued" if cross_country else "session_refreshed")
+        _mark(progress, "reissued" if cross_country else "session_refreshed")
     else:
         if not access_token:
             raise _error(401, ErrorCode.INVALID_SESSION, "JSON 中没有 accessToken")
@@ -875,6 +887,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     view = store.view(order.id)
     view.route_profile = str(route_plan.profile)
     if route_plan.use_browser_context:
+        _mark(progress, "browser_decode")
         decode_started = time.perf_counter()
         if not browser_decode_enabled():
             if not browser_decode_fallback_a():
@@ -978,7 +991,10 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         logger.info("stage_timing stage=create_checkout duration_ms=%.1f", (time.perf_counter() - checkout_started) * 1000)
         view = store.view(order.id)
         view.failure_code = _checkout_failure_code(exc)
-        if view.failure_code in {"unusual_activity", "invalid_session"}:
+        if view.failure_code == "already_subscribed":
+            error = _error(400, ErrorCode.ALREADY_SUBSCRIBED, "该账号已有订阅，已停止建单。",
+                           session_reissued=session_reissued, diagnostics=exc.detail)
+        elif view.failure_code in {"unusual_activity", "invalid_session"}:
             # Never persist upstream prose or advice to replay a rejected session.
             invalid = view.failure_code == "invalid_session"
             error = _error(401 if invalid else 400,
