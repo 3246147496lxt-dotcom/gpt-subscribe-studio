@@ -227,7 +227,7 @@ def _forbidden_error(path: str, response: Any) -> DomainError:
 
 def _structure(payload: Any, depth: int = 0) -> Any:
     """Keys and array lengths only: enough to verify a mapping, no values."""
-    if depth >= 3:
+    if depth >= 5:
         return "..."
     if isinstance(payload, dict):
         out: Dict[str, Any] = {"type": "object", "keys": sorted(payload)[:24]}
@@ -258,7 +258,17 @@ def _request(client: ChatGPTClient, path: str, params: Optional[dict]):
         return None, status, response
     payload = _json(response)
     logger.info("account_detail_upstream path=%s status=%s structure=%s",
-                path, status, json.dumps(_structure(payload), ensure_ascii=False)[:900])
+                path, status, json.dumps(_structure(payload), ensure_ascii=False)[:1200])
+    if path == SUBSCRIPTIONS_PATH:
+        for key in ("current_billing_period", "scheduled_billing_period",
+                    "last_active_subscription", "entitlement"):
+            if isinstance(payload.get(key), (dict, list)):
+                logger.info("account_detail_sub key=%s structure=%s", key,
+                            json.dumps(_structure(payload[key]), ensure_ascii=False)[:700])
+    if path == ACCOUNTS_CHECK_PATH and isinstance(payload.get("accounts"), dict):
+        for name, item in list(payload["accounts"].items())[:2]:
+            logger.info("account_detail_account key=%s structure=%s", name,
+                        json.dumps(_structure(item), ensure_ascii=False)[:700])
     if not payload:
         logger.info("account_detail_upstream_empty path=%s", path)
     return payload, status, response
@@ -329,14 +339,20 @@ async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
     """Serial reads on one exit; parallel tunnels were rejected by the proxy."""
     proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
     account_params = {"account_id": account_id} if account_id else None
-    calls = (
+    calls = [
         ("accounts", ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),
         ("subscriptions", SUBSCRIPTIONS_PATH, account_params),
         ("invoices", INVOICES_PATH, account_params),
         ("billing_history", BILLING_HISTORY_PATH, account_params),
         ("receipts", RECEIPTS_PATH, account_params),
-    )
-    return await asyncio.to_thread(_fetch_serial, session, access_token, calls,
+    ]
+    if account_id:
+        calls.append(("account_billing",
+                      f"/backend-api/accounts/{account_id}/billing_history", None))
+        calls.append(("account_invoices",
+                      f"/backend-api/accounts/{account_id}/invoices", None))
+    calls.append(("transactions", "/backend-api/payments/transactions", account_params))
+    return await asyncio.to_thread(_fetch_serial, session, access_token, tuple(calls),
                                    proxy=proxy, timeout=timeout)
 
 
@@ -450,7 +466,8 @@ def _invoice_items(payload: Any) -> List[dict]:
 def _invoice_records(merged: Dict[str, Any]) -> List[dict]:
     """Merge every billing source, de-duplicate, newest first."""
     candidates: List[dict] = []
-    for key in ("invoices", "billing_history", "receipts"):
+    for key in ("invoices", "billing_history", "receipts", "account_billing",
+                "account_invoices", "transactions"):
         candidates.extend(_invoice_items(merged.get(key)))
     subs = merged.get("subscriptions") if isinstance(merged.get("subscriptions"), dict) else {}
     period = subs.get("current_billing_period") if isinstance(subs, dict) else None

@@ -275,6 +275,7 @@ def test_endpoints_are_queried_serially_on_one_client(monkeypatch):
         "/backend-api/payments/invoices",
         "/backend-api/payments/billing_history",
         "/backend-api/payments/receipts",
+        "/backend-api/payments/transactions",
     ]
 
 
