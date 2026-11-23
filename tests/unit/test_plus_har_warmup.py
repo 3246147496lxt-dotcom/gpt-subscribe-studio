@@ -21,7 +21,7 @@ SESSION_US = json.dumps({
 
 
 class StubClient:
-    def __init__(self, *, fail_warmup: bool = False):
+    def __init__(self, *, fail_warmup: bool = False, accounts=None):
         self.timeout = 25.0
         self.language = "en-US"
         self.timezone = "UTC"
@@ -31,12 +31,14 @@ class StubClient:
         self.session_token = "session-fixture"
         self.calls = []
         self.fail_warmup = fail_warmup
+        self.accounts = accounts
 
     def warm_exit_session(self, *, reissue: bool = True, oauth: bool = False):
         self.calls.append(("warm_exit_session", reissue, oauth))
         if self.fail_warmup:
             raise DomainError(ErrorCode.INVALID_SESSION, "预热被拒绝",
                               detail={"code": "warmup_rejected", "stage": "me"})
+        return self.accounts
 
     def close(self):
         pass
@@ -293,3 +295,24 @@ def test_missing_old_checkout_is_dropped_without_aborting():
 
     assert engine.checkout_id == ""
     assert engine.discarded_checkout_id == "oaics_gone"
+
+def test_existing_subscription_blocks_checkout_before_creation(monkeypatch):
+    stub = StubClient(accounts={"accounts": {"default": {"account": {"plan_type": "plus"}}}})
+    _install(monkeypatch, "from_raw_session", stub, [])
+    engine = build(exit_country="US")
+
+    with pytest.raises(DomainError) as caught:
+        engine._prepare()
+
+    assert caught.value.code is ErrorCode.ALREADY_SUBSCRIBED
+    assert caught.value.detail["code"] == "already_subscribed"
+    assert caught.value.detail["planType"] == "plus"
+
+
+def test_free_account_still_reaches_the_checkout_path(monkeypatch):
+    stub = StubClient(accounts={"accounts": {"default": {"account": {"plan_type": "free"}}}})
+    _install(monkeypatch, "from_raw_session", stub, [])
+    engine = build(exit_country="US")
+
+    engine._prepare()  # must not raise
+    assert engine.client is stub

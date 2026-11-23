@@ -807,6 +807,30 @@ class ChatGPTClient:
                 self.extra_cookies[str(name)] = str(value)
         self.http.headers.update(self._identity_headers())
 
+    def _sync_rotated_session_token(self, response: Any, payload: Dict[str, Any]) -> bool:
+        """Adopt a rotated sessionToken from the body or Set-Cookie, in memory only."""
+        rotated = str(payload.get("sessionToken") or payload.get("session_token") or "").strip()
+        if not rotated:
+            rotated = _session_token_from_set_cookie(response)
+        if not rotated or rotated == self.session_token:
+            return False
+        self.session_token = rotated
+        self.extra_cookies["__Secure-next-auth.session-token"] = rotated
+        jar = getattr(self.http, "cookies", None)
+        setter = getattr(jar, "set", None) if jar is not None else None
+        if callable(setter):
+            try:
+                setter("__Secure-next-auth.session-token", rotated, domain="chatgpt.com")
+            except TypeError:
+                try:
+                    setter("__Secure-next-auth.session-token", rotated)
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info("session_token_rotated")
+        return True
+
     def refresh_session(self, *, trust_statsig: bool = True, reject_unauthorized: bool = False) -> bool:
         """用当前出口 IP 请求 /api/auth/session，换取与本批次出口一致的 accessToken 与 cookie。
 
@@ -841,6 +865,9 @@ class ChatGPTClient:
             logger.warning("session 刷新失败（HTTP %s），继续用原 session", status)
             return False
         payload = _json(response)
+        # The server may rotate the session cookie even when it does not
+        # re-issue accessToken; persist it in memory before any early return.
+        self._sync_rotated_session_token(response, payload)
         token = str(payload.get("accessToken") or "").strip()
         if not token:
             # session-token 已失效时上游返回 200 + 空 accessToken。
@@ -997,7 +1024,7 @@ class ChatGPTClient:
         self.http.headers.update(self._identity_headers())
 
     def warm_exit_session(self, *, reissue: bool = True, oauth: bool = False,
-                          interval: tuple[float, float] = (1.5, 2.5)) -> None:
+                          interval: tuple[float, float] = (1.5, 2.5)) -> Optional[Dict[str, Any]]:
         """Bring an imported session up to date on the exit it will run on.
 
         Order matters: the edge handshake creates cookie state for this exit,
@@ -1021,8 +1048,8 @@ class ChatGPTClient:
             self._warm_wait(interval)
         self._warm_probe("/backend-api/me", None, stage="me")
         self._warm_wait(interval)
-        self._warm_probe(ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"},
-                         stage="accounts_check")
+        return self._warm_probe(ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"},
+                                stage="accounts_check")
 
     @staticmethod
     def _warm_wait(interval: tuple[float, float]) -> None:
@@ -1037,7 +1064,8 @@ class ChatGPTClient:
         if delay:
             time.sleep(delay)
 
-    def _warm_probe(self, path: str, params: Optional[Dict[str, str]], *, stage: str) -> None:
+    def _warm_probe(self, path: str, params: Optional[Dict[str, str]], *,
+                    stage: str) -> Dict[str, Any]:
         headers = self._route_headers(path)
         headers.update(self._identity_headers())
         try:
@@ -1068,6 +1096,7 @@ class ChatGPTClient:
                 detail=detail,
             )
         self._merge_cookies()
+        return _json(response)
 
     def mint_sentinel(self, *, flow: str, page_url: str = "") -> None:
         token = mint(
@@ -2426,6 +2455,37 @@ def _will_renew(payload: Dict[str, Any]) -> Optional[bool]:
         if isinstance(block, dict) and "will_renew" in block:
             return bool(block.get("will_renew"))
     return None
+
+
+def _session_token_from_set_cookie(response: Any) -> str:
+    """Return a rotated session token from Set-Cookie, joining chunked values."""
+    headers = getattr(response, "headers", None)
+    raw_values = []
+    getter = getattr(headers, "get_list", None)
+    if callable(getter):
+        try:
+            raw_values = list(getter("set-cookie") or [])
+        except Exception:  # noqa: BLE001
+            raw_values = []
+    if not raw_values and headers is not None:
+        try:
+            raw = headers.get("set-cookie")
+        except Exception:  # noqa: BLE001
+            raw = None
+        if raw:
+            raw_values = [raw]
+    plain = ""
+    chunks: Dict[str, str] = {}
+    for item in raw_values:
+        for match in re.finditer(r"(__Secure-next-auth\.session-token(?:\.\d+)?)=([^;]+)", str(item)):
+            name, value = match.group(1), match.group(2).strip()
+            if name.rsplit(".", 1)[-1].isdigit():
+                chunks[name] = value
+            else:
+                plain = value
+    if chunks:
+        return "".join(chunks[key] for key in sorted(chunks))
+    return plain
 
 
 def _json(response: Any) -> Dict[str, Any]:

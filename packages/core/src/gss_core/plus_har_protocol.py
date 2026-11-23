@@ -61,6 +61,7 @@ from gss_core.chatgpt import (
     _intent_object,
     _PLAN_NAME,
     _json,
+    parse_account_check,
     _log_upstream_failure,
     payment_intent_from_confirm,
     public_checkout_id,
@@ -458,6 +459,27 @@ class PlusHarProtocol:
                 detail={"code": "proxy_sid_unavailable", "stage": "prepare"},
             ) from None
 
+    def _reject_if_already_subscribed(self, accounts: Any) -> None:
+        """Stop a new-purchase attempt before /payments/checkout when the
+        account already holds an active subscription."""
+        if str(self.plan).lower() == "team":
+            return
+        if not isinstance(accounts, dict) or not accounts:
+            return
+        try:
+            parsed = parse_account_check(accounts, account_id=self.client.account_id or "")
+        except (ValueError, TypeError, KeyError):
+            logger.warning("account_check_plan_unparsed")
+            return
+        plan_type = str(parsed.get("current_plan_type") or parsed.get("subscription_plan") or "")
+        if parsed.get("is_free"):
+            return
+        raise DomainError(
+            ErrorCode.ALREADY_SUBSCRIBED,
+            "该账号当前已有有效订阅，已停止创建新订单。",
+            detail={"code": "already_subscribed", "planType": plan_type},
+        )
+
     def _note_exit_rejection(self, status: int, payload: Dict[str, Any],
                              response: Any = None) -> None:
         """Quarantine the bound exit after a risk rejection, before any retry."""
@@ -508,12 +530,13 @@ class PlusHarProtocol:
                 self.client.user_agent = self.device.ua
             if not self.read_only:
                 try:
-                    self.client.warm_exit_session(
+                    accounts = self.client.warm_exit_session(
                         oauth=bool(imported.refresh_token),
                         reissue=not self.session_reissued,
                     )
                 except DomainError as exc:
                     raise DomainError(exc.code, exc.message, detail=exc.detail) from None
+                self._reject_if_already_subscribed(accounts)
             try:
                 restore_account(self.client, self.expected_account,
                                 credentials_current=self.credentials_current)
