@@ -14,10 +14,16 @@ router = APIRouter(prefix="/api", tags=["account"])
 
 def _http(exc: DomainError) -> HTTPException:
     code = str(exc.code)
-    status = 401 if exc.code is ErrorCode.INVALID_SESSION else 502
     detail = dict(exc.detail or {})
+    wire = detail.get("code")
+    if exc.code is ErrorCode.INVALID_SESSION:
+        status = 401
+    elif wire in {"cloudflare_challenge", "upstream_forbidden"}:
+        status = 403
+    else:
+        status = 502
     return HTTPException(status, detail={
-        "code": detail.get("code") or code,
+        "code": wire or code,
         "message": exc.message,
         "detail": detail or None,
     })

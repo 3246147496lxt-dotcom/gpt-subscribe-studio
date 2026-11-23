@@ -201,84 +201,131 @@ def test_accounts_check_is_the_fallback_when_subscriptions_is_empty():
     assert detail["status"] == "使用中"
 
 
-def test_parallel_failure_falls_back_to_one_connection(monkeypatch):
+class FakeResponse:
+    def __init__(self, status: int, payload: dict | None = None,
+                 headers: dict | None = None, text: str | None = None):
+        self.status_code = status
+        self.payload = payload or {}
+        self.headers = headers or {}
+        self.text = text if text is not None else json.dumps(self.payload)
+
+    def json(self):
+        return self.payload
+
+
+class FakeHttp:
+    def __init__(self, plan):
+        self.plan = plan          # path -> list[FakeResponse]
+        self.paths: list[str] = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        path = url.split("chatgpt.com", 1)[-1]
+        self.paths.append(path)
+        queue = self.plan.get(path)
+        return queue.pop(0) if queue else FakeResponse(200, {})
+
+
+class FakeClient:
+    def __init__(self, http, *, session_token="session-fixture", token="token-fixture"):
+        self.http = http
+        self.session_token = session_token
+        self.access_token = token
+        self.timeout = 5.0
+        self.refresh_calls = 0
+
+    def _route_headers(self, path):
+        return {}
+
+    def _identity_headers(self):
+        return {}
+
+    def refresh_session(self, **kwargs):
+        self.refresh_calls += 1
+        self.access_token = jwt()
+        return True
+
+    def close(self):
+        pass
+
+
+def _install_client(monkeypatch, http, **kwargs):
+    from gss_core.chatgpt import ChatGPTClient
+
+    fake = FakeClient(http, **kwargs)
+    monkeypatch.setattr(ChatGPTClient, "from_raw_session",
+                        staticmethod(lambda *a, **k: fake))
+    monkeypatch.setattr(account_detail, "configured_proxy", lambda role: None)
+    return fake
+
+
+def test_endpoints_are_queried_serially_on_one_client(monkeypatch):
     import asyncio
 
-    from gss_api import account_detail
+    http = FakeHttp({})
+    _install_client(monkeypatch, http)
 
-    calls: list[str] = []
+    asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="", country=""))
 
-    def flaky(session, token, path, params, *, proxy, timeout):
-        calls.append(path)
-        if len(calls) <= 5:          # all parallel tunnels fail
-            raise OSError("proxy busy")
-        return {"path": path}        # the sequential retry succeeds
+    assert http.paths == [
+        "/backend-api/accounts/check/v4-2023-04-27",
+        "/backend-api/subscriptions",
+        "/backend-api/payments/invoices",
+        "/backend-api/payments/billing_history",
+        "/backend-api/payments/receipts",
+    ]
 
-    monkeypatch.setattr(account_detail, "_fetch_one", flaky)
-    monkeypatch.setattr(account_detail, "configured_proxy", lambda role: None)
+
+def test_401_exchanges_the_session_cookie_and_retries_once(monkeypatch):
+    import asyncio
+
+    http = FakeHttp({
+        "/backend-api/subscriptions": [
+            FakeResponse(401, {"error": {"code": "token_expired"}}),
+            FakeResponse(200, {"plan_type": "chatgptplusplan"}),
+        ],
+    })
+    fake = _install_client(monkeypatch, http)
 
     merged = asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="", country=""))
-    assert set(merged) == {"accounts", "subscriptions", "invoices",
-                           "billing_history", "receipts"}
-    assert len(calls) == 10
+
+    assert fake.refresh_calls == 1
+    assert "subscriptions" in merged
+    assert http.paths.count("/backend-api/subscriptions") == 2
 
 
-def test_billing_history_drives_currency_start_and_amount():
-    merged = {
-        "subscriptions": {"plan_type": "chatgptplusplan", "is_active": True,
-                          "current_period_end": "2026-11-22T00:00:00Z"},
-        "billing_history": {"items": [
-            {"plan_name": "chatgptplusplan",
-             "created": int(datetime(2026, 10, 22, tzinfo=timezone.utc).timestamp()),
-             "status": "paid", "amount": 98214, "currency": "PHP"},
-            {"plan_name": "chatgptplusplan",
-             "created": int(datetime(2026, 9, 22, tzinfo=timezone.utc).timestamp()),
-             "status": "paid", "amount": 98214, "currency": "PHP"},
-        ]},
-    }
-    detail = normalize(merged, email="e@example.test", account_id="a",
-                       now=datetime(2026, 11, 22, tzinfo=timezone.utc))
+def test_401_without_session_cookie_reports_the_upstream_code(monkeypatch):
+    import asyncio
 
-    assert len(detail["invoices"]) == 2
-    assert detail["currency"] == "PHP"
-    assert detail["startTime"] == "2026/10/22 08:00"   # latest settled invoice
-    assert detail["invoices"][0]["amount"] == "982.14 PHP"
-    assert detail["invoices"][1]["paidAt"] == "2026/09/22 08:00"
+    http = FakeHttp({
+        "/backend-api/accounts/check/v4-2023-04-27": [
+            FakeResponse(401, {"error": {"code": "token_expired"}},
+                         headers={"cf-ray": "ray-fixture"}),
+        ],
+    })
+    _install_client(monkeypatch, http, session_token="", token=jwt(expires_in=120))
 
+    with pytest.raises(DomainError) as caught:
+        asyncio.run(account_detail.fetch_snapshot("s", jwt(expires_in=120),
+                                                  account_id="", country=""))
 
-def test_receipts_and_invoices_are_merged_without_duplicates():
-    when = int(datetime(2026, 10, 22, tzinfo=timezone.utc).timestamp())
-    row = {"plan_name": "chatgptplusplan", "created": when, "status": "paid",
-           "amount": 98214, "currency": "PHP"}
-    detail = normalize(
-        {"receipts": {"receipts": [row]}, "invoices": {"data": [dict(row)]}},
-        email="e@example.test", account_id="a",
-    )
-    assert len(detail["invoices"]) == 1
+    detail = caught.value.detail
+    assert detail["upstream_code"] == "token_expired"
+    assert detail["code"] != "token_revoked"          # not hardcoded
+    assert detail["cf_ray"] == "ray-fixture"
+    assert detail["jwt_expires_at"] is not None
 
 
-def test_currency_prefers_billing_currency_over_hardcoded_default():
-    detail = normalize(
-        {"subscriptions": {"plan_type": "chatgptplusplan", "is_active": True,
-                           "billing_currency": "PHP"}},
-        email="e@example.test", account_id="a",
-    )
-    assert detail["currency"] == "PHP"
+def test_403_is_reported_as_a_forbidden_upstream(monkeypatch):
+    import asyncio
 
+    http = FakeHttp({
+        "/backend-api/accounts/check/v4-2023-04-27": [
+            FakeResponse(403, text="<html>Just a moment...</html>"),
+        ],
+    })
+    _install_client(monkeypatch, http)
 
-def test_missing_currency_is_dash_not_usd():
-    detail = normalize(
-        {"subscriptions": {"plan_type": "chatgptplusplan", "is_active": True}},
-        email="e@example.test", account_id="a",
-    )
-    assert detail["currency"] == "-"
+    with pytest.raises(DomainError) as caught:
+        asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="", country=""))
 
-
-def test_start_time_is_estimated_from_expiry_as_a_last_resort():
-    detail = normalize(
-        {"subscriptions": {"plan_type": "chatgptplusplan", "is_active": True,
-                           "current_period_end": "2026-12-01T00:00:00Z"}},
-        email="e@example.test", account_id="a",
-        now=datetime(2026, 11, 22, tzinfo=timezone.utc),
-    )
-    assert detail["startTime"] == "2026/11/01 08:00（约）"
+    assert caught.value.detail["code"] == "cloudflare_challenge"

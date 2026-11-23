@@ -120,51 +120,179 @@ def parse_credentials(session: str) -> Dict[str, str]:
 
 
 # ── upstream fan-out ──────────────────────────────────────────────────
-def _upstream_get(client: ChatGPTClient, path: str, params: Optional[dict]) -> Optional[Dict[str, Any]]:
+def _header(response: Any, name: str) -> Optional[str]:
+    headers = getattr(response, "headers", None)
+    try:
+        value = headers.get(name) if headers is not None else None
+    except Exception:  # noqa: BLE001
+        value = None
+    if value is None and headers is not None:
+        for key in getattr(headers, "keys", lambda: [])():
+            if str(key).lower() == name.lower():
+                try:
+                    value = headers[key]
+                except Exception:  # noqa: BLE001
+                    value = None
+                break
+    return str(value)[:300] if value else None
+
+
+def _safe_body(response: Any) -> str:
+    raw = str(getattr(response, "text", "") or "")[:1500]
+    return redact_sensitive(raw).replace("\n", " ").replace("\r", " ")[:800]
+
+
+def _wire_code(payload: Dict[str, Any]) -> str:
+    for block in (payload.get("error"), payload.get("detail"), payload):
+        if isinstance(block, dict):
+            value = block.get("code") or block.get("type")
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:80]
+    return ""
+
+
+def _jwt_exp(token: str) -> Optional[str]:
+    claims = _jwt_claims(token)
+    value = claims.get("exp")
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+    return None
+
+
+def _safe_headers(response: Any) -> Dict[str, str]:
+    """Headers useful for diagnosis; credentials and cookies are dropped."""
+    try:
+        items = dict(getattr(response, "headers", None) or {})
+    except Exception:  # noqa: BLE001
+        return {}
+    return {
+        str(key): redact_sensitive(str(value))[:300]
+        for key, value in items.items()
+        if str(key).lower() not in {"set-cookie", "cookie", "authorization"}
+    }
+
+
+def _log_auth_failure(path: str, response: Any) -> None:
+    logger.warning(
+        "account_detail_auth path=%s status=%s cf_ray=%s headers=%s body=%s",
+        path,
+        int(getattr(response, "status_code", 0) or 0),
+        _header(response, "cf-ray"),
+        _safe_headers(response),
+        _safe_body(response),
+    )
+
+
+def _auth_error(path: str, response: Any, client: ChatGPTClient,
+                session_token_present: bool) -> DomainError:
+    payload = _json(response)
+    wire = _wire_code(payload)
+    detail = {
+        "code": wire or "upstream_unauthorized",
+        "upstream_status": 401,
+        "upstream_code": wire or None,
+        "upstream_message": _safe_body(response)[:240],
+        "cf_ray": _header(response, "cf-ray"),
+        "www_authenticate": _header(response, "www-authenticate"),
+        "jwt_expires_at": _jwt_exp(getattr(client, "access_token", "")),
+        "session_token_present": session_token_present,
+        "path": path,
+    }
+    if wire in {"token_expired", "expired_token"}:
+        message = "accessToken 已过期，且当前 Session 无法自动续期，请重新登录。"
+    elif wire == "token_revoked":
+        message = "上游明确撤销了该 accessToken（token_revoked），请重新登录后导出新 Session。"
+    elif session_token_present:
+        message = "上游拒绝了当前 accessToken，已尝试用 Session 自动续期但仍失败。"
+    else:
+        message = "上游拒绝当前 accessToken（401），且 Session 中没有可续期的 sessionToken。"
+    return DomainError(ErrorCode.INVALID_SESSION, message, detail=detail)
+
+
+def _forbidden_error(path: str, response: Any) -> DomainError:
+    body = _safe_body(response).lower()
+    challenge = ("just a moment" in body or "cf-chl" in body
+                 or "challenge-platform" in body or "cf-challenge" in body)
+    detail = {
+        "code": "cloudflare_challenge" if challenge else "upstream_forbidden",
+        "upstream_status": 403,
+        "cf_ray": _header(response, "cf-ray"),
+        "upstream_message": _safe_body(response)[:240],
+        "path": path,
+    }
+    message = ("Cloudflare 拦截了查询请求（403 challenge），请检查出口 IP 与请求头。"
+               if challenge else "上游拒绝查询（HTTP 403）。")
+    return DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, message, detail=detail)
+
+
+def _request(client: ChatGPTClient, path: str, params: Optional[dict]):
     headers = client._route_headers(path)
     headers.update(client._identity_headers())
     response = client.http.get(APP_BASE + path, params=params, headers=headers, timeout=client.timeout)
     status = int(getattr(response, "status_code", 0) or 0)
-    if status == 401:
-        payload = _json(response)
-        wire = ""
-        for block in (payload.get("error"), payload.get("detail"), payload):
-            if isinstance(block, dict) and isinstance(block.get("code"), str):
-                wire = block["code"][:60]
-                break
-        message = ("Session 已被上游撤销（token_revoked），请重新登录后导出新 Session。"
-                   if wire == "token_revoked" else "Session 无效或已过期，请重新登录。")
-        raise DomainError(ErrorCode.INVALID_SESSION, message,
-                          detail={"code": "token_revoked" if wire == "token_revoked" else "invalid_session",
-                                  "upstream_status": status})
+    if status in {401, 403}:
+        _log_auth_failure(path, response)
+        return None, status, response
     if status == 404:
-        return None
+        return None, status, response
     if status >= 400:
         logger.info("account_detail_upstream path=%s status=%s", path, status)
-        return None
+        return None, status, response
     payload = _json(response)
-    # Keys only: values can contain billing PII and are never logged.
     logger.info("account_detail_upstream path=%s status=%s keys=%s",
                 path, status, ",".join(sorted(payload)[:14]) or "-")
     if not payload:
         logger.info("account_detail_upstream_empty path=%s", path)
-    return payload
+    return payload, status, response
 
 
-def _fetch_one(session: str, access_token: str, path: str, params: Optional[dict],
-               *, proxy: Optional[str], timeout: float) -> Optional[Dict[str, Any]]:
+def _fetch_serial(session: str, access_token: str, calls, *,
+                  proxy: Optional[str], timeout: float) -> Dict[str, Any]:
+    """One client, one exit, one device id, endpoints strictly in order.
+
+    A 401 on the first request is retried once after exchanging the session
+    cookie for a fresh access token; only a second failure is reported.
+    """
     client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
     client.access_token = access_token
     client.timeout = timeout
+    merged: Dict[str, Any] = {}
+    failures: List[str] = []
+    refreshed = False
     try:
-        return _upstream_get(client, path, params)
+        for key, path, params in calls:
+            payload, status, response = _request(client, path, params)
+            if status == 401 and not refreshed:
+                refreshed = True
+                session_token_present = bool(getattr(client, "session_token", ""))
+                if session_token_present and client.refresh_session(
+                        trust_statsig=False, reject_unauthorized=False):
+                    logger.info("account_detail_token_refreshed path=%s", path)
+                    payload, status, response = _request(client, path, params)
+            if status == 401:
+                raise _auth_error(path, response, client, bool(getattr(client, "session_token", "")))
+            if status == 403:
+                raise _forbidden_error(path, response)
+            if status == 404:
+                continue
+            if status >= 400:
+                failures.append(f"{path}:{status}")
+                continue
+            if payload:
+                merged[key] = payload
+        if failures and not merged:
+            raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                              "订阅接口暂时不可达，请稍后重试。",
+                              detail={"code": "upstream_unavailable",
+                                      "reason": failures[0][:80]})
+        return merged
     finally:
         client.close()
 
 
 async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
                          country: str, timeout: float = ORDER_HTTP_TIMEOUT_S) -> Dict[str, Any]:
-    """Fan out to the three read-only endpoints with independent clients."""
+    """Serial reads on one exit; parallel tunnels were rejected by the proxy."""
     proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
     account_params = {"account_id": account_id} if account_id else None
     calls = (
@@ -174,57 +302,8 @@ async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
         ("billing_history", BILLING_HISTORY_PATH, account_params),
         ("receipts", RECEIPTS_PATH, account_params),
     )
-    tasks = [
-        asyncio.to_thread(_fetch_one, session, access_token, path, params,
-                          proxy=proxy, timeout=timeout)
-        for _, path, params in calls
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    merged, failures = _merge(calls, results)
-    if failures and not merged:
-        # A sticky proxy may refuse three parallel tunnels. Read-only queries
-        # fall back to one connection before surfacing an error.
-        logger.info("account_detail_parallel_failed reasons=%s; retrying sequentially",
-                    ",".join(failures)[:120])
-        merged, failures = await asyncio.to_thread(
-            _run_sequential, session, access_token, calls, proxy=proxy, timeout=timeout)
-    if failures and not merged:
-        raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
-                          "订阅接口暂时不可达，请稍后重试。",
-                          detail={"code": "upstream_unavailable",
-                                  "reason": failures[0][:80]})
-    return merged
-
-
-def _merge(calls, results) -> tuple[Dict[str, Any], List[str]]:
-    merged: Dict[str, Any] = {}
-    failures: List[str] = []
-    for (key, _, _), item in zip(calls, results):
-        if isinstance(item, BaseException):
-            if isinstance(item, DomainError):
-                raise item
-            failures.append(type(item).__name__)
-            continue
-        if item is not None:
-            merged[key] = item
-    return merged, failures
-
-
-def _run_sequential(session: str, access_token: str, calls, *,
-                    proxy: Optional[str], timeout: float) -> tuple[Dict[str, Any], List[str]]:
-    merged: Dict[str, Any] = {}
-    failures: List[str] = []
-    for key, path, params in calls:
-        try:
-            item = _fetch_one(session, access_token, path, params, proxy=proxy, timeout=timeout)
-        except DomainError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            failures.append(type(exc).__name__)
-            continue
-        if item is not None:
-            merged[key] = item
-    return merged, failures
+    return await asyncio.to_thread(_fetch_serial, session, access_token, calls,
+                                   proxy=proxy, timeout=timeout)
 
 
 # ── normalization ────────────────────────────────────────────────────
