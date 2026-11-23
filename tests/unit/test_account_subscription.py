@@ -210,7 +210,7 @@ def test_parallel_failure_falls_back_to_one_connection(monkeypatch):
 
     def flaky(session, token, path, params, *, proxy, timeout):
         calls.append(path)
-        if len(calls) <= 3:          # the three parallel tunnels all fail
+        if len(calls) <= 5:          # all parallel tunnels fail
             raise OSError("proxy busy")
         return {"path": path}        # the sequential retry succeeds
 
@@ -218,5 +218,67 @@ def test_parallel_failure_falls_back_to_one_connection(monkeypatch):
     monkeypatch.setattr(account_detail, "configured_proxy", lambda role: None)
 
     merged = asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="", country=""))
-    assert set(merged) == {"accounts", "subscriptions", "invoices"}
-    assert len(calls) == 6
+    assert set(merged) == {"accounts", "subscriptions", "invoices",
+                           "billing_history", "receipts"}
+    assert len(calls) == 10
+
+
+def test_billing_history_drives_currency_start_and_amount():
+    merged = {
+        "subscriptions": {"plan_type": "chatgptplusplan", "is_active": True,
+                          "current_period_end": "2026-11-22T00:00:00Z"},
+        "billing_history": {"items": [
+            {"plan_name": "chatgptplusplan",
+             "created": int(datetime(2026, 10, 22, tzinfo=timezone.utc).timestamp()),
+             "status": "paid", "amount": 98214, "currency": "PHP"},
+            {"plan_name": "chatgptplusplan",
+             "created": int(datetime(2026, 9, 22, tzinfo=timezone.utc).timestamp()),
+             "status": "paid", "amount": 98214, "currency": "PHP"},
+        ]},
+    }
+    detail = normalize(merged, email="e@example.test", account_id="a",
+                       now=datetime(2026, 11, 22, tzinfo=timezone.utc))
+
+    assert len(detail["invoices"]) == 2
+    assert detail["currency"] == "PHP"
+    assert detail["startTime"] == "2026/10/22 08:00"   # latest settled invoice
+    assert detail["invoices"][0]["amount"] == "982.14 PHP"
+    assert detail["invoices"][1]["paidAt"] == "2026/09/22 08:00"
+
+
+def test_receipts_and_invoices_are_merged_without_duplicates():
+    when = int(datetime(2026, 10, 22, tzinfo=timezone.utc).timestamp())
+    row = {"plan_name": "chatgptplusplan", "created": when, "status": "paid",
+           "amount": 98214, "currency": "PHP"}
+    detail = normalize(
+        {"receipts": {"receipts": [row]}, "invoices": {"data": [dict(row)]}},
+        email="e@example.test", account_id="a",
+    )
+    assert len(detail["invoices"]) == 1
+
+
+def test_currency_prefers_billing_currency_over_hardcoded_default():
+    detail = normalize(
+        {"subscriptions": {"plan_type": "chatgptplusplan", "is_active": True,
+                           "billing_currency": "PHP"}},
+        email="e@example.test", account_id="a",
+    )
+    assert detail["currency"] == "PHP"
+
+
+def test_missing_currency_is_dash_not_usd():
+    detail = normalize(
+        {"subscriptions": {"plan_type": "chatgptplusplan", "is_active": True}},
+        email="e@example.test", account_id="a",
+    )
+    assert detail["currency"] == "-"
+
+
+def test_start_time_is_estimated_from_expiry_as_a_last_resort():
+    detail = normalize(
+        {"subscriptions": {"plan_type": "chatgptplusplan", "is_active": True,
+                           "current_period_end": "2026-12-01T00:00:00Z"}},
+        email="e@example.test", account_id="a",
+        now=datetime(2026, 11, 22, tzinfo=timezone.utc),
+    )
+    assert detail["startTime"] == "2026/11/01 08:00（约）"

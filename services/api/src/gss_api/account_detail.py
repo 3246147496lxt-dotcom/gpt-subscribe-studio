@@ -25,8 +25,12 @@ from gss_core.session_token import parse_session_bundle
 logger = logging.getLogger("gss.account_detail")
 
 BEIJING = timezone(timedelta(hours=8))
+# Bump when the normalized shape changes; old cache rows are ignored.
+CACHE_VERSION = 2
 SUBSCRIPTIONS_PATH = "/backend-api/subscriptions"
 INVOICES_PATH = "/backend-api/payments/invoices"
+BILLING_HISTORY_PATH = "/backend-api/payments/billing_history"
+RECEIPTS_PATH = "/backend-api/payments/receipts"
 
 _PLAN_LABELS = {
     "plus": "ChatGPT Plus",
@@ -138,7 +142,13 @@ def _upstream_get(client: ChatGPTClient, path: str, params: Optional[dict]) -> O
     if status >= 400:
         logger.info("account_detail_upstream path=%s status=%s", path, status)
         return None
-    return _json(response)
+    payload = _json(response)
+    # Keys only: values can contain billing PII and are never logged.
+    logger.info("account_detail_upstream path=%s status=%s keys=%s",
+                path, status, ",".join(sorted(payload)[:14]) or "-")
+    if not payload:
+        logger.info("account_detail_upstream_empty path=%s", path)
+    return payload
 
 
 def _fetch_one(session: str, access_token: str, path: str, params: Optional[dict],
@@ -161,6 +171,8 @@ async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
         ("accounts", ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),
         ("subscriptions", SUBSCRIPTIONS_PATH, account_params),
         ("invoices", INVOICES_PATH, account_params),
+        ("billing_history", BILLING_HISTORY_PATH, account_params),
+        ("receipts", RECEIPTS_PATH, account_params),
     )
     tasks = [
         asyncio.to_thread(_fetch_one, session, access_token, path, params,
@@ -281,26 +293,32 @@ def _plan_label(value: Any) -> str:
 
 
 def _amount(value: Any, currency: str) -> str:
-    cur = (currency or "USD").upper()
+    cur = "" if str(currency or "").strip() in {"", "-"} else str(currency).upper()
     if isinstance(value, dict):
         minor = value.get("minorUnitsAmount")
         if isinstance(minor, int) and not isinstance(minor, bool):
-            amount = Decimal(minor) / 100
+            number: Any = Decimal(minor) / 100
         else:
-            amount = value.get("amount")
-            cur = str(value.get("currency") or cur).upper()
+            number = value.get("amount")
+            if number is None:
+                number = value.get("value")
+            if value.get("currency"):
+                cur = str(value["currency"]).upper()
     else:
-        amount = value
-    if amount is None or amount == "":
+        number = value
+    if number is None or number == "":
         return "-"
     try:
-        number = Decimal(str(amount))
+        amount = Decimal(str(number))
         if not isinstance(value, dict):
-            number = number / 100 if number >= 100 and str(amount).isdigit() else number
+            text = str(number).strip()
+            # Billing endpoints report integer minor units (98214 -> 982.14).
+            if text.isdigit() and amount >= 100:
+                amount = amount / 100
     except (InvalidOperation, ValueError):
-        return f"{redact_sensitive(str(amount))[:30]} {cur}".strip()
-    quantized = number.quantize(Decimal("0.01"))
-    return f"{quantized} {cur}"
+        return f"{redact_sensitive(str(number))[:30]} {cur}".strip()
+    formatted = f"{amount.quantize(Decimal('0.01')):.2f}"
+    return f"{formatted} {cur}".strip() if cur else formatted
 
 
 def _invoice_items(payload: Any) -> List[dict]:
@@ -308,11 +326,55 @@ def _invoice_items(payload: Any) -> List[dict]:
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
         return []
-    for key in ("data", "invoices", "items", "billing_history", "results"):
+    for key in ("items", "invoices", "receipts", "data", "billing_history",
+                "results", "history", "transactions"):
         value = payload.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _invoice_records(merged: Dict[str, Any]) -> List[dict]:
+    """Merge every billing source, de-duplicate, newest first."""
+    candidates: List[dict] = []
+    for key in ("invoices", "billing_history", "receipts"):
+        candidates.extend(_invoice_items(merged.get(key)))
+    records: List[dict] = []
+    seen = set()
+    for item in candidates:
+        moment = _moment(_deep(item, ("paid_at", "created", "date", "invoice_date",
+                                      "created_at", "period_start")))
+        amount_raw = _deep(item, ("amount_paid", "total", "amount", "total_amount", "price"))
+        currency = str(_deep(item, ("currency", "currency_code")) or "").upper()
+        status_key = str(_deep(item, ("status", "payment_status")) or "").strip().lower()
+        signature = (moment.isoformat() if moment else "", str(amount_raw), currency)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        records.append({
+            "moment": moment,
+            "plan": _plan_label(_deep(item, ("plan_name", "plan", "subscription_plan",
+                                             "description", "product_name"))),
+            "status": _INVOICE_STATUS.get(status_key, "未知"),
+            "amount_raw": amount_raw,
+            "currency": currency,
+        })
+    records.sort(key=lambda row: row["moment"] or datetime.min.replace(tzinfo=timezone.utc),
+                 reverse=True)
+    return records
+
+
+def _pick_currency(records: List[dict], subs: Dict[str, Any], accounts: Dict[str, Any]) -> str:
+    # A settled invoice is the strongest evidence of the billing currency.
+    for row in records:
+        if row["currency"]:
+            return row["currency"]
+    for source in (subs, accounts):
+        value = str(_deep(source, ("billing_currency", "currency", "currency_code",
+                                   "plan_currency")) or "").upper()
+        if value:
+            return value
+    return "-"
 
 
 def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
@@ -331,8 +393,6 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
         active = not is_free
     status = "使用中" if active else ("已过期" if plan_key and not is_free else "未订阅")
 
-    start = _deep(subs, ("current_period_start", "start_date", "started_at",
-                         "subscription_start", "created_at", "created"))
     end = _deep(subs, ("current_period_end", "expires_at", "active_until",
                        "end_date", "renews_at", "expiration_time"))
     end_moment = _moment(end)
@@ -348,31 +408,38 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
                                        "payment_method_type")) or "").strip().lower()
     payment_channel = _CHANNEL_LABELS.get(channel_source, "网页支付" if not channel_source else channel_source)
 
-    invoices_raw = _invoice_items(merged.get("invoices"))
-    currency = str(_deep(subs, ("currency", "plan_currency")) or "").upper()
-    if not currency and invoices_raw:
-        currency = str(_deep(invoices_raw[0], ("currency",)) or "").upper()
-    currency = currency or "USD"
+    records = _invoice_records(merged)
+    currency = _pick_currency(records, subs, accounts)
+    invoices = [{
+        "plan": row["plan"],
+        "paidAt": to_beijing(row["moment"]) or "-",
+        "status": row["status"],
+        "amount": _amount(row["amount_raw"], row["currency"] or currency),
+    } for row in records]
 
-    invoices = []
-    for item in invoices_raw:
-        invoice_currency = str(_deep(item, ("currency",)) or currency).upper()
-        amount_value = _deep(item, ("amount_paid", "total", "amount", "total_amount", "price"))
-        invoices.append({
-            "plan": _plan_label(_deep(item, ("plan_name", "plan", "subscription_plan", "description"))),
-            "paidAt": to_beijing(_deep(item, ("paid_at", "created", "date", "invoice_date",
-                                              "created_at", "period_start"))) or "-",
-            "status": _INVOICE_STATUS.get(
-                str(_deep(item, ("status", "payment_status")) or "").strip().lower(), "未知"),
-            "amount": _amount(amount_value, invoice_currency),
-        })
+    # Start time: subscription period start, else the latest settled invoice,
+    # else a labelled one-month estimate before the expiry.
+    start_moment = _moment(_deep(subs, ("current_period_start", "start_date", "started_at",
+                                        "subscription_start", "created_at", "created")))
+    estimated = False
+    if start_moment is None:
+        start_moment = next((row["moment"] for row in records
+                             if row["status"] == "已支付" and row["moment"]), None)
+    if start_moment is None and end_moment is not None:
+        start_moment = end_moment - timedelta(days=30)
+        estimated = True
+    start_time = None
+    if start_moment is not None:
+        start_time = start_moment.astimezone(BEIJING).strftime("%Y/%m/%d %H:%M")
+        if estimated:
+            start_time += "（约）"
 
     return {
         "email": email or str(_deep(accounts, ("email",)) or ""),
         "accountId": account_id or str(_deep(accounts, ("account_id",)) or ""),
         "status": status,
         "planName": _plan_label(plan_source),
-        "startTime": to_beijing(start),
+        "startTime": start_time,
         "endTime": to_beijing(end),
         "remainingDays": remaining,
         "autoRenew": auto_renew,
@@ -380,6 +447,7 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
         "currency": currency,
         "invoices": invoices,
         "queriedAt": now.astimezone(BEIJING).strftime("%Y/%m/%d %H:%M"),
+        "cacheVersion": CACHE_VERSION,
         "cached": False,
         "stale": False,
         "warning": None,

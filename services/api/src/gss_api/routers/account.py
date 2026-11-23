@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 
 from gss_contracts.errors import DomainError, ErrorCode
 
-from ..account_detail import fetch_snapshot, normalize, parse_credentials
+from ..account_detail import CACHE_VERSION, fetch_snapshot, normalize, parse_credentials
 from ..persistence import get_db_optional
 from ..schemas import AccountSubscriptionOut, AccountSubscriptionRequest
 
@@ -38,7 +38,7 @@ async def subscription_detail(payload: AccountSubscriptionRequest) -> AccountSub
     # Cached first: a read must not spend an upstream request unless asked.
     if db is not None and key and not payload.force_refresh:
         cached = db.get_account_snapshot(key)
-        if cached:
+        if cached and cached.get("cacheVersion") == CACHE_VERSION:
             return AccountSubscriptionOut(**{**cached, "cached": True, "stale": False})
 
     try:
@@ -51,7 +51,7 @@ async def subscription_detail(payload: AccountSubscriptionRequest) -> AccountSub
     except DomainError as exc:
         if db is not None and key:
             cached = db.get_account_snapshot(key)
-            if cached and exc.code is not ErrorCode.INVALID_SESSION:
+            if cached and cached.get("cacheVersion") == CACHE_VERSION and exc.code is not ErrorCode.INVALID_SESSION:
                 return AccountSubscriptionOut(**{
                     **cached, "cached": True, "stale": True,
                     "warning": "上游暂时不可用，显示上次查询结果。",
