@@ -221,6 +221,17 @@ class Persistence:
             );
             CREATE INDEX IF NOT EXISTS idx_events_order ON order_events(order_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_events_job ON order_events(job_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS account_subscription_snapshots (
+                account_key TEXT PRIMARY KEY,
+                email TEXT,
+                account_id TEXT,
+                detail_json TEXT NOT NULL,
+                queried_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_account_snapshots_email
+                ON account_subscription_snapshots(email);
             """
         )
         for statement in (
@@ -278,6 +289,48 @@ class Persistence:
             if not isinstance(getattr(view, name, None), (bytes, bytearray))
         }
         return json.dumps(payload, ensure_ascii=False, default=str)
+
+    # -- account subscription snapshots -------------------------------------- #
+
+    def save_account_snapshot(self, account_key: str, *, email: str, account_id: str,
+                              detail: dict, queried_at: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO account_subscription_snapshots(
+                    account_key, email, account_id, detail_json, queried_at, updated_at
+                ) VALUES(?,?,?,?,?,?)
+                ON CONFLICT(account_key) DO UPDATE SET
+                    email=excluded.email,
+                    account_id=excluded.account_id,
+                    detail_json=excluded.detail_json,
+                    queried_at=excluded.queried_at,
+                    updated_at=excluded.updated_at""",
+                (account_key, email or None, account_id or None,
+                 json.dumps(detail, ensure_ascii=False), queried_at, _utcnow()),
+            )
+
+    def get_account_snapshot(self, account_key: str) -> Optional[dict]:
+        if not account_key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM account_subscription_snapshots WHERE account_key = ?",
+                (account_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            detail = json.loads(row["detail_json"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(detail, dict):
+            return None
+        return {
+            **detail,
+            "email": detail.get("email") or row["email"] or "",
+            "accountId": detail.get("accountId") or row["account_id"] or "",
+            "queriedAt": row["queried_at"] or detail.get("queriedAt"),
+        }
 
     def save_order(self, order: Order, view: "OrderView", *, account_fingerprint: Optional[str] = None) -> None:
         payload = (

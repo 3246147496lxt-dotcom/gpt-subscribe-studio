@@ -17,7 +17,7 @@ from gss_core.proxies import GatewayStore, configured_proxy
 
 from .persistence import init_db
 from .store import store
-from .routers import events, locks, orders, promo, proxies, quick_pay, saved_cards, protocol_cards
+from .routers import account, events, locks, orders, promo, proxies, quick_pay, saved_cards, protocol_cards
 
 __version__ = "0.1.0"
 
@@ -95,6 +95,7 @@ def create_app() -> FastAPI:
     app.include_router(promo.router)
     app.include_router(events.router)
     app.state.gateway_store = GatewayStore()
+    app.include_router(account.router)
     app.include_router(proxies.router)
 
     @app.get("/api/health", tags=["health"])

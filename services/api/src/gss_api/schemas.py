@@ -245,3 +245,37 @@ class QuickPayJobOut(BaseModel):
     proxy_rotations: int = 0
     proxy_last_sid: Optional[str] = None
     proxy_last_exit_ip: Optional[str] = None
+
+
+class AccountSubscriptionRequest(BaseModel):
+    """Session JSON is accepted transiently and never echoed back."""
+
+    session: str = ""
+    account_id: str = Field(default="", alias="accountId")
+    force_refresh: bool = Field(default=False, alias="forceRefresh")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AccountInvoiceOut(BaseModel):
+    plan: str
+    paidAt: str
+    status: str
+    amount: str
+
+
+class AccountSubscriptionOut(BaseModel):
+    email: str
+    accountId: str = ""
+    status: str
+    planName: str
+    startTime: Optional[str] = None
+    endTime: Optional[str] = None
+    remainingDays: Optional[int] = None
+    autoRenew: str
+    paymentChannel: str
+    currency: str
+    invoices: list[AccountInvoiceOut] = Field(default_factory=list)
+    queriedAt: str
+    cached: bool = False
+    stale: bool = False
+    warning: Optional[str] = None

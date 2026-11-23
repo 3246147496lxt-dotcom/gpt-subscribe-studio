@@ -1,11 +1,12 @@
 import { ActionIcon, Tabs, Tooltip, useComputedColorScheme, useMantineColorScheme } from "@mantine/core";
 import {
-  IconBolt, IconChevronDown, IconLogout, IconMoon, IconSun,
+  IconBolt, IconChevronDown, IconLogout, IconMoon, IconSun, IconUserCircle,
 } from "@tabler/icons-react";
 import { useCallback, useState } from "react";
 
 import { loadHistory, recordOrder } from "./api/history";
 import type { Order } from "./api/client";
+import { AccountDetailModal } from "./components/AccountDetailModal";
 import { HistoryTable } from "./components/HistoryTable";
 import { ProxySettings } from "./components/ProxySettings";
 import { OrderNew } from "./pages/OrderNew";
@@ -20,6 +21,7 @@ const helpItems = [
 export function App() {
   const [history, setHistory] = useState(loadHistory);
   const [view, setView] = useState<string | null>("quick");
+  const [accountOpen, setAccountOpen] = useState(false);
   const scheme = useComputedColorScheme("light");
   const { toggleColorScheme } = useMantineColorScheme();
   const record = useCallback((order: Order) => setHistory(recordOrder(order)), []);
@@ -45,6 +47,11 @@ export function App() {
             </button>
           </h1>
           <div className="header-tools">
+            <Tooltip label="账号详情">
+              <ActionIcon variant="default" className="theme-toggle" onClick={() => setAccountOpen(true)} aria-label="查看账号详情">
+                <IconUserCircle size={18} />
+              </ActionIcon>
+            </Tooltip>
             <Tooltip label={scheme === "dark" ? "浅色模式" : "深色模式"}>
               <ActionIcon variant="default" className="theme-toggle" onClick={toggleColorScheme} aria-label="切换主题">
                 {scheme === "dark" ? <IconSun size={17} /> : <IconMoon size={17} />}
@@ -78,6 +85,7 @@ export function App() {
           </dl>
         </details>
       </main>
+      <AccountDetailModal opened={accountOpen} onClose={() => setAccountOpen(false)} />
     </div>
   );
 }
