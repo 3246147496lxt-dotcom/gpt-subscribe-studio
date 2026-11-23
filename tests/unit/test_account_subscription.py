@@ -425,3 +425,28 @@ def test_stripe_portal_reports_a_401(monkeypatch):
         account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
     assert caught.value.code is ErrorCode.INVALID_SESSION
     assert caught.value.detail["upstream_code"] == "token_expired"
+
+
+def test_stripe_portal_finds_nested_links_after_a_405(monkeypatch):
+    http = FakeHttp({
+        "/backend-api/payments/customer_portal": [
+            FakeResponse(200, {"data": {"customer_portal_url": "https://billing.stripe.com/p/session/nested"}}),
+        ],
+    })
+    _install_client(monkeypatch, http)
+
+    result = account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
+    assert result["url"] == "https://billing.stripe.com/p/session/nested"
+
+
+def test_stripe_portal_get_is_tried_before_post(monkeypatch):
+    http = FakeHttp({
+        "/backend-api/payments/customer_portal": [
+            FakeResponse(200, {"url": "https://billing.stripe.com/p/session/get-first"}),
+        ],
+    })
+    _install_client(monkeypatch, http)
+
+    account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
+    assert http.paths[0] == "/backend-api/payments/customer_portal"
+    assert not http.paths[0].startswith("POST ")

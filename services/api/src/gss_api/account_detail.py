@@ -593,20 +593,36 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
 
 # ── Stripe billing portal ─────────────────────────────────────────────
 PORTAL_PATHS = (
+    # The GET route answers 200 while POST is 405.
+    ("GET", "/backend-api/payments/customer_portal"),
     ("POST", "/backend-api/payments/customer_portal"),
     ("POST", "/backend-api/payments/billing_portal"),
-    ("GET", "/backend-api/payments/customer_portal"),
 )
 
 
-def _portal_url(payload: Dict[str, Any]) -> str:
-    for key in ("url", "portal_url", "billing_portal_url"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.startswith("https://"):
-            return value
-    nested = payload.get("billing_portal")
-    if isinstance(nested, dict):
-        return _portal_url(nested)
+def _portal_url(payload: Any, depth: int = 0) -> str:
+    """Find the first allowed portal link anywhere in the response."""
+    if depth > 6:
+        return ""
+    if isinstance(payload, str):
+        return _safe_portal_url(payload) if payload.startswith("https://") else ""
+    if isinstance(payload, dict):
+        for key in ("url", "portal_url", "billing_portal_url", "customer_portal_url",
+                    "redirect_url", "redirect"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                safe = _safe_portal_url(value)
+                if safe:
+                    return safe
+        for value in payload.values():
+            found = _portal_url(value, depth + 1)
+            if found:
+                return found
+    if isinstance(payload, list):
+        for item in payload[:10]:
+            found = _portal_url(item, depth + 1)
+            if found:
+                return found
     return ""
 
 
@@ -616,8 +632,13 @@ def _safe_portal_url(url: str) -> str:
     except ValueError:
         return ""
     host = (parsed.hostname or "").lower()
-    allowed = (host == "chatgpt.com" or host.endswith(".chatgpt.com")
-               or host == "stripe.com" or host.endswith(".stripe.com"))
+    if host == "stripe.com" or host.endswith(".stripe.com"):
+        allowed = True
+    elif host == "chatgpt.com" or host.endswith(".chatgpt.com"):
+        # A return_url is not a portal: require a billing/portal/account path.
+        allowed = any(part in parsed.path for part in ("/billing", "/portal", "/account"))
+    else:
+        allowed = False
     return url if parsed.scheme == "https" and allowed else ""
 
 
@@ -633,7 +654,8 @@ def fetch_stripe_portal(session: str, access_token: str, *, account_id: str,
         for method, path in PORTAL_PATHS:
             headers = client._route_headers(path)
             headers.update(client._identity_headers())
-            headers["Content-Type"] = "application/json"
+            if method == "POST":
+                headers["Content-Type"] = "application/json"
             body = {"account_id": account_id} if account_id else {}
             try:
                 if method == "POST":
@@ -656,11 +678,13 @@ def fetch_stripe_portal(session: str, access_token: str, *, account_id: str,
             if status >= 400:
                 logger.info("account_detail_portal path=%s status=%s", path, status)
                 continue
-            url = _safe_portal_url(_portal_url(_json(response)))
+            payload = _json(response)
+            url = _portal_url(payload)
             if url:
                 logger.info("account_detail_portal path=%s status=%s ok", path, status)
                 return {"url": url, "source": path}
-            logger.info("account_detail_portal path=%s status=%s no_url", path, status)
+            logger.info("account_detail_portal path=%s status=%s no_url structure=%s",
+                        path, status, json.dumps(_structure(payload), ensure_ascii=False)[:700])
     finally:
         client.close()
     raise DomainError(
