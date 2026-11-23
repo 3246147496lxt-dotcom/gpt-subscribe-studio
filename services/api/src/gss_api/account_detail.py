@@ -225,6 +225,23 @@ def _forbidden_error(path: str, response: Any) -> DomainError:
     return DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, message, detail=detail)
 
 
+def _structure(payload: Any, depth: int = 0) -> Any:
+    """Keys and array lengths only: enough to verify a mapping, no values."""
+    if depth >= 3:
+        return "..."
+    if isinstance(payload, dict):
+        out: Dict[str, Any] = {"type": "object", "keys": sorted(payload)[:24]}
+        for key in ("items", "invoices", "receipts", "data", "billing_history",
+                    "accounts", "entitlement", "current_billing_period"):
+            if key in payload:
+                out[key] = _structure(payload[key], depth + 1)
+        return out
+    if isinstance(payload, list):
+        return {"type": "array", "len": len(payload),
+                "first": _structure(payload[0], depth + 1) if payload else None}
+    return type(payload).__name__
+
+
 def _request(client: ChatGPTClient, path: str, params: Optional[dict]):
     headers = client._route_headers(path)
     headers.update(client._identity_headers())
@@ -234,13 +251,14 @@ def _request(client: ChatGPTClient, path: str, params: Optional[dict]):
         _log_auth_failure(path, response)
         return None, status, response
     if status == 404:
+        logger.info("account_detail_upstream path=%s status=404", path)
         return None, status, response
     if status >= 400:
         logger.info("account_detail_upstream path=%s status=%s", path, status)
         return None, status, response
     payload = _json(response)
-    logger.info("account_detail_upstream path=%s status=%s keys=%s",
-                path, status, ",".join(sorted(payload)[:14]) or "-")
+    logger.info("account_detail_upstream path=%s status=%s structure=%s",
+                path, status, json.dumps(_structure(payload), ensure_ascii=False)[:900])
     if not payload:
         logger.info("account_detail_upstream_empty path=%s", path)
     return payload, status, response
@@ -261,14 +279,30 @@ def _fetch_serial(session: str, access_token: str, calls, *,
     refreshed = False
     try:
         for key, path, params in calls:
-            payload, status, response = _request(client, path, params)
+            try:
+                payload, status, response = _request(client, path, params)
+            except DomainError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{path}:{type(exc).__name__}")
+                logger.warning("account_detail_transport path=%s error=%s",
+                               path, type(exc).__name__)
+                continue
             if status == 401 and not refreshed:
                 refreshed = True
                 session_token_present = bool(getattr(client, "session_token", ""))
                 if session_token_present and client.refresh_session(
                         trust_statsig=False, reject_unauthorized=False):
                     logger.info("account_detail_token_refreshed path=%s", path)
-                    payload, status, response = _request(client, path, params)
+                    try:
+                        payload, status, response = _request(client, path, params)
+                    except DomainError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        failures.append(f"{path}:{type(exc).__name__}")
+                        logger.warning("account_detail_transport path=%s error=%s",
+                                       path, type(exc).__name__)
+                        continue
             if status == 401:
                 raise _auth_error(path, response, client, bool(getattr(client, "session_token", "")))
             if status == 403:
@@ -418,6 +452,11 @@ def _invoice_records(merged: Dict[str, Any]) -> List[dict]:
     candidates: List[dict] = []
     for key in ("invoices", "billing_history", "receipts"):
         candidates.extend(_invoice_items(merged.get(key)))
+    subs = merged.get("subscriptions") if isinstance(merged.get("subscriptions"), dict) else {}
+    period = subs.get("current_billing_period") if isinstance(subs, dict) else None
+    if isinstance(period, dict) and _deep(period, ("amount_paid", "total", "amount",
+                                                    "total_amount", "price")):
+        candidates.append(period)
     records: List[dict] = []
     seen = set()
     for item in candidates:
@@ -498,8 +537,9 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
 
     # Start time: subscription period start, else the latest settled invoice,
     # else a labelled one-month estimate before the expiry.
-    start_moment = _moment(_deep(subs, ("current_period_start", "start_date", "started_at",
-                                        "subscription_start", "created_at", "created")))
+    start_moment = _moment(_deep(subs, ("current_period_start", "active_start",
+                                        "start_date", "started_at", "subscription_start",
+                                        "created_at", "created")))
     estimated = False
     if start_moment is None:
         start_moment = next((row["moment"] for row in records

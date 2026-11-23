@@ -222,7 +222,10 @@ class FakeHttp:
         path = url.split("chatgpt.com", 1)[-1]
         self.paths.append(path)
         queue = self.plan.get(path)
-        return queue.pop(0) if queue else FakeResponse(200, {})
+        item = queue.pop(0) if queue else FakeResponse(200, {})
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 class FakeClient:
@@ -329,3 +332,46 @@ def test_403_is_reported_as_a_forbidden_upstream(monkeypatch):
         asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="", country=""))
 
     assert caught.value.detail["code"] == "cloudflare_challenge"
+
+
+def test_active_start_maps_to_start_time():
+    detail = normalize({
+        "subscriptions": {
+            "plan_type": "chatgptplusplan", "is_active": True,
+            "active_start": "2026-10-22T00:00:00Z",
+            "active_until": "2026-11-22T00:00:00Z",
+        },
+    }, email="e@example.test", account_id="a")
+    assert detail["startTime"] == "2026/10/22 08:00"
+    assert detail["endTime"] == "2026/11/22 08:00"
+
+
+def test_one_transport_failure_does_not_abort_the_other_endpoints(monkeypatch):
+    import asyncio
+
+    http = FakeHttp({
+        "/backend-api/accounts/check/v4-2023-04-27": [FakeResponse(200, {"accounts": {"a": 1}})],
+        "/backend-api/subscriptions": [FakeResponse(200, {"plan_type": "chatgptplusplan"})],
+        "/backend-api/payments/invoices": [OSError("connection reset")],
+    })
+    _install_client(monkeypatch, http)
+
+    merged = asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="", country=""))
+
+    assert "accounts" in merged and "subscriptions" in merged
+    assert "/backend-api/payments/receipts" in http.paths   # kept going after the failure
+
+
+def test_current_billing_period_is_used_as_a_bill_fallback():
+    when = int(datetime(2026, 10, 22, tzinfo=timezone.utc).timestamp())
+    detail = normalize({
+        "subscriptions": {
+            "plan_type": "chatgptplusplan", "is_active": True,
+            "billing_currency": "PHP",
+            "current_billing_period": {
+                "amount": 98214, "currency": "PHP", "status": "paid", "created": when,
+            },
+        },
+    }, email="e@example.test", account_id="a")
+    assert detail["currency"] == "PHP"
+    assert detail["invoices"][0]["amount"] == "982.14 PHP"
