@@ -26,7 +26,7 @@ logger = logging.getLogger("gss.account_detail")
 
 BEIJING = timezone(timedelta(hours=8))
 # Bump when the normalized shape changes; old cache rows are ignored.
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 SUBSCRIPTIONS_PATH = "/backend-api/subscriptions"
 INVOICES_PATH = "/backend-api/payments/invoices"
 BILLING_HISTORY_PATH = "/backend-api/payments/billing_history"
