@@ -279,3 +279,14 @@ class AccountSubscriptionOut(BaseModel):
     cached: bool = False
     stale: bool = False
     warning: Optional[str] = None
+
+
+class StripePortalRequest(BaseModel):
+    session: str = ""
+    account_id: str = Field(default="", alias="accountId")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class StripePortalOut(BaseModel):
+    url: str
+    source: str

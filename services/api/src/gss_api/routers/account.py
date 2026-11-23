@@ -1,13 +1,17 @@
 """Account subscription detail: cached read path plus an explicit refresh."""
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 
 from gss_contracts.errors import DomainError, ErrorCode
 
-from ..account_detail import CACHE_VERSION, fetch_snapshot, normalize, parse_credentials
+from ..account_detail import (CACHE_VERSION, fetch_snapshot, fetch_stripe_portal,
+                              normalize, parse_credentials)
 from ..persistence import get_db_optional
-from ..schemas import AccountSubscriptionOut, AccountSubscriptionRequest
+from ..schemas import (AccountSubscriptionOut, AccountSubscriptionRequest,
+                       StripePortalOut, StripePortalRequest)
 
 router = APIRouter(prefix="/api", tags=["account"])
 
@@ -69,3 +73,23 @@ async def subscription_detail(payload: AccountSubscriptionRequest) -> AccountSub
         db.save_account_snapshot(key, email=email, account_id=account_id,
                                  detail=detail, queried_at=detail["queriedAt"])
     return AccountSubscriptionOut(**detail)
+
+
+@router.post("/account/stripe-portal", response_model=StripePortalOut)
+async def stripe_portal(payload: StripePortalRequest) -> StripePortalOut:
+    try:
+        credentials = parse_credentials(payload.session)
+    except DomainError as exc:
+        raise _http(exc) from None
+    account_id = payload.account_id.strip() or credentials["account_id"]
+    try:
+        result = await asyncio.to_thread(
+            fetch_stripe_portal,
+            payload.session,
+            credentials["access_token"],
+            account_id=account_id,
+            country=credentials["session_country"] or "US",
+        )
+    except DomainError as exc:
+        raise _http(exc) from None
+    return StripePortalOut(**result)

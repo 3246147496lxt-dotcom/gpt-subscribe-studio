@@ -1,10 +1,10 @@
 import {
   Alert, Badge, Button, Group, Loader, Modal, Paper, SimpleGrid, Stack, Table, Text, Textarea, Title,
 } from "@mantine/core";
-import { IconAlertCircle, IconRefresh } from "@tabler/icons-react";
+import { IconAlertCircle, IconExternalLink, IconRefresh } from "@tabler/icons-react";
 import { useState } from "react";
 
-import { fetchAccountSubscription, type AccountSubscription } from "../api/account";
+import { fetchAccountSubscription, fetchStripePortal, type AccountSubscription } from "../api/account";
 
 interface Props {
   opened: boolean;
@@ -37,6 +37,8 @@ export function AccountDetailModal({ opened, onClose }: Props) {
   const [detail, setDetail] = useState<AccountSubscription | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [portalLoading, setPortalLoading] = useState(false);
+  const [portalError, setPortalError] = useState<string | null>(null);
 
   async function run(forceRefresh: boolean) {
     if (loading) return;
@@ -57,6 +59,24 @@ export function AccountDetailModal({ opened, onClose }: Props) {
   }
 
   const invoices = detail?.invoices ?? [];
+
+  async function openPortal() {
+    if (portalLoading) return;
+    if (!session.trim()) {
+      setPortalError("请先粘贴 Session JSON。");
+      return;
+    }
+    setPortalLoading(true);
+    setPortalError(null);
+    try {
+      const portal = await fetchStripePortal({ session: session.trim() });
+      window.open(portal.url, "_blank", "noopener,noreferrer");
+    } catch (exc) {
+      setPortalError(exc instanceof Error ? exc.message : "无法打开账单门户。");
+    } finally {
+      setPortalLoading(false);
+    }
+  }
 
   return (
     <Modal opened={opened} onClose={onClose} size="lg" title={<Title order={3}>账号详情</Title>} centered>
@@ -126,7 +146,15 @@ export function AccountDetailModal({ opened, onClose }: Props) {
             </SimpleGrid>
 
             <Stack gap="xs">
-              <Text fw={600} size="sm">历史账单</Text>
+              <Group justify="space-between" align="center">
+                <Text fw={600} size="sm">历史账单</Text>
+                <Button variant="subtle" size="xs" leftSection={<IconExternalLink size={14} />}
+                  onClick={() => void openPortal()} loading={portalLoading}
+                  disabled={!session.trim()}>
+                  打开 Stripe 官方账单明细
+                </Button>
+              </Group>
+              {portalError && <Text size="xs" c="red">{portalError}</Text>}
               {invoices.length === 0 ? (
                 <Text c="dimmed" size="sm" py="sm">暂无历史账单。</Text>
               ) : (

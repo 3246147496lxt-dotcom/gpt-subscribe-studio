@@ -227,6 +227,15 @@ class FakeHttp:
             raise item
         return item
 
+    def post(self, url, json=None, headers=None, timeout=None):
+        path = url.split("chatgpt.com", 1)[-1]
+        self.paths.append("POST " + path)
+        queue = self.plan.get(path)
+        item = queue.pop(0) if queue else FakeResponse(404, {})
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
 
 class FakeClient:
     def __init__(self, http, *, session_token="session-fixture", token="token-fixture"):
@@ -376,3 +385,43 @@ def test_current_billing_period_is_used_as_a_bill_fallback():
     }, email="e@example.test", account_id="a")
     assert detail["currency"] == "PHP"
     assert detail["invoices"][0]["amount"] == "982.14 PHP"
+
+
+def test_stripe_portal_returns_a_stripe_url(monkeypatch):
+    http = FakeHttp({
+        "/backend-api/payments/customer_portal": [
+            FakeResponse(200, {"url": "https://billing.stripe.com/p/session/abc"}),
+        ],
+    })
+    _install_client(monkeypatch, http)
+
+    result = account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
+    assert result == {"url": "https://billing.stripe.com/p/session/abc",
+                      "source": "/backend-api/payments/customer_portal"}
+
+
+def test_stripe_portal_rejects_a_foreign_redirect(monkeypatch):
+    http = FakeHttp({
+        "/backend-api/payments/customer_portal": [
+            FakeResponse(200, {"url": "https://evil.example/steal"}),
+        ],
+    })
+    _install_client(monkeypatch, http)
+
+    with pytest.raises(DomainError) as caught:
+        account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
+    assert caught.value.detail["code"] == "stripe_portal_unavailable"
+
+
+def test_stripe_portal_reports_a_401(monkeypatch):
+    http = FakeHttp({
+        "/backend-api/payments/customer_portal": [
+            FakeResponse(401, {"error": {"code": "token_expired"}}),
+        ],
+    })
+    _install_client(monkeypatch, http)
+
+    with pytest.raises(DomainError) as caught:
+        account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
+    assert caught.value.code is ErrorCode.INVALID_SESSION
+    assert caught.value.detail["upstream_code"] == "token_expired"

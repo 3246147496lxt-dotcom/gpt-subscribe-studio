@@ -50,3 +50,26 @@ export async function fetchAccountSubscription(input: AccountSubscriptionInput):
   }
   return data as AccountSubscription;
 }
+
+export interface StripePortal {
+  url: string;
+  source: string;
+}
+
+export async function fetchStripePortal(input: { session: string; accountId?: string }): Promise<StripePortal> {
+  const response = await fetch("/api/account/stripe-portal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session: input.session, accountId: input.accountId ?? "" }),
+  });
+  const data = await response.json().catch(() => null) as
+    | { detail?: { code?: string; message?: string } }
+    | StripePortal
+    | null;
+  if (!response.ok) {
+    const detail = (data as { detail?: { code?: string; message?: string } } | null)?.detail;
+    const message = detail?.message || `无法打开账单门户（HTTP ${response.status}）`;
+    throw new Error(detail?.code ? `${message}（${detail.code}）` : message);
+  }
+  return data as StripePortal;
+}

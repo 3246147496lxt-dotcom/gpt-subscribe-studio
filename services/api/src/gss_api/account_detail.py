@@ -14,6 +14,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.chatgpt import ACCOUNTS_CHECK_PATH, APP_BASE, ChatGPTClient, _json
@@ -588,3 +589,82 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
         "stale": False,
         "warning": None,
     }
+
+
+# ── Stripe billing portal ─────────────────────────────────────────────
+PORTAL_PATHS = (
+    ("POST", "/backend-api/payments/customer_portal"),
+    ("POST", "/backend-api/payments/billing_portal"),
+    ("GET", "/backend-api/payments/customer_portal"),
+)
+
+
+def _portal_url(payload: Dict[str, Any]) -> str:
+    for key in ("url", "portal_url", "billing_portal_url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.startswith("https://"):
+            return value
+    nested = payload.get("billing_portal")
+    if isinstance(nested, dict):
+        return _portal_url(nested)
+    return ""
+
+
+def _safe_portal_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    host = (parsed.hostname or "").lower()
+    allowed = (host == "chatgpt.com" or host.endswith(".chatgpt.com")
+               or host == "stripe.com" or host.endswith(".stripe.com"))
+    return url if parsed.scheme == "https" and allowed else ""
+
+
+def fetch_stripe_portal(session: str, access_token: str, *, account_id: str,
+                        country: str, timeout: float = ORDER_HTTP_TIMEOUT_S) -> Dict[str, str]:
+    """Create a Stripe customer-portal session on the bound exit."""
+    proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
+    client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
+    client.access_token = access_token
+    client.timeout = timeout
+    attempts = []
+    try:
+        for method, path in PORTAL_PATHS:
+            headers = client._route_headers(path)
+            headers.update(client._identity_headers())
+            headers["Content-Type"] = "application/json"
+            body = {"account_id": account_id} if account_id else {}
+            try:
+                if method == "POST":
+                    response = client.http.post(APP_BASE + path, json=body, headers=headers,
+                                                timeout=timeout)
+                else:
+                    response = client.http.get(APP_BASE + path, params=body or None,
+                                               headers=headers, timeout=timeout)
+            except DomainError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(f"{path}:{type(exc).__name__}")
+                continue
+            status = int(getattr(response, "status_code", 0) or 0)
+            attempts.append(f"{path}:{status}")
+            if status == 401:
+                raise _auth_error(path, response, client, bool(getattr(client, "session_token", "")))
+            if status == 403:
+                raise _forbidden_error(path, response)
+            if status >= 400:
+                logger.info("account_detail_portal path=%s status=%s", path, status)
+                continue
+            url = _safe_portal_url(_portal_url(_json(response)))
+            if url:
+                logger.info("account_detail_portal path=%s status=%s ok", path, status)
+                return {"url": url, "source": path}
+            logger.info("account_detail_portal path=%s status=%s no_url", path, status)
+    finally:
+        client.close()
+    raise DomainError(
+        ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+        "未能获取 Stripe 账单门户链接，请稍后重试。",
+        detail={"code": "stripe_portal_unavailable", "attempts": attempts[-4:]},
+    )
