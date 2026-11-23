@@ -168,6 +168,23 @@ async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
         for _, path, params in calls
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
+    merged, failures = _merge(calls, results)
+    if failures and not merged:
+        # A sticky proxy may refuse three parallel tunnels. Read-only queries
+        # fall back to one connection before surfacing an error.
+        logger.info("account_detail_parallel_failed reasons=%s; retrying sequentially",
+                    ",".join(failures)[:120])
+        merged, failures = await asyncio.to_thread(
+            _run_sequential, session, access_token, calls, proxy=proxy, timeout=timeout)
+    if failures and not merged:
+        raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                          "订阅接口暂时不可达，请稍后重试。",
+                          detail={"code": "upstream_unavailable",
+                                  "reason": failures[0][:80]})
+    return merged
+
+
+def _merge(calls, results) -> tuple[Dict[str, Any], List[str]]:
     merged: Dict[str, Any] = {}
     failures: List[str] = []
     for (key, _, _), item in zip(calls, results):
@@ -178,11 +195,24 @@ async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
             continue
         if item is not None:
             merged[key] = item
-    if failures and not merged:
-        raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
-                          "订阅接口暂时不可达，请稍后重试。",
-                          detail={"code": "upstream_unavailable", "reason": failures[0]})
-    return merged
+    return merged, failures
+
+
+def _run_sequential(session: str, access_token: str, calls, *,
+                    proxy: Optional[str], timeout: float) -> tuple[Dict[str, Any], List[str]]:
+    merged: Dict[str, Any] = {}
+    failures: List[str] = []
+    for key, path, params in calls:
+        try:
+            item = _fetch_one(session, access_token, path, params, proxy=proxy, timeout=timeout)
+        except DomainError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            failures.append(type(exc).__name__)
+            continue
+        if item is not None:
+            merged[key] = item
+    return merged, failures
 
 
 # ── normalization ────────────────────────────────────────────────────

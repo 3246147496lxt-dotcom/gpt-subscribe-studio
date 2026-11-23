@@ -199,3 +199,24 @@ def test_accounts_check_is_the_fallback_when_subscriptions_is_empty():
     assert detail["accountId"] == "acc-fixture"
     assert detail["planName"] == "ChatGPT Plus"
     assert detail["status"] == "使用中"
+
+
+def test_parallel_failure_falls_back_to_one_connection(monkeypatch):
+    import asyncio
+
+    from gss_api import account_detail
+
+    calls: list[str] = []
+
+    def flaky(session, token, path, params, *, proxy, timeout):
+        calls.append(path)
+        if len(calls) <= 3:          # the three parallel tunnels all fail
+            raise OSError("proxy busy")
+        return {"path": path}        # the sequential retry succeeds
+
+    monkeypatch.setattr(account_detail, "_fetch_one", flaky)
+    monkeypatch.setattr(account_detail, "configured_proxy", lambda role: None)
+
+    merged = asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="", country=""))
+    assert set(merged) == {"accounts", "subscriptions", "invoices"}
+    assert len(calls) == 6

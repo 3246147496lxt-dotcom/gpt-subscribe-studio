@@ -44,8 +44,9 @@ export async function fetchAccountSubscription(input: AccountSubscriptionInput):
     | AccountSubscription
     | null;
   if (!response.ok) {
-    const detail = (data as { detail?: { message?: string } } | null)?.detail;
-    throw new Error(detail?.message || `查询失败（HTTP ${response.status}）`);
+    const detail = (data as { detail?: { code?: string; message?: string } } | null)?.detail;
+    const message = detail?.message || `查询失败（HTTP ${response.status}）`;
+    throw new Error(detail?.code ? `${message}（${detail.code}）` : message);
   }
   return data as AccountSubscription;
 }
