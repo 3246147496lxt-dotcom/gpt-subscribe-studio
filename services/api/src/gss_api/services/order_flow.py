@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from gss_contracts.errors import DomainError, ErrorCode, UpstreamFailureCode
 from gss_core.chatgpt import ChatGPTClient
 from gss_core.checkout_diagnostics import safe_checkout_diagnostics
+from gss_core.config import use_fake_adapters
 from gss_core.redaction import redact_sensitive
 
 from ..schemas import BillingIn, OrderCreateRequest, QuickPayRequest
