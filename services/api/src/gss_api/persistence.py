@@ -237,6 +237,29 @@ class Persistence:
             );
             CREATE INDEX IF NOT EXISTS idx_account_snapshots_email
                 ON account_subscription_snapshots(email);
+
+            CREATE TABLE IF NOT EXISTS portal_users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_login_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS portal_tasks (
+                job_id TEXT PRIMARY KEY,
+                owner_user_id TEXT,
+                guest_token_hash TEXT,
+                guest_expires_at TEXT,
+                masked_email TEXT,
+                plan TEXT NOT NULL,
+                exit_country TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_portal_tasks_user
+                ON portal_tasks(owner_user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_portal_tasks_guest
+                ON portal_tasks(guest_token_hash, created_at DESC);
             """
         )
         for statement in (
@@ -1089,11 +1112,187 @@ class Persistence:
             for row in rows
         ]
 
+    # -- portal users & scoped customer tasks ------------------------------- #
+    def create_portal_user(self, *, user_id: str, username: str, password_hash: str) -> Optional[dict[str, Any]]:
+        now = _utcnow()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    """INSERT INTO portal_users(id, username, password_hash, created_at, last_login_at)
+                       VALUES(?,?,?,?,?)""",
+                    (user_id, username, password_hash, now, now),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                self._conn.rollback()
+                return None
+        return {"id": user_id, "username": username, "created_at": now, "last_login_at": now}
+
+    def get_portal_user_by_username(self, username: str) -> Optional[dict[str, Any]]:
+        if not username:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM portal_users WHERE username = ?", (username,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_portal_user_by_id(self, user_id: str) -> Optional[dict[str, Any]]:
+        if not user_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, username, created_at, last_login_at FROM portal_users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def touch_portal_user_login(self, user_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE portal_users SET last_login_at = ? WHERE id = ?",
+                (_utcnow(), user_id),
+            )
+
+    def bind_portal_task(
+        self,
+        *,
+        job_id: str,
+        owner_user_id: Optional[str],
+        guest_token_hash: Optional[str],
+        guest_expires_at: Optional[str],
+        masked_email: str,
+        plan: str,
+        exit_country: str,
+    ) -> None:
+        now = _utcnow()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO portal_tasks(
+                    job_id, owner_user_id, guest_token_hash, guest_expires_at,
+                    masked_email, plan, exit_country, created_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    owner_user_id = COALESCE(portal_tasks.owner_user_id, excluded.owner_user_id),
+                    guest_token_hash = COALESCE(portal_tasks.guest_token_hash, excluded.guest_token_hash),
+                    guest_expires_at = COALESCE(portal_tasks.guest_expires_at, excluded.guest_expires_at),
+                    masked_email = CASE WHEN COALESCE(portal_tasks.masked_email,'')='' THEN excluded.masked_email ELSE portal_tasks.masked_email END""",
+                (
+                    job_id,
+                    owner_user_id or None,
+                    guest_token_hash or None,
+                    guest_expires_at or None,
+                    masked_email or None,
+                    plan,
+                    exit_country or None,
+                    now,
+                ),
+            )
+
+    def claim_guest_tasks(self, *, guest_token_hash: str, user_id: str) -> int:
+        if not guest_token_hash or not user_id:
+            return 0
+        now = _utcnow()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """UPDATE portal_tasks
+                   SET owner_user_id = ?
+                   WHERE guest_token_hash = ?
+                     AND owner_user_id IS NULL
+                     AND (guest_expires_at IS NULL OR guest_expires_at >= ?)""",
+                (user_id, guest_token_hash, now),
+            )
+            return int(cur.rowcount or 0)
+
+    def get_portal_task_ownership(
+        self,
+        job_id: str,
+        *,
+        owner_user_id: Optional[str],
+        guest_token_hash: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        if not job_id or (not owner_user_id and not guest_token_hash):
+            return None
+        now = _utcnow()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM portal_tasks WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        rec = dict(row)
+        if owner_user_id and rec.get("owner_user_id") == owner_user_id:
+            return rec
+        if (
+            guest_token_hash
+            and rec.get("guest_token_hash") == guest_token_hash
+            and (not rec.get("guest_expires_at") or str(rec["guest_expires_at"]) >= now)
+        ):
+            return rec
+        return None
+
+    def list_portal_tasks(
+        self,
+        *,
+        owner_user_id: Optional[str],
+        guest_token_hash: Optional[str],
+        search: str = "",
+        limit: int = 10,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not owner_user_id and not guest_token_hash:
+            return [], 0
+        capped = max(1, min(int(limit), 50))
+        skip = max(0, int(offset))
+        now = _utcnow()
+        owner_clauses: list[str] = []
+        params: list[Any] = []
+        if owner_user_id:
+            owner_clauses.append("t.owner_user_id = ?")
+            params.append(owner_user_id)
+        if guest_token_hash:
+            owner_clauses.append("(t.guest_token_hash = ? AND (t.guest_expires_at IS NULL OR t.guest_expires_at >= ?))")
+            params.extend([guest_token_hash, now])
+        clauses = ["(" + " OR ".join(owner_clauses) + ")"]
+        q = (search or "").strip()
+        if q:
+            like = f"%{q}%"
+            clauses.append(
+                "(COALESCE(t.masked_email,'') LIKE ? OR t.plan LIKE ? OR t.job_id LIKE ? OR COALESCE(j.order_id,'') LIKE ?)"
+            )
+            params.extend([like, like, like, like])
+        where_sql = "WHERE " + " AND ".join(clauses)
+        with self._lock:
+            total = int(
+                self._conn.execute(
+                    f"""SELECT COUNT(*)
+                        FROM portal_tasks t
+                        LEFT JOIN quick_pay_jobs j ON j.id = t.job_id
+                        {where_sql}""",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = self._conn.execute(
+                f"""SELECT t.job_id, t.masked_email, t.plan, t.exit_country, t.created_at,
+                           j.status, j.stage, j.order_id, j.amount, j.currency,
+                           j.failure_code, j.message, j.finished_at, j.updated_at,
+                           o.auto_renew_status, o.auto_renew_canceled_at, o.auto_renew_error,
+                           o.payment_status, o.delivery_status
+                    FROM portal_tasks t
+                    LEFT JOIN quick_pay_jobs j ON j.id = t.job_id
+                    LEFT JOIN orders o ON o.id = j.order_id
+                    {where_sql}
+                    ORDER BY t.created_at DESC
+                    LIMIT ? OFFSET ?""",
+                [*params, capped, skip],
+            ).fetchall()
+        return [dict(row) for row in rows], total
+
     def clear_all(self) -> None:
         """Test/reset helper; never called by a live request path."""
         with self._lock:
-            for table in ("order_events", "account_locks", "idempotency_keys",
-                          "quick_pay_jobs", "orders"):
+            for table in ("portal_tasks", "portal_users", "order_events", "account_locks",
+                          "idempotency_keys", "quick_pay_jobs", "orders"):
                 self._conn.execute(f"DELETE FROM {table}")
             self._conn.commit()
 

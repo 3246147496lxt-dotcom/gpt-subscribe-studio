@@ -19,7 +19,7 @@ from gss_core.proxies import GatewayStore, configured_proxy
 from .persistence import init_db
 from .store import store
 from .routers import (
-    account, events, locks, orders, promo, proxies, quick_pay, saved_cards,
+    account, events, locks, orders, promo, proxies, public_portal, quick_pay, saved_cards,
     protocol_cards, runtime_flags as runtime_flags_router,
     system as system_router, webhooks as webhooks_router,
 )
@@ -98,7 +98,19 @@ def create_app() -> FastAPI:
         private_create = (
             path == "/api/orders"
             or path.startswith("/api/orders/")
-            or path in {"/api/payments/quick-pay", "/api/payments/preflight", "/api/payments/preflight/batch"}
+            or path in {
+                "/api/payments/quick-pay",
+                "/api/payments/preflight",
+                "/api/payments/preflight/batch",
+                "/api/public/quick-pay",
+                "/api/public/account/subscription-detail",
+                "/api/public/account/billing-history",
+                "/api/public/account/stripe-portal",
+                "/api/public/account/cancel-auto-renew",
+                "/api/public/auth/login",
+                "/api/public/auth/register",
+            }
+            or (path.startswith("/api/public/tasks/") and path.endswith("/cancel-auto-renew"))
         )
         if request.method == "POST" and private_create:
             return JSONResponse(status_code=422, content={"detail": {
@@ -118,6 +130,8 @@ def create_app() -> FastAPI:
     app.include_router(runtime_flags_router.router)
     app.include_router(webhooks_router.router)
     app.include_router(system_router.router)
+    app.include_router(public_portal.router)
+    app.include_router(public_portal.admin_router)
 
     @app.get("/api/health", tags=["health"])
     async def health() -> dict:

@@ -29,7 +29,7 @@ logger = logging.getLogger("gss.account_detail")
 
 BEIJING = timezone(timedelta(hours=8))
 # Bump when the normalized shape changes; old cache rows are ignored.
-CACHE_VERSION = 4
+CACHE_VERSION = 7
 SUBSCRIPTIONS_PATH = "/backend-api/subscriptions"
 INVOICES_PATH = "/backend-api/payments/invoices"
 BILLING_HISTORY_PATH = "/backend-api/payments/billing_history"
@@ -290,7 +290,8 @@ def _request(client: ChatGPTClient, path: str, params: Optional[dict]):
 
 
 def _fetch_serial(session: str, access_token: str, calls, *,
-                  account_id: str = "", proxy: Optional[str], timeout: float) -> Dict[str, Any]:
+                  account_id: str = "", proxy: Optional[str], timeout: float,
+                  include_invoices: bool = True) -> Dict[str, Any]:
     """One client, one exit, one device id, endpoints strictly in order.
 
     A 401 on the first request is retried once after exchanging the session
@@ -348,6 +349,10 @@ def _fetch_serial(session: str, access_token: str, calls, *,
                               "订阅接口暂时不可达，请稍后重试。",
                               detail={"code": "upstream_unavailable",
                                       "reason": failures[0][:80]})
+        if not include_invoices:
+            if _should_fetch_portal_invoices(merged):
+                merged["_portal_meta"] = {"attempted": False, "stage": "deferred", "has_portal": True}
+            return merged
         if _should_fetch_portal_invoices(merged):
             resolved_account_id = account_id or str(_deep(merged.get("accounts"), ("account_id",)) or "")
             try:
@@ -359,7 +364,9 @@ def _fetch_serial(session: str, access_token: str, calls, *,
                 merged["_portal_meta"] = {"attempted": True, "stage": "portal_error", "has_portal": False}
             else:
                 if portal_url:
-                    portal_items, stage = fetch_portal_invoices(portal_url, proxy=proxy, timeout=timeout)
+                    portal_items, stage = fetch_portal_invoices(
+                        portal_url, proxy=proxy, timeout=max(float(timeout), 25.0),
+                    )
                     if portal_items:
                         merged["portal_invoices"] = portal_items
                     merged["_portal_meta"] = {"attempted": True, "stage": stage, "has_portal": True}
@@ -368,6 +375,140 @@ def _fetch_serial(session: str, access_token: str, calls, *,
         return merged
     finally:
         client.close()
+
+
+async def fetch_basic_snapshot(session: str, access_token: str, *, account_id: str,
+                               country: str, timeout: float = ORDER_HTTP_TIMEOUT_S) -> Dict[str, Any]:
+    """Fast phase-1 read: only accounts/check + subscriptions (~1-2s), deferring portal invoices."""
+    proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
+    account_params = {"account_id": account_id} if account_id else None
+    calls = (
+        ("accounts", ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),
+        ("subscriptions", SUBSCRIPTIONS_PATH, account_params),
+    )
+    return await asyncio.to_thread(
+        _fetch_serial,
+        session,
+        access_token,
+        calls,
+        account_id=account_id,
+        proxy=proxy,
+        timeout=timeout,
+        include_invoices=False,
+    )
+
+
+def _fetch_billing_history_sync(
+    session: str,
+    access_token: str,
+    *,
+    account_id: str,
+    country: str,
+    default_plan: str,
+    fallback_currency: str,
+    timeout: float,
+) -> Dict[str, Any]:
+    proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
+    retry_proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
+    client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
+    client.access_token = access_token
+    client.timeout = min(float(timeout), 20.0)
+    try:
+        portal_url, _source, _attempts = _request_portal_url(
+            client, account_id, min(float(timeout), 20.0), allow_refresh=True,
+        )
+    finally:
+        client.close()
+
+    if not portal_url:
+        return {
+            "invoices": [],
+            "billingSource": "none",
+            "billingNote": "未获取到该账号的 Stripe 账单门户（可能是免费、团队或非 Stripe 渠道订阅）。",
+            "currency": fallback_currency or "-",
+            "retryable": False,
+            "verified": False,
+        }
+
+    portal_items, stage = fetch_portal_invoices(
+        portal_url, proxy=proxy, retry_proxy=retry_proxy, timeout=max(float(timeout), 25.0),
+    )
+    if portal_items:
+        records = _invoice_records({"portal_invoices": portal_items}, default_plan=default_plan)
+        currency = _pick_currency(records, {}, {})
+        if currency == "-" and fallback_currency:
+            currency = fallback_currency
+        invoices = [{
+            "plan": row["plan"],
+            "paidAt": to_beijing(row["moment"]) or "-",
+            "status": row["status"],
+            "amount": _amount(
+                row["amount_raw"],
+                row["currency"] or currency,
+                amount_unit=row.get("amount_unit", ""),
+            ),
+            "invoiceId": row.get("invoice_id") or None,
+            "invoiceUrl": row.get("invoice_url"),
+        } for row in records[:20]]
+        return {
+            "invoices": invoices,
+            "billingSource": "stripe_portal",
+            "billingNote": None,
+            "currency": currency,
+            "retryable": False,
+            "verified": True,
+        }
+
+    if stage == "browser_verified_empty":
+        return {
+            "invoices": [],
+            "billingSource": "stripe_portal_empty",
+            "billingNote": "Stripe 官方账单门户当前暂无历史账单记录（如免费试用或尚未出账）。",
+            "currency": fallback_currency or "-",
+            "retryable": False,
+            "verified": True,
+        }
+
+    if stage == "browser_disabled":
+        return {
+            "invoices": [],
+            "billingSource": "stripe_portal_empty",
+            "billingNote": "已关闭自动抓取 Stripe 门户页面，可点击右上角「打开 Stripe 官方账单明细」查看。",
+            "currency": fallback_currency or "-",
+            "retryable": False,
+            "verified": False,
+        }
+
+    return {
+        "invoices": [],
+        "billingSource": "stripe_portal_timeout",
+        "billingNote": "官方账单门户加载超时（出口代理波动），可点击「重试读取账单」或右上角直接打开官方门户。",
+        "currency": fallback_currency or "-",
+        "retryable": True,
+        "verified": False,
+    }
+
+
+async def fetch_billing_history(
+    session: str,
+    access_token: str,
+    *,
+    account_id: str,
+    country: str,
+    default_plan: str = "",
+    fallback_currency: str = "",
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(
+        _fetch_billing_history_sync,
+        session,
+        access_token,
+        account_id=account_id,
+        country=country,
+        default_plan=default_plan,
+        fallback_currency=fallback_currency,
+        timeout=timeout,
+    )
 
 
 async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
@@ -601,6 +742,7 @@ def _invoice_records(merged: Dict[str, Any], *, default_plan: str = "") -> List[
         amount_raw = _deep(item, ("amount_paid", "total", "amount", "total_amount", "price"))
         currency = str(_deep(item, ("currency", "currency_code")) or "").upper()
         status_key = str(_deep(item, ("status", "payment_status")) or "").strip().lower()
+        invoice_id = str(item.get("id") or item.get("invoice_id") or item.get("number") or "").strip() or None
         invoice_url = safe_invoice_url(
             item.get("invoice_url") or item.get("hosted_invoice_url") or item.get("invoice_pdf")
         )
@@ -609,6 +751,8 @@ def _invoice_records(merged: Dict[str, Any], *, default_plan: str = "") -> List[
             existing = records[seen[signature]]
             if invoice_url and not existing.get("invoice_url"):
                 existing["invoice_url"] = invoice_url
+            if invoice_id and not existing.get("invoice_id"):
+                existing["invoice_id"] = invoice_id
             continue
         seen[signature] = len(records)
         raw_plan = _deep(item, ("plan_name", "plan", "subscription_plan",
@@ -620,6 +764,7 @@ def _invoice_records(merged: Dict[str, Any], *, default_plan: str = "") -> List[
             "amount_raw": amount_raw,
             "amount_unit": str(item.get("amount_unit") or ""),
             "currency": currency,
+            "invoice_id": invoice_id,
             "invoice_url": invoice_url,
             "source": source,
         })
@@ -663,6 +808,8 @@ def _billing_meta(
         )
     if status == "未订阅" and is_free and not portal_meta.get("attempted"):
         return "none", "当前为免费账号，暂无付费账单记录。"
+    if portal_meta.get("stage") == "deferred":
+        return "loading", None
     if portal_meta.get("attempted"):
         stage = str(portal_meta.get("stage") or "")
         if stage == "browser_disabled":
@@ -670,10 +817,10 @@ def _billing_meta(
                 "stripe_portal_empty",
                 "已关闭自动抓取 Stripe 门户页面，可点击右上角「打开 Stripe 官方账单明细」查看。",
             )
-        if stage in {"browser_unavailable", "browser_error"}:
+        if stage in {"browser_unavailable", "browser_error", "browser_timeout"}:
             return (
-                "stripe_portal_empty",
-                "ChatGPT 上游未开放账单明细接口，自动读取 Stripe 门户失败，请点击右上角「打开 Stripe 官方账单明细」查看。",
+                "stripe_portal_timeout",
+                "官方账单门户加载超时（出口代理波动），请点击重试或点击右上角「打开 Stripe 官方账单明细」查看。",
             )
         if stage in {"no_portal_url", "portal_error"}:
             return (
@@ -713,7 +860,12 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
 
     cancel = _as_bool(_deep(subs, ("cancel_at_period_end", "cancel_at_period_end_on")))
     will_renew = _as_bool(_deep(subs, ("will_renew", "auto_renew", "renews")))
-    auto_renew = "已关闭" if (cancel is True or will_renew is False) else "已开启"
+    cancels_at = _deep(subs, ("cancels_at",))
+    auto_renew = (
+        "已关闭"
+        if (cancel is True or will_renew is False or (bool(cancels_at) and will_renew is not True))
+        else "已开启"
+    )
 
     payment_channel = _channel_label(subs, accounts)
 
@@ -730,8 +882,9 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
             row["currency"] or currency,
             amount_unit=row.get("amount_unit", ""),
         ),
+        "invoiceId": row.get("invoice_id") or None,
         "invoiceUrl": row.get("invoice_url"),
-    } for row in records]
+    } for row in records[:20]]
     billing_source, billing_note = _billing_meta(
         records,
         payment_channel=payment_channel,
@@ -815,6 +968,10 @@ def _portal_url(payload: Any, depth: int = 0) -> str:
     return ""
 
 
+_OPENAI_PORTAL_HOSTS = frozenset({"pay.openai.com", "billing.openai.com", "invoice.openai.com"})
+_PORTAL_PATH_HINTS = ("/billing", "/portal", "/account", "/p/session", "/payments")
+
+
 def _safe_portal_url(url: str) -> str:
     try:
         parsed = urlsplit(url)
@@ -823,12 +980,59 @@ def _safe_portal_url(url: str) -> str:
     host = (parsed.hostname or "").lower()
     if host == "stripe.com" or host.endswith(".stripe.com"):
         allowed = True
-    elif host == "chatgpt.com" or host.endswith(".chatgpt.com"):
+    elif host in _OPENAI_PORTAL_HOSTS:
+        allowed = True
+    elif (
+        host == "chatgpt.com"
+        or host.endswith(".chatgpt.com")
+        or host == "openai.com"
+        or host.endswith(".openai.com")
+    ):
         # A return_url is not a portal: require a billing/portal/account path.
-        allowed = any(part in parsed.path for part in ("/billing", "/portal", "/account"))
+        allowed = any(part in parsed.path for part in _PORTAL_PATH_HINTS)
     else:
         allowed = False
     return url if parsed.scheme == "https" and allowed else ""
+
+
+def _safe_url_hint(payload: Any) -> Dict[str, Any]:
+    """Non-secret diagnostic summary of the candidate URL field (never logs tokens)."""
+    if not isinstance(payload, dict):
+        return {"type": type(payload).__name__}
+    candidate = None
+    found_key = ""
+    for key in ("url", "portal_url", "billing_portal_url", "customer_portal_url",
+                "redirect_url", "redirect"):
+        if key in payload:
+            found_key = key
+            candidate = payload.get(key)
+            break
+    if not found_key:
+        return {"key": None}
+    if candidate is None:
+        return {"key": found_key, "type": "NoneType"}
+    if not isinstance(candidate, str):
+        return {"key": found_key, "type": type(candidate).__name__}
+    text = candidate.strip()
+    if not text:
+        return {"key": found_key, "type": "empty_str"}
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return {"key": found_key, "type": "invalid_url"}
+    segments: List[str] = []
+    for seg in [s for s in parsed.path.split("/") if s][:2]:
+        if len(seg) <= 20 and re.fullmatch(r"[A-Za-z-]+", seg):
+            segments.append(seg)
+        else:
+            segments.append("<id>")
+    return {
+        "key": found_key,
+        "type": "str",
+        "scheme": parsed.scheme or "",
+        "host": (parsed.hostname or "").lower(),
+        "path_prefix": "/" + "/".join(segments) if segments else "/",
+    }
 
 
 def _request_portal_url(
@@ -879,10 +1083,16 @@ def _request_portal_url(
             payload = _json(response)
             url = _portal_url(payload)
             if url:
-                logger.info("account_detail_portal path=%s status=%s ok", path, status)
+                host = (urlsplit(url).hostname or "").lower()
+                logger.info("account_detail_portal path=%s status=%s ok host=%s", path, status, host)
                 return url, path, attempts
-            logger.info("account_detail_portal path=%s status=%s no_url structure=%s",
-                        path, status, json.dumps(_structure(payload), ensure_ascii=False)[:700])
+            logger.info(
+                "account_detail_portal path=%s status=%s no_url url_hint=%s structure=%s",
+                path,
+                status,
+                json.dumps(_safe_url_hint(payload), ensure_ascii=False),
+                json.dumps(_structure(payload), ensure_ascii=False)[:700],
+            )
             break
     return "", "", attempts
 

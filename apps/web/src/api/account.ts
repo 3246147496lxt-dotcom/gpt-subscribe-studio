@@ -5,6 +5,7 @@ export interface AccountInvoice {
   paidAt: string;
   status: string;
   amount: string;
+  invoiceId?: string | null;
   invoiceUrl?: string | null;
 }
 

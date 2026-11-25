@@ -497,7 +497,31 @@ async def _cancel_auto_renew(job: QuickPayJob, *, order_id: str, plan: str) -> N
             return
         except Exception as exc:  # noqa: BLE001
             last_error = _safe_message(exc)
-            if "未配置" in last_error or "Session" in last_error:
+            if "未配置" in last_error:
+                try:
+                    from ..auto_renew import cancel_account_auto_renew
+                    portal_res = await asyncio.to_thread(
+                        cancel_account_auto_renew,
+                        secrets.session,
+                        plan=plan_type,
+                        proxy=secrets.proxy,
+                    )
+                    if portal_res.get("canceled"):
+                        view.auto_renew_status = "canceled"
+                        view.auto_renew_canceled_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        view.auto_renew_error = None
+                        job.auto_renew_status = "canceled"
+                        job.auto_renew_canceled_at = view.auto_renew_canceled_at
+                        job.auto_renew_error = None
+                        orders.store.persist(order_id)
+                        _event(job, "auto_renew_canceled", "下期自动续费已关闭")
+                        _publish_sse(job)
+                        return
+                    last_error = str(portal_res.get("message") or portal_res.get("stage") or last_error)[:300]
+                except Exception as portal_exc:  # noqa: BLE001
+                    last_error = _safe_message(portal_exc)
+                break
+            if "Session" in last_error:
                 break
             if attempt < 2:
                 await asyncio.sleep(1 if attempt == 0 else 4)

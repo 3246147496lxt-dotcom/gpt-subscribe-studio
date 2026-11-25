@@ -1873,7 +1873,26 @@ async def cancel_auto_renew(order_id: str) -> OrderOut:
             return _to_out(order)
         except Exception as exc:  # noqa: BLE001
             last_error = redact_sensitive(str(exc))[:300]
-            if "未配置" in last_error or "Session" in last_error:
+            if "未配置" in last_error:
+                try:
+                    from ..auto_renew import cancel_account_auto_renew
+                    portal_res = await asyncio.to_thread(
+                        cancel_account_auto_renew,
+                        secrets.session,
+                        plan=normalize_plan_name(str(order.plan)),
+                        proxy=secrets.proxy,
+                    )
+                    if portal_res.get("canceled"):
+                        view.auto_renew_status = "canceled"
+                        view.auto_renew_canceled_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        view.auto_renew_error = None
+                        store.persist(order_id)
+                        return _to_out(order)
+                    last_error = redact_sensitive(str(portal_res.get("message") or last_error))[:300]
+                except Exception as portal_exc:  # noqa: BLE001
+                    last_error = redact_sensitive(str(portal_exc))[:300]
+                break
+            if "Session" in last_error:
                 break
             if attempt < 2:
                 await asyncio.sleep(1 if attempt == 0 else 4)

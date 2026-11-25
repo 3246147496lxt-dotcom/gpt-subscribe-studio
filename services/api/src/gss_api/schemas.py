@@ -528,6 +528,15 @@ class AccountSubscriptionRequest(BaseModel):
     session: str = ""
     account_id: str = Field(default="", alias="accountId")
     force_refresh: bool = Field(default=False, alias="forceRefresh")
+    include_invoices: bool = Field(default=True, alias="includeInvoices")
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AccountBillingHistoryRequest(BaseModel):
+    session: str = ""
+    account_id: str = Field(default="", alias="accountId")
+    plan_name: str = Field(default="", alias="planName")
+    currency: str = ""
     model_config = ConfigDict(populate_by_name=True)
 
 
@@ -536,7 +545,16 @@ class AccountInvoiceOut(BaseModel):
     paidAt: str
     status: str
     amount: str
+    invoiceId: Optional[str] = None
     invoiceUrl: Optional[str] = None
+
+
+class AccountBillingHistoryOut(BaseModel):
+    invoices: list[AccountInvoiceOut] = Field(default_factory=list)
+    billingSource: Optional[str] = None
+    billingNote: Optional[str] = None
+    currency: str = "-"
+    retryable: bool = False
 
 
 class AccountSubscriptionOut(BaseModel):

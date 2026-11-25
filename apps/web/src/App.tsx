@@ -1,6 +1,6 @@
 import { ActionIcon, Badge, Center, Group, Loader, Tabs, Tooltip, useComputedColorScheme, useMantineColorScheme } from "@mantine/core";
 import {
-  IconActivity, IconBolt, IconChevronDown, IconLogout, IconMoon, IconSun, IconUserCircle,
+  IconActivity, IconBolt, IconChevronDown, IconExternalLink, IconLogout, IconMoon, IconSun, IconUserCircle,
 } from "@tabler/icons-react";
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 
@@ -174,6 +174,19 @@ export function App() {
             </button>
           </h1>
           <div className="header-tools">
+            <Tooltip label="打开用户端充值页">
+              <ActionIcon
+                component="a"
+                href="/"
+                target="_blank"
+                rel="noopener noreferrer"
+                variant="default"
+                className="theme-toggle"
+                aria-label="打开用户端充值页"
+              >
+                <IconExternalLink size={17} />
+              </ActionIcon>
+            </Tooltip>
             <Tooltip label="系统自检与维护">
               <ActionIcon variant="default" className="theme-toggle" onClick={() => setDiagnosticsOpen(true)} aria-label="系统自检与维护">
                 <IconActivity size={18} />

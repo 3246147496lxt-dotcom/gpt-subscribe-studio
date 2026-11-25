@@ -182,19 +182,27 @@ def publish_quick_pay(job_id: str, snapshot: dict[str, Any]) -> None:
                     del _qp_subscribers[job_id]
 
 
-async def _quick_pay_stream(job_id: str, initial: dict[str, Any]) -> AsyncGenerator[str, None]:
+async def _quick_pay_stream(
+    job_id: str,
+    initial: dict[str, Any],
+    *,
+    transform=None,
+) -> AsyncGenerator[str, None]:
     loop = asyncio.get_running_loop()
     q: asyncio.Queue[dict] = asyncio.Queue(maxsize=32)
     pair = (loop, q)
     with _qp_lock:
         _qp_subscribers.setdefault(job_id, set()).add(pair)
     try:
-        yield _sse({"type": "init", "timestamp": time.time(), "job": initial})
+        init_job = transform(initial) if callable(transform) else initial
+        yield _sse({"type": "init", "timestamp": time.time(), "job": init_job})
         if str(initial.get("status") or "") in _QP_FINAL_STATUSES:
             return
         while True:
             try:
                 item = await asyncio.wait_for(q.get(), timeout=25.0)
+                if callable(transform) and isinstance(item, dict) and isinstance(item.get("job"), dict):
+                    item = {**item, "job": transform(item["job"])}
                 yield _sse(item)
                 job_data = item.get("job") if isinstance(item, dict) else None
                 if isinstance(job_data, dict) and str(job_data.get("status") or "") in _QP_FINAL_STATUSES:

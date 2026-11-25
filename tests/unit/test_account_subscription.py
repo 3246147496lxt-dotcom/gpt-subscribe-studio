@@ -63,6 +63,7 @@ MERGED = {
         "payment_provider": "stripe",
     },
     "invoices": {"data": [{
+        "id": "in_fixture_0000000001",
         "plan_name": "chatgptplusplan",
         "created": int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp()),
         "status": "paid",
@@ -88,6 +89,7 @@ def test_normalize_maps_upstream_fields_to_display_values():
     assert detail["invoices"][0]["status"] == "已支付"
     assert detail["invoices"][0]["amount"] == "982.14 PHP"
     assert detail["invoices"][0]["paidAt"] == "2026/11/01 08:00"
+    assert detail["invoices"][0]["invoiceId"] == "in_fixture_0000000001"
 
 
 def test_normalize_empty_account_is_not_subscribed():
@@ -724,3 +726,35 @@ def test_stale_cache_version_is_ignored_after_bump(api):
     assert resp.status_code == 200
     assert resp.json()["cached"] is False
     assert calls["count"] == 1
+
+
+def test_stripe_portal_accepts_openai_custom_domain_and_invoice_links(monkeypatch):
+    from gss_api.stripe_portal_invoices import _safe_portal_entry_url, safe_invoice_url
+
+    portal_url = "https://pay.openai.com/p/session/live_YWNjdF90ZXN0"
+    http = FakeHttp({
+        "/backend-api/payments/customer_portal": [
+            FakeResponse(200, {"url": portal_url}),
+        ],
+    })
+    _install_client(monkeypatch, http)
+
+    result = account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
+    assert result == {"url": portal_url, "source": "/backend-api/payments/customer_portal"}
+    assert _safe_portal_entry_url(portal_url) == portal_url
+    assert safe_invoice_url("https://pay.openai.com/i/acct_1/inv_1") == "https://pay.openai.com/i/acct_1/inv_1"
+    assert account_detail._safe_portal_url("https://chatgpt.com/") == ""
+    assert safe_invoice_url("https://evil.example/i/acct_1/inv_1") is None
+
+
+def test_safe_url_hint_redacts_portal_tokens():
+    hint = account_detail._safe_url_hint({"url": "https://pay.openai.com/p/session/live_secret_token_12345?foo=bar"})
+    assert hint == {
+        "key": "url",
+        "type": "str",
+        "scheme": "https",
+        "host": "pay.openai.com",
+        "path_prefix": "/p/session",
+    }
+    assert "secret" not in str(hint)
+    assert account_detail._safe_url_hint({"url": None}) == {"key": "url", "type": "NoneType"}

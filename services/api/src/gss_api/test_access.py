@@ -60,15 +60,32 @@ class TestAccessMiddleware(BaseHTTPMiddleware):
             headers={"Cache-Control": "no-store"},
         )
 
+    @staticmethod
+    def _is_public_path(path: str, method: str) -> bool:
+        if path.startswith("/api/public/"):
+            return True
+        if method in {"GET", "HEAD"}:
+            if path in {"/", "/index.html", "/favicon.ico", "/robots.txt"}:
+                return True
+            if path.startswith("/assets/"):
+                return True
+        return False
+
     async def dispatch(self, request, call_next):
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
             if origin and not self._same_origin(origin, request):
                 return JSONResponse({"detail": "请求来源不匹配"}, status_code=403)
+        path = request.url.path
+        if self._is_public_path(path, request.method):
+            response = await call_next(request)
+            if path.startswith("/api/"):
+                response.headers["Cache-Control"] = "no-store"
+            return response
         authenticated = self.valid_session(request.cookies.get(COOKIE, ""))
-        if request.url.path == "/login":
+        if path == "/login":
             if request.method == "GET":
-                return RedirectResponse("/", 303) if authenticated else self.login_page()
+                return RedirectResponse("/admin", 303) if authenticated else self.login_page()
             if request.method == "POST":
                 if request.headers.get("content-type", "").split(";")[0] != "application/x-www-form-urlencoded":
                     return JSONResponse({"detail": "登录表单格式不正确"}, status_code=415)
@@ -83,7 +100,7 @@ class TestAccessMiddleware(BaseHTTPMiddleware):
                     return self.login_page(error=True)
                 if not hmac.compare_digest(hashlib.sha256(password.encode()).digest(), self.password_hash):
                     return self.login_page(error=True)
-                response = RedirectResponse("/", 303, headers={"Cache-Control": "no-store"})
+                response = RedirectResponse("/admin", 303, headers={"Cache-Control": "no-store"})
                 response.set_cookie(
                     COOKIE,
                     self.issue_session(),
@@ -95,12 +112,12 @@ class TestAccessMiddleware(BaseHTTPMiddleware):
                 )
                 return response
             return JSONResponse({"detail": "不支持该方法"}, status_code=405)
-        if request.url.path == "/logout" and request.method == "POST":
+        if path == "/logout" and request.method == "POST":
             response = RedirectResponse("/login", 303)
             response.delete_cookie(COOKIE, secure=True, httponly=True, samesite="strict", path="/")
             return response
         if not authenticated:
-            if request.url.path.startswith("/api/") or request.method not in {"GET", "HEAD"}:
+            if path.startswith("/api/") or request.method not in {"GET", "HEAD"}:
                 return JSONResponse(
                     {"detail": "请先输入访问密码"},
                     status_code=401,

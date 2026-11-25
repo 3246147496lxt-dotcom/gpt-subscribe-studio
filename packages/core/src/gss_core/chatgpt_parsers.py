@@ -53,14 +53,25 @@ def _subscription_id(payload: Dict[str, Any]) -> str:
 
 
 def _will_renew(payload: Dict[str, Any]) -> Optional[bool]:
-    for block in (
-        payload,
-        payload.get("entitlement"),
-        payload.get("last_active_subscription"),
-        payload.get("subscription"),
-    ):
-        if isinstance(block, dict) and "will_renew" in block:
+    blocks = [
+        block for block in (
+            payload,
+            payload.get("entitlement"),
+            payload.get("last_active_subscription"),
+            payload.get("subscription"),
+        )
+        if isinstance(block, dict)
+    ]
+    for block in blocks:
+        if "will_renew" in block and block.get("will_renew") is not None:
             return bool(block.get("will_renew"))
+    for block in blocks:
+        for key in ("cancel_at_period_end", "cancel_at_period_end_on"):
+            if key in block and block.get(key) is not None:
+                return not bool(block.get(key))
+    for block in blocks:
+        if block.get("cancels_at") and not block.get("renews_at"):
+            return False
     return None
 
 
