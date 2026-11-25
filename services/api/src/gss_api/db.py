@@ -1,9 +1,9 @@
-"""SQLite 持久化层（SQLAlchemy 2.x）。
+"""[Legacy / 保留兼容] SQLAlchemy 2.x 持久化模型。
 
-实现 tasks.md T010–T011：
-- 订单、任务、支付尝试的持久化模型
-- 幂等键唯一约束
-- 数据库初始化与迁移基础
+注意：当前主 FastAPI 服务（``gss_api.main``）实际运行在原生 SQLite WAL
+持久化层（``gss_api.persistence`` + ``gss_api.store``）之上。
+本模块仅保留供历史集成测试（``tests/integration/test_database.py``）
+及旧 ``gss_orchestrator.worker`` 引用，新增业务表与迁移请统一写在 ``persistence.py``。
 
 宪法第 I 条：**不得**存储 session / token / 卡号 / CVV / 代理明文口令。
 """

@@ -10,7 +10,9 @@
     "test:team": "node scripts/test-team.mjs",
     "test:saved-card": "node scripts/test-saved-card.mjs",
     "test:protocol-bind": "node scripts/test-protocol-bind.mjs",
-    "test:purchase-intent": "node scripts/test-purchase-intent.mjs"
+    "test:purchase-intent": "node scripts/test-purchase-intent.mjs",
+    "test:quick-pay": "node scripts/test-quick-pay.mjs",
+    "test:utils": "node scripts/test-frontend-utils.mjs"
   },
   "dependencies": {
     "@mantine/core": "^9.7.2",

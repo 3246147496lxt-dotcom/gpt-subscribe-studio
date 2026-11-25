@@ -71,12 +71,14 @@ def test_invalid_source_is_unavailable_without_pii(verified_us_payer, problem, t
 def test_existing_channel_billing_declarations_must_agree(verified_us_payer):
     assert checkout_address("US", "US", verified_us_payer) == verified_us_payer
     for route, country, billing in [
-        ("JP", "US", verified_us_payer),
         ("US", "JP", verified_us_payer),
         ("US", "US", {**verified_us_payer, "line1": "Different"}),
     ]:
         with pytest.raises(DomainError):
             checkout_address(route, country, billing)
+    # 出口自由：账单国 US 不变，出口 JP/PH 都允许。
+    assert checkout_address("JP", "US", verified_us_payer)["country"] == "US"
+    assert checkout_address("PH", "US", verified_us_payer)["country"] == "US"
 
 
 @pytest.mark.parametrize("name", ["plus_run", "plus_har_run", "plus_probe"])

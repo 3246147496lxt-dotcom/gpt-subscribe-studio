@@ -25,12 +25,27 @@ from gss_core.countries import country_codes, currency_for
 from gss_core.proxies import (
     align_proxy_region,
     configured_proxy,
+    rotate_proxy_sid,
     session_proxy,
 )
 
 logger = logging.getLogger("gss.checkout")
 _STRIPE_PROXY_CHECK_URL = "https://api.stripe.com/v1/payment_methods"
 _STRIPE_PROXY_CHECK_TIMEOUT = ORDER_HTTP_TIMEOUT_S
+
+
+def _retryable_sentinel_transport(exc: DomainError) -> bool:
+    """A dead proxy SID returns CONNECT 404/407 before any checkout is created."""
+    if exc.code is not ErrorCode.CHECKOUT_UPSTREAM_ERROR:
+        return False
+    text = str(exc.message or "").lower()
+    if "sentinel" not in text and "风控令牌" not in text:
+        return False
+    return any(marker in text for marker in (
+        "connect tunnel failed", "curl: (7)", "curl: (35)", "curl: (56)",
+        "proxy fetch:", "timed out", "proxyerror", "ssl_error_syscall",
+        "ssl_connect", "boringssl",
+    ))
 
 
 def _probe_stripe_proxy(proxy: Optional[str], *, timeout: float = _STRIPE_PROXY_CHECK_TIMEOUT) -> bool:
@@ -110,8 +125,22 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         if pinned_billing is not None:
             # Bind payer + attestation across the worker handoff, even for internal callers.
             req = replace(req, verified_billing=pinned_billing)
-        # One attempt on the selected route. An upstream refusal is terminal.
-        created = await asyncio.to_thread(self._create, req, proxy)
+        # A dead proxy session fails inside Sentinel before the checkout POST.
+        # Rotate only that SID and recreate the client; the retried request uses
+        # the new exit for both Sentinel and the checkout, keeping one IP.
+        created = None
+        for attempt in range(2):
+            try:
+                created = await asyncio.to_thread(self._create, req, proxy)
+                break
+            except DomainError as exc:
+                if attempt == 0 and proxy and _retryable_sentinel_transport(exc):
+                    logger.warning("checkout_sentinel_proxy_rotated code=%s", exc.code.value)
+                    proxy = rotate_proxy_sid(proxy, force=True)
+                    continue
+                raise
+        if created is None:
+            raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "建单未返回结果")
         amount = created.amount
         # Team 托管长链的实际价格（席位、周期、优惠码）只在 Stripe 页面上有，拿不到报价就留空，
         # 不能拿写死的 25 × 席位数冒充应付金额。

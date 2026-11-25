@@ -15,10 +15,11 @@ _CODES = frozenset("""
 """.split())
 # A stage is a local workflow label, never arbitrary provider-controlled text.
 _STAGES = frozenset("""
-    queued creating_order reissue reissuing reissued session_refresh session_refreshed
-    browser_decode browser_decoded browser_decode_skipped checkout create_checkout
-    creating_checkout checkout_retry_started checkout_created confirming_payment
-    verifying_delivery canceling_auto_renew failed
+    queued preflight preflight_passed creating_order reissue reissuing reissued
+    session_refresh session_refreshed browser_decode browser_decoded
+    browser_decode_skipped checkout create_checkout creating_checkout
+    checkout_retry_started checkout_created confirming_payment requires_action
+    verifying_delivery canceling_auto_renew draining failed
 """.split())
 _RAY = re.compile(r"[0-9a-f]{16}(?:-[a-z]{3})?", re.ASCII | re.I)
 _REQUEST = re.compile(

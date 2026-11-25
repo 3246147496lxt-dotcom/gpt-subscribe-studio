@@ -65,9 +65,31 @@ def _address(raw) -> dict:
     return addr
 
 
-def load_profile() -> VerifiedBilling:
+def _fixed_profile() -> VerifiedBilling:
+    """The single US address from ``GSS_FIXED_BILLING_FILE``, when configured."""
+    from .fixed_billing import fixed_verification_id, load_fixed_billing_file
+
     try:
-        path = Path(os.environ.get("GSS_VERIFIED_BILLING_FILE", ""))
+        address = load_fixed_billing_file()
+    except (OSError, ValueError, RecursionError, AttributeError):
+        raise MissingProfile from None
+    if address is None:
+        raise MissingProfile
+    try:
+        clean = _address(address)
+    except ValueError:
+        raise MissingProfile from None
+    return VerifiedBilling(clean, fixed_verification_id(clean))
+
+
+def load_profile() -> VerifiedBilling:
+    if os.environ.get("GSS_FIXED_BILLING_FILE", "").strip():
+        return _fixed_profile()
+    configured = os.environ.get("GSS_VERIFIED_BILLING_FILE", "").strip()
+    if not configured:
+        return _fixed_profile()
+    try:
+        path = Path(configured)
         if not path.is_absolute():
             raise ValueError
         # Inspect the opened object, not a path check followed by a second open.
@@ -95,8 +117,24 @@ def load_profile() -> VerifiedBilling:
         raise MissingProfile from None
 
 
+def _authoritative_profile(claim=None) -> VerifiedBilling:
+    """Load whichever single source the deployment configured.
+
+    Fixed file and legacy verified payer are tried first; multi-currency
+    profiles are resolved by the claimed country when only that file exists.
+    """
+    try:
+        return load_profile()
+    except MissingProfile:
+        pass
+    from .billing_profiles import load_billing_profiles
+
+    country = str(claim.get("country") or "") if isinstance(claim, dict) else ""
+    return load_billing_profiles().resolve_for_country(country or "US", "")
+
+
 def verify_claims(*claims, order_billing=None, verification_id=None, profile=None) -> VerifiedBilling:
-    profile = profile or load_profile()
+    profile = profile or _authoritative_profile(claims[0] if claims else None)
     if verification_id is not None and verification_id != profile.verification_id:
         raise BillingMismatch
     for claim in (*claims, order_billing):
@@ -110,18 +148,36 @@ def verify_claims(*claims, order_billing=None, verification_id=None, profile=Non
     return profile
 
 
+def exit_billing_must_match() -> bool:
+    """Opt-in strict mode. Off by default: the exit may differ from the fixed billing."""
+    from . import runtime_flags
+
+    return runtime_flags.get_bool("require_exit_billing_match")
+
+
 def split_exit_billing_allowed() -> bool:
-    """Lab-only escape hatch for PH exit + US tax-free billing."""
-    return os.environ.get("GSS_ALLOW_SPLIT_EXIT_BILLING", "").strip().lower() in {"1", "true", "yes", "on"}
+    """Default: billing is fixed (US tax-free) and the exit proxy is free to change."""
+    if exit_billing_must_match():
+        return False
+    legacy = os.environ.get("GSS_ALLOW_SPLIT_EXIT_BILLING", "").strip().lower()
+    if legacy:
+        return legacy in {"1", "true", "yes", "on"}
+    return True
 
 
 def checkout_address(country: str, declared_country: str, claim=None, profile=None) -> VerifiedBilling:
-    """The existing channel puts its country into checkout billing details. Never correct a mismatch."""
+    """Return the fixed profile. The exit never rewrites the billing address.
+
+    ``declared_country`` is the billing country the caller intends to write; if it
+    is present it must still be the profile country. ``country`` is only the
+    network exit and may be any supported region unless strict mode is enabled.
+    """
     try:
         profile = verify_claims(claim, profile=profile)
-        if declared_country.strip().upper() != profile["country"]:
+        declared = str(declared_country or "").strip().upper()
+        if declared and declared != profile["country"]:
             raise BillingMismatch
-        if not split_exit_billing_allowed() and country.strip().upper() != profile["country"]:
+        if exit_billing_must_match() and str(country or "").strip().upper() != profile["country"]:
             raise BillingMismatch
         return profile
     except MissingProfile:
@@ -137,7 +193,7 @@ class ObservedBillingConflict(DomainError):
         super().__init__(ErrorCode.BILLING_COUNTRY_MISMATCH, "上游账单与本单核验地址不符，未提交付款。")
 
 
-def check_observed_billing(payload, expected: dict) -> None:
+def check_observed_billing(payload, expected: dict, *, alternate_countries=()) -> None:
     """Veto a conflicting provider echo; silence, nulls and metadata attest nothing.
 
     Only inspect the current checkout/session and its billing blocks, not arbitrary
@@ -145,6 +201,7 @@ def check_observed_billing(payload, expected: dict) -> None:
     """
     if not isinstance(payload, dict):
         return
+    allowed = {str(code or "").strip().upper() for code in alternate_countries if str(code or "").strip()}
 
     def compare(block, mapping):
         if not isinstance(block, dict):
@@ -155,9 +212,10 @@ def check_observed_billing(payload, expected: dict) -> None:
                 continue
             wanted = expected.get(field, "")
             if field == "country" and split_exit_billing_allowed():
-                # Lab split mode: the upstream checkout echoes the exit country
-                # (PH) while the payer address remains US; do not veto it.
-                continue
+                # The fixed billing country is authoritative. An upstream echo may
+                # repeat the *selected exit* region; any other country is a conflict.
+                if isinstance(value, str) and value.strip().upper() in allowed:
+                    continue
             if isinstance(value, str):
                 value = value.strip()
                 if field == "country":

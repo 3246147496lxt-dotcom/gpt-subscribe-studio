@@ -36,7 +36,7 @@ def _configure_proxy(tmp_path, monkeypatch):
     monkeypatch.setenv("GSS_USE_FAKE", "1")
 
 
-def test_create_order_pins_exit_to_target_billing_country(tmp_path, monkeypatch, verified_payer):
+def test_create_order_honours_explicit_exit_regardless_of_billing(tmp_path, monkeypatch, verified_payer):
     verified_payer(country="PH")
     _configure_proxy(tmp_path, monkeypatch)
     store.clear()
@@ -44,7 +44,7 @@ def test_create_order_pins_exit_to_target_billing_country(tmp_path, monkeypatch,
     session = json.dumps({"accessToken": "tok_fixture"})
     response = api.post(
         "/api/orders",
-        json={"plan": "plus", "billing_country": "PH", "session": session},
+        json={"plan": "plus", "billing_country": "PH", "exit_country": "PH", "session": session},
     )
     assert response.status_code == 201, response.text
     order_id = response.json()["id"]

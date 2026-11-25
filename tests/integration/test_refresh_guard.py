@@ -73,7 +73,7 @@ def test_preflight_failure_sends_no_credentials(monkeypatch, original_country, s
         "sessionToken": "fixture-only", "accessToken": "fixture-old", "statsigContext": {"country": original_country},
     }))
     result = TestClient(create_app()).post("/api/orders", json={
-        "session": session, "billing_country": "US", "plan": "plus",
+        "session": session, "billing_country": "US", "exit_country": "US", "plan": "plus",
     })
     guard.assert_called_once_with("http://p.invalid:80", "US")
     assert result.status_code == status_code
@@ -114,7 +114,7 @@ def test_ambiguous_authentication_failure_is_never_replayed(monkeypatch):
     monkeypatch.setattr("gss_core.proxies.rotate_proxy_sid", lambda p: pytest.fail("unexpected new exit"))
     session = {"sessionToken": "fixture-only", "accessToken": "fixture-old", "statsigContext": {"country": "JP"}}
     response = TestClient(create_app()).post("/api/orders", json={
-        "session": json.dumps(session), "billing_country": "US", "plan": "plus",
+        "session": json.dumps(session), "billing_country": "US", "exit_country": "US", "plan": "plus",
     })
     assert response.status_code == 401
     fail.assert_called_once()
@@ -144,7 +144,7 @@ def test_order_reissue_401_exports_only_safe_response_fields(monkeypatch, caplog
         "sessionToken": "fixture-only", "accessToken": "fixture-old", "statsigContext": {"country": original_country},
     }))
     result = TestClient(create_app()).post("/api/orders", json={
-        "session": session, "billing_country": "US", "plan": "plus",
+        "session": session, "billing_country": "US", "exit_country": "US", "plan": "plus",
     })
     assert result.status_code == 401
     assert result.json()["detail"]["code"] == "invalid_session"

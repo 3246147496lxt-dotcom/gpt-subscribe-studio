@@ -243,7 +243,7 @@ function makeCurlFetch(proxy) {
         const body = markerAt >= 0 ? raw.slice(0, markerAt) : raw;
         const status = markerAt >= 0 ? Number(raw.slice(markerAt + marker.length)) : 0;
         if (code !== 0) {
-          reject(new Error(Buffer.concat(stderr).toString("utf8").slice(0, 500) || `curl exit ${code}`));
+          reject(new Error(Buffer.concat(stderr).toString("utf8").slice(0, 4000) || `curl exit ${code}`));
           return;
         }
         resolve({
@@ -366,7 +366,7 @@ function makePythonCurlFetch(proxy) {
       child.on("error", reject);
       child.on("close", (code) => {
         if (code !== 0) {
-          reject(new Error(Buffer.concat(stderr).toString("utf8").slice(0, 500) || `python curl exit ${code}`));
+          reject(new Error(Buffer.concat(stderr).toString("utf8").slice(0, 4000) || `python curl exit ${code}`));
           return;
         }
         try {

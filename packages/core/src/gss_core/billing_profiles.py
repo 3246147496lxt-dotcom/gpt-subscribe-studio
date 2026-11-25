@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
 
+from .fixed_billing import fixed_verification_id, load_fixed_billing_file
 from .verified_payer import MissingProfile, VerifiedBilling, _address, _unique
 
 _LIMIT = 16384
@@ -25,6 +26,23 @@ class BillingProfiles:
         if profile is None:
             raise MissingProfile()
         return profile
+
+    def resolve_for_country(self, country: str, currency: str = "") -> VerifiedBilling:
+        """固定账单以国家为准，币种只用于在同国多条记录中挑一条。
+
+        美国是固定账单国；出口币种（PHP/JPY/...）不应把账单换到别的国家。
+        """
+        code = str(country or "").strip().upper()
+        key = str(currency or "").strip().upper()
+        preferred = self.by_currency.get(key)
+        if preferred is not None and str(preferred.get("country") or "").upper() == code:
+            return preferred
+        for profile in self.by_currency.values():
+            if str(profile.get("country") or "").upper() == code:
+                return profile
+        if self.fallback is not None and str(self.fallback.get("country") or "").upper() == code:
+            return self.fallback
+        return self.resolve(currency)
 
 
 def _read_record(path: Path) -> dict:
@@ -44,6 +62,10 @@ def _read_record(path: Path) -> dict:
     if not isinstance(record, dict):
         raise ValueError
     return record
+
+
+def _fixed_verified(address: dict) -> VerifiedBilling:
+    return VerifiedBilling(_address(address), fixed_verification_id(_address(address)))
 
 
 def _verified(payer: str, ref: str, address: dict) -> VerifiedBilling:
@@ -81,6 +103,17 @@ def _load_from_path(path: Path) -> BillingProfiles:
 
 
 def load_billing_profiles() -> BillingProfiles:
+    # A single fixed US address is the primary deployment mode; when set it wins
+    # over the older per-currency / single-payer files.
+    fixed_value = os.environ.get("GSS_FIXED_BILLING_FILE", "").strip()
+    if fixed_value:
+        try:
+            address = load_fixed_billing_file(Path(fixed_value))
+            if address is None:
+                raise ValueError
+            return BillingProfiles({}, _fixed_verified(address))
+        except (OSError, ValueError, RecursionError, AttributeError):
+            raise MissingProfile from None
     path_value = os.environ.get("GSS_BILLING_PROFILES_FILE", "").strip()
     if path_value:
         path = Path(path_value)
@@ -94,8 +127,8 @@ def load_billing_profiles() -> BillingProfiles:
         raise MissingProfile from None
 
 
-def resolve_billing_profile(currency: str) -> VerifiedBilling:
-    return load_billing_profiles().resolve(currency)
+def resolve_billing_profile(currency: str, country: str = "US") -> VerifiedBilling:
+    return load_billing_profiles().resolve_for_country(country, currency)
 
 
 __all__ = ["BillingProfiles", "load_billing_profiles", "resolve_billing_profile"]

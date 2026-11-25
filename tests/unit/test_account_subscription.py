@@ -419,12 +419,26 @@ def test_stripe_portal_reports_a_401(monkeypatch):
             FakeResponse(401, {"error": {"code": "token_expired"}}),
         ],
     })
-    _install_client(monkeypatch, http)
+    _install_client(monkeypatch, http, session_token="")
 
     with pytest.raises(DomainError) as caught:
         account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
     assert caught.value.code is ErrorCode.INVALID_SESSION
     assert caught.value.detail["upstream_code"] == "token_expired"
+
+
+def test_stripe_portal_refreshes_session_on_401(monkeypatch):
+    http = FakeHttp({
+        "/backend-api/payments/customer_portal": [
+            FakeResponse(401, {"error": {"code": "token_expired"}}),
+            FakeResponse(200, {"url": "https://billing.stripe.com/p/session/refreshed"}),
+        ],
+    })
+    fake = _install_client(monkeypatch, http)
+
+    result = account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
+    assert fake.refresh_calls == 1
+    assert result["url"] == "https://billing.stripe.com/p/session/refreshed"
 
 
 def test_stripe_portal_finds_nested_links_after_a_405(monkeypatch):
@@ -450,3 +464,263 @@ def test_stripe_portal_get_is_tried_before_post(monkeypatch):
     account_detail.fetch_stripe_portal("s", "t", account_id="a", country="")
     assert http.paths[0] == "/backend-api/payments/customer_portal"
     assert not http.paths[0].startswith("POST ")
+
+
+def test_extract_invoices_from_json_handles_nested_stripe_payload():
+    from gss_api.stripe_portal_invoices import extract_invoices_from_json
+
+    inv = {
+        "id": "in_test_001",
+        "object": "invoice",
+        "amount_paid": 2000,
+        "currency": "usd",
+        "status": "paid",
+        "created": 1760000000,
+        "status_transitions": {"paid_at": 1760000120},
+        "hosted_invoice_url": "https://invoice.stripe.com/i/acct_1/test_001",
+        "lines": {"data": [{"description": "1 × ChatGPT Plus (at $20.00 / month)"}]},
+    }
+    payload = {
+        "invoices": {"object": "list", "data": [inv]},
+        "subscriptions": {"data": [{"latest_invoice": inv}]},
+        "upcoming_invoice": {"object": "invoice", "status": "draft", "amount_due": 2000, "currency": "usd"},
+    }
+    rows = extract_invoices_from_json(payload)
+    # Upcoming draft without id is skipped; duplicate in_test_001 appears twice before dedupe
+    assert any(r["id"] == "in_test_001" for r in rows)
+    first = rows[0]
+    assert first["paid_at"] == 1760000120
+    assert first["amount_paid"] == 2000
+    assert first["amount_unit"] == "minor"
+    assert first["currency"] == "USD"
+    assert first["invoice_url"] == "https://invoice.stripe.com/i/acct_1/test_001"
+    assert "ChatGPT Plus" in first["description"]
+    assert all(r["status"] != "draft" for r in rows)
+
+
+def test_extract_invoices_from_html_parses_embedded_bootstrap_json():
+    from gss_api.stripe_portal_invoices import extract_invoices_from_html
+
+    blob = json.dumps({
+        "invoice_history": [
+            {
+                "id": "in_html_1",
+                "object": "invoice",
+                "amount_paid": 3000,
+                "currency": "jpy",
+                "status": "paid",
+                "created": 1761000000,
+                "hosted_invoice_url": "https://invoice.stripe.com/i/acct_1/html_1",
+                "lines": {"data": [{"description": "ChatGPT Plus"}]},
+            }
+        ]
+    })
+    html_doc = f'<html><body><script type="application/json" id="boot">{blob}</script></body></html>'
+    rows = extract_invoices_from_html(html_doc)
+    assert len(rows) == 1
+    assert rows[0]["id"] == "in_html_1"
+    assert rows[0]["currency"] == "JPY"
+    assert rows[0]["amount_paid"] == 3000
+
+
+def test_parse_dom_invoice_rows_handles_currencies_and_dates():
+    from gss_api.stripe_portal_invoices import parse_dom_invoice_rows
+
+    rows = parse_dom_invoice_rows([
+        {
+            "text": "Oct 22, 2026  $20.00  Paid  ChatGPT Plus",
+            "href": "https://invoice.stripe.com/i/acct_1/dom_1",
+        },
+        {
+            "text": "2026年09月22日  ₱1,100  Refunded",
+            "href": "https://evil.example/phish",
+        },
+        {
+            "text": "22 Aug 2026  ¥3,000  Paid  ChatGPT Pro",
+            "href": "https://pay.stripe.com/invoice/acct_1/dom_3",
+        },
+    ])
+    assert len(rows) == 3
+    assert rows[0]["amount_paid"] == "20.00"
+    assert rows[0]["amount_unit"] == "major"
+    assert rows[0]["currency"] == "USD"
+    assert rows[0]["description"] == "plus"
+    assert rows[0]["invoice_url"] == "https://invoice.stripe.com/i/acct_1/dom_1"
+
+    assert rows[1]["amount_paid"] == "1100"
+    assert rows[1]["currency"] == "PHP"
+    assert rows[1]["status"] == "refunded"
+    assert "invoice_url" not in rows[1]  # non-stripe host rejected
+
+    assert rows[2]["amount_paid"] == "3000"
+    assert rows[2]["currency"] == "JPY"
+    assert rows[2]["description"] == "pro"
+
+
+def test_fetch_snapshot_falls_back_to_stripe_portal_invoices_when_billing_apis_404(monkeypatch):
+    import asyncio
+
+    t_old = int(datetime(2026, 9, 22, 0, 0, tzinfo=timezone.utc).timestamp())
+    t_new = int(datetime(2026, 10, 22, 0, 0, tzinfo=timezone.utc).timestamp())
+    http = FakeHttp({
+        "/backend-api/accounts/check/v4-2023-04-27": [
+            FakeResponse(200, {"accounts": {"default": {"account": {"account_id": "acc-1", "plan_type": "plus"}}}})
+        ],
+        "/backend-api/subscriptions": [
+            FakeResponse(200, {
+                "plan_type": "chatgptplusplan",
+                "is_active": True,
+                "is_processor_stripe": True,
+                "billing_currency": "USD",
+                "current_billing_period": None,
+                "last_active_subscription": {
+                    "purchase_origin_platform": "chatgpt_web",
+                    "subscription_id": "sub_test_1",
+                    "will_renew": True,
+                },
+            })
+        ],
+        "/backend-api/payments/invoices": [FakeResponse(404, {})],
+        "/backend-api/payments/billing_history": [FakeResponse(404, {})],
+        "/backend-api/payments/receipts": [FakeResponse(404, {})],
+        "/backend-api/accounts/acc-1/billing_history": [FakeResponse(404, {})],
+        "/backend-api/accounts/acc-1/invoices": [FakeResponse(404, {})],
+        "/backend-api/payments/transactions": [FakeResponse(404, {})],
+        "/backend-api/payments/customer_portal": [
+            FakeResponse(200, {"url": "https://billing.stripe.com/p/session/live_test_portal"})
+        ],
+    })
+    _install_client(monkeypatch, http)
+
+    captured = {}
+
+    def fake_portal_invoices(url, *, proxy=None, timeout=20.0):
+        captured["url"] = url
+        return (
+            [
+                {
+                    "id": "in_old",
+                    "paid_at": t_old,
+                    "amount_paid": 2000,
+                    "amount_unit": "minor",
+                    "currency": "USD",
+                    "status": "paid",
+                    "description": "1 × ChatGPT Plus (at $20.00 / month)",
+                    "invoice_url": "https://invoice.stripe.com/i/acct_1/old",
+                },
+                {
+                    "id": "in_new",
+                    "paid_at": t_new,
+                    "amount_paid": 2000,
+                    "amount_unit": "minor",
+                    "currency": "USD",
+                    "status": "paid",
+                    "description": "",
+                    "invoice_url": "https://invoice.stripe.com/i/acct_1/new",
+                },
+            ],
+            "browser_xhr",
+        )
+
+    monkeypatch.setattr(account_detail, "fetch_portal_invoices", fake_portal_invoices)
+
+    merged = asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="acc-1", country=""))
+    assert captured["url"] == "https://billing.stripe.com/p/session/live_test_portal"
+
+    detail = normalize(merged, email="plus@example.test", account_id="acc-1")
+    assert detail["paymentChannel"] == "网页支付"
+    assert detail["billingSource"] == "stripe_portal"
+    assert detail["billingNote"] is None
+    assert len(detail["invoices"]) == 2
+    assert detail["invoices"][0]["paidAt"] == "2026/10/22 08:00"
+    assert detail["invoices"][0]["plan"] == "ChatGPT Plus"  # fallback from account plan when description empty
+    assert detail["invoices"][0]["amount"] == "20.00 USD"
+    assert detail["invoices"][0]["invoiceUrl"] == "https://invoice.stripe.com/i/acct_1/new"
+    assert detail["invoices"][1]["paidAt"] == "2026/09/22 08:00"
+    assert detail["invoices"][1]["plan"] == "ChatGPT Plus"
+
+
+def test_zero_decimal_currency_and_major_unit_amounts_are_not_divided():
+    when = int(datetime(2026, 10, 22, tzinfo=timezone.utc).timestamp())
+    detail = normalize({
+        "subscriptions": {"plan_type": "chatgptplusplan", "is_active": True},
+        "portal_invoices": [
+            {
+                "paid_at": when,
+                "amount_paid": 3000,
+                "amount_unit": "minor",
+                "currency": "JPY",
+                "status": "paid",
+                "description": "ChatGPT Plus",
+            },
+            {
+                "paid_at": when - 86400,
+                "amount_paid": "1100",
+                "amount_unit": "major",
+                "currency": "PHP",
+                "status": "paid",
+                "description": "ChatGPT Plus",
+            },
+        ],
+    }, email="jp@example.test", account_id="acc-jp")
+    assert detail["invoices"][0]["amount"] == "3000 JPY"
+    assert detail["invoices"][1]["amount"] == "1100.00 PHP"
+
+
+def test_purchase_origin_platform_maps_mobile_channel_and_skips_stripe_portal(monkeypatch):
+    import asyncio
+
+    http = FakeHttp({
+        "/backend-api/subscriptions": [
+            FakeResponse(200, {
+                "plan_type": "chatgptplusplan",
+                "is_active": True,
+                "is_processor_stripe": False,
+                "last_active_subscription": {
+                    "purchase_origin_platform": "chatgpt_ios",
+                    "subscription_id": "apple_sub_1",
+                    "will_renew": True,
+                },
+            })
+        ],
+        "/backend-api/payments/invoices": [FakeResponse(404, {})],
+        "/backend-api/payments/billing_history": [FakeResponse(404, {})],
+        "/backend-api/payments/receipts": [FakeResponse(404, {})],
+        "/backend-api/payments/transactions": [FakeResponse(404, {})],
+    })
+    _install_client(monkeypatch, http)
+
+    merged = asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="", country=""))
+    assert "/backend-api/payments/customer_portal" not in http.paths
+
+    detail = normalize(merged, email="ios@example.test", account_id="acc-ios")
+    assert detail["paymentChannel"] == "App Store"
+    assert detail["billingSource"] == "mobile_store"
+    assert "App Store" in (detail["billingNote"] or "")
+
+
+def test_stale_cache_version_is_ignored_after_bump(api):
+    client, calls, db = api
+    db.save_account_snapshot(
+        "acc-fixture",
+        email="fixture@example.test",
+        account_id="acc-fixture",
+        detail={
+            "email": "fixture@example.test",
+            "accountId": "acc-fixture",
+            "status": "使用中",
+            "planName": "ChatGPT Plus",
+            "autoRenew": "已开启",
+            "paymentChannel": "网页支付",
+            "currency": "USD",
+            "invoices": [],
+            "queriedAt": "2026/11/01 08:00",
+            "cacheVersion": 3,
+        },
+        queried_at="2026/11/01 08:00",
+    )
+    assert account_detail.CACHE_VERSION >= 4
+    resp = post(client, session=session_json())
+    assert resp.status_code == 200
+    assert resp.json()["cached"] is False
+    assert calls["count"] == 1

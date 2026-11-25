@@ -1,4 +1,7 @@
-"""按账单国家自动生成 Stripe 账单地址。不依赖外部地址接口，也不让用户填。"""
+"""账单地址。美国始终返回同一份免税州固定地址，其它国家才用本地样例模板。
+
+出口代理与账单国家互不绑定：出口可以按订单自由变化，账单只看固定资料。
+"""
 
 from __future__ import annotations
 
@@ -6,6 +9,7 @@ import secrets
 from typing import Dict, List, Mapping, TypedDict
 
 from gss_core.countries import normalize_country
+from gss_core.fixed_billing import BILLING_COUNTRY, fixed_billing_address
 
 
 class BillingAddress(TypedDict):
@@ -28,12 +32,6 @@ _FIRST = ("James", "David", "Michael", "Daniel", "Emma", "Olivia", "Sofia", "Mar
 _LAST = ("Miller", "Johnson", "Garcia", "Santos", "Kim", "Tanaka", "Silva", "Nguyen")
 
 _PLACES: Dict[str, List[_Place]] = {
-    "US": [
-        # 免税州：Oregon / Delaware，避免美国本地销售税叠加。
-        {"city": "Portland", "state": "OR", "postal_code": "97201", "streets": ["SW Morrison Street", "NW Couch Street"]},
-        {"city": "Wilmington", "state": "DE", "postal_code": "19801", "streets": ["Market Street", "King Street"]},
-        {"city": "Salem", "state": "OR", "postal_code": "97301", "streets": ["Commercial Street SE", "State Street"]},
-    ],
     "PH": [
         {"city": "Makati", "state": "NCR", "postal_code": "1226", "streets": ["Ayala Avenue", "Paseo de Roxas"]},
         {"city": "Quezon City", "state": "NCR", "postal_code": "1100", "streets": ["EDSA", "Quezon Avenue"]},
@@ -112,8 +110,13 @@ _PLACES: Dict[str, List[_Place]] = {
 
 
 def address_for(country: str) -> BillingAddress:
-    code = normalize_country(country) or "US"
-    places = _PLACES.get(code) or _PLACES["US"]
+    code = normalize_country(country) or BILLING_COUNTRY
+    if code == BILLING_COUNTRY:
+        # 固定地址：同一部署的每一笔订单都完全一致，不再随机。
+        return dict(fixed_billing_address())
+    places = _PLACES.get(code)
+    if not places:
+        return dict(fixed_billing_address())
     place = secrets.choice(places)
     street = secrets.choice(place["streets"])
     number = secrets.randbelow(180) + 12
@@ -124,7 +127,7 @@ def address_for(country: str) -> BillingAddress:
         "city": place["city"],
         "state": place["state"],
         "postal_code": place["postal_code"],
-        "country": code if code in _PLACES else "US",
+        "country": code,
     }
 
 
@@ -141,4 +144,4 @@ def stripe_billing_details(address: Mapping[str, str]) -> Dict[str, object]:
     }
 
 
-__all__ = ["BillingAddress", "address_for", "stripe_billing_details"]
+__all__ = ["BillingAddress", "address_for", "fixed_billing_address", "stripe_billing_details"]

@@ -62,3 +62,17 @@ GSS_BILLING_PROFILES_FILE=/Users/pu/.gss/billing-profiles.json
 
 Legacy `GSS_VERIFIED_BILLING_FILE` remains supported as a fallback for every
 currency.
+
+For a single fixed US tax-free address (the usual deployment), a plain address
+file is enough:
+
+```json
+{"name": "...", "email": "...", "line1": "...", "city": "Portland", "state": "OR", "postal_code": "97205", "country": "US"}
+```
+
+```env
+GSS_FIXED_BILLING_FILE=/Users/you/.gss/fixed-billing.json
+```
+
+When set it takes precedence over the two files above. Generate it with
+`scripts/setup_fixed_us_billing.py`; see [fixed-us-billing.md](fixed-us-billing.md).

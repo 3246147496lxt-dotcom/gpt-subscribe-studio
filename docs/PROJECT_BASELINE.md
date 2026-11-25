@@ -138,8 +138,8 @@ GAP-S3  没有把“清洗后指纹”作为结构化诊断返回给前端。
   - `pro -> chatgptpro`
   - `pro_max -> chatgptpromax`
 - `create_checkout()`：
-  - `billing_details.country = exit_country`
-  - `billing_details.currency = currency_for(exit_country)`
+  - `billing_details.country = billing_country`（固定美国免税地址）
+  - `billing_details.currency = currency_for(exit_country)`（币种随出口）
   - `checkout_ui_mode = custom`
   - `checkout_source = chatgpt_web_merged`
   - `purchase_attempt_id` 每次新建
@@ -152,9 +152,9 @@ GAP-S3  没有把“清洗后指纹”作为结构化诊断返回给前端。
 ```text
 pro_lite + CL 出口 + US 账单
 → 建单 body: plan_name=chatgptprolite,
-             billing_details.country=CL,
+             billing_details.country=US,
              billing_details.currency=CLP
-→ 后续 tax / confirm 使用 US 免税地址
+→ 后续 tax / confirm 使用同一份 US 免税地址
 ```
 
 隐藏缺口：

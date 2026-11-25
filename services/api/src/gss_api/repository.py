@@ -1,9 +1,8 @@
-"""订单存储实现（SQLAlchemy 版本）。
+"""[Legacy / 保留兼容] 订单存储实现（SQLAlchemy 版本）。
 
-替换骨架的 InMemoryStore，提供完整的持久化能力：
-- 订单 CRUD 与状态迁移
-- 幂等键去重
-- 任务与支付尝试管理
+注意：当前主 FastAPI 服务（``gss_api.main``）使用 ``gss_api.persistence`` 与
+``gss_api.store.InMemoryStore``（有界缓存 + SQLite 回查）处理订单与队列持久化。
+本模块保留仅供旧集成测试与 ``gss_orchestrator.worker`` 兼容。
 
 宪法第 I 条：此处**不得**保存 session / token / 卡字段。
 """

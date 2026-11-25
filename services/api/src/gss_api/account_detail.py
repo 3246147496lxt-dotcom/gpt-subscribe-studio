@@ -23,15 +23,23 @@ from gss_core.proxies import align_proxy_region, configured_proxy
 from gss_core.redaction import redact_sensitive
 from gss_core.session_token import parse_session_bundle
 
+from .stripe_portal_invoices import fetch_portal_invoices, safe_invoice_url
+
 logger = logging.getLogger("gss.account_detail")
 
 BEIJING = timezone(timedelta(hours=8))
 # Bump when the normalized shape changes; old cache rows are ignored.
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 SUBSCRIPTIONS_PATH = "/backend-api/subscriptions"
 INVOICES_PATH = "/backend-api/payments/invoices"
 BILLING_HISTORY_PATH = "/backend-api/payments/billing_history"
 RECEIPTS_PATH = "/backend-api/payments/receipts"
+
+# Stripe zero-decimal currencies (minor unit == major unit; never divide by 100).
+_ZERO_DECIMAL_CURRENCIES = frozenset({
+    "BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA",
+    "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF",
+})
 
 _PLAN_LABELS = {
     "plus": "ChatGPT Plus",
@@ -63,12 +71,18 @@ _CHANNEL_LABELS = {
     "stripe": "网页支付",
     "web": "网页支付",
     "web_payment": "网页支付",
+    "chatgpt_web": "网页支付",
     "apple": "App Store",
     "app_store": "App Store",
     "ios": "App Store",
+    "chatgpt_ios": "App Store",
+    "ios_app_store": "App Store",
+    "mobile_ios": "App Store",
     "google": "Google Play",
     "google_play": "Google Play",
     "android": "Google Play",
+    "chatgpt_android": "Google Play",
+    "mobile_android": "Google Play",
 }
 
 
@@ -276,11 +290,15 @@ def _request(client: ChatGPTClient, path: str, params: Optional[dict]):
 
 
 def _fetch_serial(session: str, access_token: str, calls, *,
-                  proxy: Optional[str], timeout: float) -> Dict[str, Any]:
+                  account_id: str = "", proxy: Optional[str], timeout: float) -> Dict[str, Any]:
     """One client, one exit, one device id, endpoints strictly in order.
 
     A 401 on the first request is retried once after exchanging the session
     cookie for a fresh access token; only a second failure is reported.
+    When ChatGPT's direct billing endpoints return no invoices for a Stripe
+    account, falls back to reading invoice history from the account's Stripe
+    Customer Portal session (strictly read-only, no ChatGPT credentials sent
+    to Stripe).
     """
     client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
     client.access_token = access_token
@@ -330,6 +348,23 @@ def _fetch_serial(session: str, access_token: str, calls, *,
                               "订阅接口暂时不可达，请稍后重试。",
                               detail={"code": "upstream_unavailable",
                                       "reason": failures[0][:80]})
+        if _should_fetch_portal_invoices(merged):
+            resolved_account_id = account_id or str(_deep(merged.get("accounts"), ("account_id",)) or "")
+            try:
+                portal_url, _source, _attempts = _request_portal_url(
+                    client, resolved_account_id, timeout, allow_refresh=not refreshed,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.info("account_detail_portal_fallback_error type=%s", type(exc).__name__)
+                merged["_portal_meta"] = {"attempted": True, "stage": "portal_error", "has_portal": False}
+            else:
+                if portal_url:
+                    portal_items, stage = fetch_portal_invoices(portal_url, proxy=proxy, timeout=timeout)
+                    if portal_items:
+                        merged["portal_invoices"] = portal_items
+                    merged["_portal_meta"] = {"attempted": True, "stage": stage, "has_portal": True}
+                else:
+                    merged["_portal_meta"] = {"attempted": True, "stage": "no_portal_url", "has_portal": False}
         return merged
     finally:
         client.close()
@@ -354,7 +389,7 @@ async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
                       f"/backend-api/accounts/{account_id}/invoices", None))
     calls.append(("transactions", "/backend-api/payments/transactions", account_params))
     return await asyncio.to_thread(_fetch_serial, session, access_token, tuple(calls),
-                                   proxy=proxy, timeout=timeout)
+                                   account_id=account_id, proxy=proxy, timeout=timeout)
 
 
 # ── normalization ────────────────────────────────────────────────────
@@ -417,24 +452,91 @@ def to_beijing(value: Any) -> Optional[str]:
     return moment.astimezone(BEIJING).strftime("%Y/%m/%d %H:%M") if moment else None
 
 
-def _plan_label(value: Any) -> str:
-    key = str(value or "").strip().lower()
-    return _PLAN_LABELS.get(key, key or "未知套餐")
+def _plan_label(value: Any, *, fallback: str = "") -> str:
+    raw = str(value or "").strip()
+    key = raw.lower()
+    if key in _PLAN_LABELS:
+        return _PLAN_LABELS[key]
+    if key:
+        if "pro max" in key or "chatgptpromax" in key:
+            return "ChatGPT Pro Max"
+        if "pro lite" in key or "chatgptprolite" in key:
+            return "ChatGPT Pro Lite"
+        if "chatgpt pro" in key or "chatgptpro" in key:
+            return "ChatGPT Pro"
+        if "chatgpt team" in key or "chatgpt business" in key or "chatgptteam" in key:
+            return "ChatGPT Team"
+        if "chatgpt go" in key or "chatgptgo" in key:
+            return "ChatGPT Go"
+        if "chatgpt plus" in key or "chatgptplus" in key:
+            return "ChatGPT Plus"
+        if "chatgpt free" in key or "chatgptfree" in key:
+            return "ChatGPT 免费版"
+        return redact_sensitive(raw)[:60]
+    return fallback or "未知套餐"
 
 
-def _amount(value: Any, currency: str) -> str:
-    cur = "" if str(currency or "").strip() in {"", "-"} else str(currency).upper()
+def _channel_label(subs: Dict[str, Any], accounts: Dict[str, Any]) -> str:
+    channel_source = str(
+        _deep(subs, ("payment_provider", "payment_channel", "channel",
+                     "payment_method_type", "purchase_origin_platform"))
+        or _deep(accounts, ("payment_provider", "payment_channel", "purchase_origin_platform"))
+        or ""
+    ).strip().lower()
+    if channel_source in _CHANNEL_LABELS:
+        return _CHANNEL_LABELS[channel_source]
+    if any(tok in channel_source for tok in ("apple", "ios", "app_store")):
+        return "App Store"
+    if any(tok in channel_source for tok in ("google", "android")):
+        return "Google Play"
+    if any(tok in channel_source for tok in ("stripe", "web")):
+        return "网页支付"
+    if _as_bool(_deep(subs, ("is_processor_stripe",))) is True:
+        return "网页支付"
+    return "网页支付" if not channel_source else channel_source
+
+
+def _should_fetch_portal_invoices(merged: Dict[str, Any]) -> bool:
+    """Decide whether to read historical bills from Stripe Customer Portal."""
+    if _invoice_records(merged):
+        return False
+    subs = merged.get("subscriptions") if isinstance(merged.get("subscriptions"), dict) else {}
+    accounts = merged.get("accounts") if isinstance(merged.get("accounts"), dict) else {}
+    if not subs and not accounts:
+        return False
+    is_stripe = _as_bool(_deep(subs, ("is_processor_stripe",)))
+    channel = _channel_label(subs, accounts)
+    if channel in {"App Store", "Google Play"} and is_stripe is not True:
+        return False
+    if is_stripe is True:
+        return True
+    if _as_bool(_deep(subs, ("is_eligible_for_cp",))) is True:
+        return True
+    if _as_bool(_deep(subs, ("is_active", "active", "has_active_subscription"))) is True:
+        return True
+    if _deep(subs, ("subscription_id",)):
+        return True
+    plan_source = (_deep(subs, ("plan_type", "subscription_plan", "plan", "plan_name"))
+                   or _deep(accounts, ("plan_type", "subscription_plan")))
+    plan_key = str(plan_source or "").strip().lower()
+    return bool(plan_key and plan_key not in {"free", "chatgptfreeplan"})
+
+
+def _amount(value: Any, currency: str, *, amount_unit: str = "") -> str:
+    cur = "" if str(currency or "").strip() in {"", "-"} else str(currency).strip().upper()
     if isinstance(value, dict):
+        if value.get("currency"):
+            cur = str(value["currency"]).strip().upper()
+        zero_decimal = cur in _ZERO_DECIMAL_CURRENCIES
         minor = value.get("minorUnitsAmount")
         if isinstance(minor, int) and not isinstance(minor, bool):
-            number: Any = Decimal(minor) / 100
+            number: Any = Decimal(minor) if zero_decimal else Decimal(minor) / 100
         else:
             number = value.get("amount")
             if number is None:
                 number = value.get("value")
-            if value.get("currency"):
-                cur = str(value["currency"]).upper()
     else:
+        zero_decimal = cur in _ZERO_DECIMAL_CURRENCIES
         number = value
     if number is None or number == "":
         return "-"
@@ -442,12 +544,25 @@ def _amount(value: Any, currency: str) -> str:
         amount = Decimal(str(number))
         if not isinstance(value, dict):
             text = str(number).strip()
-            # Billing endpoints report integer minor units (98214 -> 982.14).
-            if text.isdigit() and amount >= 100:
-                amount = amount / 100
+            unit = str(amount_unit or "").strip().lower()
+            if unit == "major":
+                pass
+            elif unit == "minor":
+                if not zero_decimal and (
+                    (isinstance(number, int) and not isinstance(number, bool))
+                    or text.lstrip("-").isdigit()
+                ):
+                    amount = amount / 100
+            else:
+                # Billing endpoints report integer minor units (98214 -> 982.14).
+                if not zero_decimal and text.isdigit() and amount >= 100:
+                    amount = amount / 100
     except (InvalidOperation, ValueError):
         return f"{redact_sensitive(str(number))[:30]} {cur}".strip()
-    formatted = f"{amount.quantize(Decimal('0.01')):.2f}"
+    if zero_decimal and amount == amount.to_integral_value():
+        formatted = f"{int(amount)}"
+    else:
+        formatted = f"{amount.quantize(Decimal('0.01')):.2f}"
     return f"{formatted} {cur}".strip() if cur else formatted
 
 
@@ -464,36 +579,49 @@ def _invoice_items(payload: Any) -> List[dict]:
     return []
 
 
-def _invoice_records(merged: Dict[str, Any]) -> List[dict]:
+def _invoice_records(merged: Dict[str, Any], *, default_plan: str = "") -> List[dict]:
     """Merge every billing source, de-duplicate, newest first."""
-    candidates: List[dict] = []
+    candidates: List[tuple[dict, str]] = []
     for key in ("invoices", "billing_history", "receipts", "account_billing",
                 "account_invoices", "transactions"):
-        candidates.extend(_invoice_items(merged.get(key)))
+        for item in _invoice_items(merged.get(key)):
+            candidates.append((item, "upstream_api"))
+    for item in _invoice_items(merged.get("portal_invoices")):
+        candidates.append((item, "stripe_portal"))
     subs = merged.get("subscriptions") if isinstance(merged.get("subscriptions"), dict) else {}
     period = subs.get("current_billing_period") if isinstance(subs, dict) else None
     if isinstance(period, dict) and _deep(period, ("amount_paid", "total", "amount",
                                                     "total_amount", "price")):
-        candidates.append(period)
+        candidates.append((period, "current_period"))
     records: List[dict] = []
-    seen = set()
-    for item in candidates:
+    seen: Dict[tuple[str, str, str], int] = {}
+    for item, source in candidates:
         moment = _moment(_deep(item, ("paid_at", "created", "date", "invoice_date",
                                       "created_at", "period_start")))
         amount_raw = _deep(item, ("amount_paid", "total", "amount", "total_amount", "price"))
         currency = str(_deep(item, ("currency", "currency_code")) or "").upper()
         status_key = str(_deep(item, ("status", "payment_status")) or "").strip().lower()
+        invoice_url = safe_invoice_url(
+            item.get("invoice_url") or item.get("hosted_invoice_url") or item.get("invoice_pdf")
+        )
         signature = (moment.isoformat() if moment else "", str(amount_raw), currency)
         if signature in seen:
+            existing = records[seen[signature]]
+            if invoice_url and not existing.get("invoice_url"):
+                existing["invoice_url"] = invoice_url
             continue
-        seen.add(signature)
+        seen[signature] = len(records)
+        raw_plan = _deep(item, ("plan_name", "plan", "subscription_plan",
+                                "description", "product_name"))
         records.append({
             "moment": moment,
-            "plan": _plan_label(_deep(item, ("plan_name", "plan", "subscription_plan",
-                                             "description", "product_name"))),
+            "plan": _plan_label(raw_plan, fallback=default_plan),
             "status": _INVOICE_STATUS.get(status_key, "未知"),
             "amount_raw": amount_raw,
+            "amount_unit": str(item.get("amount_unit") or ""),
             "currency": currency,
+            "invoice_url": invoice_url,
+            "source": source,
         })
     records.sort(key=lambda row: row["moment"] or datetime.min.replace(tzinfo=timezone.utc),
                  reverse=True)
@@ -513,11 +641,58 @@ def _pick_currency(records: List[dict], subs: Dict[str, Any], accounts: Dict[str
     return "-"
 
 
+def _billing_meta(
+    records: List[dict],
+    *,
+    payment_channel: str,
+    status: str,
+    is_free: bool,
+    portal_meta: Dict[str, Any],
+) -> tuple[str, Optional[str]]:
+    if records:
+        sources = {row.get("source") for row in records}
+        if "upstream_api" in sources:
+            return "upstream_api", None
+        if "stripe_portal" in sources:
+            return "stripe_portal", None
+        return "current_period", None
+    if payment_channel in {"App Store", "Google Play"}:
+        return (
+            "mobile_store",
+            f"当前订阅由 {payment_channel} 代扣，ChatGPT 网页端与 Stripe 门户不保存移动端历史账单，请在对应应用商店查看。",
+        )
+    if status == "未订阅" and is_free and not portal_meta.get("attempted"):
+        return "none", "当前为免费账号，暂无付费账单记录。"
+    if portal_meta.get("attempted"):
+        stage = str(portal_meta.get("stage") or "")
+        if stage == "browser_disabled":
+            return (
+                "stripe_portal_empty",
+                "已关闭自动抓取 Stripe 门户页面，可点击右上角「打开 Stripe 官方账单明细」查看。",
+            )
+        if stage in {"browser_unavailable", "browser_error"}:
+            return (
+                "stripe_portal_empty",
+                "ChatGPT 上游未开放账单明细接口，自动读取 Stripe 门户失败，请点击右上角「打开 Stripe 官方账单明细」查看。",
+            )
+        if stage in {"no_portal_url", "portal_error"}:
+            return (
+                "none",
+                "未获取到该账号的 Stripe 账单门户（可能是免费、团队或非 Stripe 渠道订阅），可尝试点击右上角按钮或前往官网查看。",
+            )
+        return (
+            "stripe_portal_empty",
+            "Stripe 账单门户暂未返回历史账单（如免费试用、尚未出账或页面需要手动验证），可点击右上角「打开 Stripe 官方账单明细」直接查看。",
+        )
+    return "none", "上游未返回历史账单，可点击右上角「打开 Stripe 官方账单明细」查看。"
+
+
 def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
               now: Optional[datetime] = None) -> Dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     accounts = merged.get("accounts") if isinstance(merged.get("accounts"), dict) else {}
     subs = merged.get("subscriptions") if isinstance(merged.get("subscriptions"), dict) else {}
+    portal_meta = merged.get("_portal_meta") if isinstance(merged.get("_portal_meta"), dict) else {}
 
     plan_source = (_deep(subs, ("plan_type", "subscription_plan", "plan", "plan_name"))
                    or _deep(accounts, ("plan_type", "subscription_plan")))
@@ -540,18 +715,30 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
     will_renew = _as_bool(_deep(subs, ("will_renew", "auto_renew", "renews")))
     auto_renew = "已关闭" if (cancel is True or will_renew is False) else "已开启"
 
-    channel_source = str(_deep(subs, ("payment_provider", "payment_channel", "channel",
-                                       "payment_method_type")) or "").strip().lower()
-    payment_channel = _CHANNEL_LABELS.get(channel_source, "网页支付" if not channel_source else channel_source)
+    payment_channel = _channel_label(subs, accounts)
 
-    records = _invoice_records(merged)
+    plan_name = _plan_label(plan_source)
+    default_invoice_plan = "" if is_free or plan_name == "未知套餐" else plan_name
+    records = _invoice_records(merged, default_plan=default_invoice_plan)
     currency = _pick_currency(records, subs, accounts)
     invoices = [{
         "plan": row["plan"],
         "paidAt": to_beijing(row["moment"]) or "-",
         "status": row["status"],
-        "amount": _amount(row["amount_raw"], row["currency"] or currency),
+        "amount": _amount(
+            row["amount_raw"],
+            row["currency"] or currency,
+            amount_unit=row.get("amount_unit", ""),
+        ),
+        "invoiceUrl": row.get("invoice_url"),
     } for row in records]
+    billing_source, billing_note = _billing_meta(
+        records,
+        payment_channel=payment_channel,
+        status=status,
+        is_free=is_free,
+        portal_meta=portal_meta,
+    )
 
     # Start time: subscription period start, else the latest settled invoice,
     # else a labelled one-month estimate before the expiry.
@@ -575,7 +762,7 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
         "email": email or str(_deep(accounts, ("email",)) or ""),
         "accountId": account_id or str(_deep(accounts, ("account_id",)) or ""),
         "status": status,
-        "planName": _plan_label(plan_source),
+        "planName": plan_name,
         "startTime": start_time,
         "endTime": to_beijing(end),
         "remainingDays": remaining,
@@ -583,6 +770,8 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
         "paymentChannel": payment_channel,
         "currency": currency,
         "invoices": invoices,
+        "billingSource": billing_source,
+        "billingNote": billing_note,
         "queriedAt": now.astimezone(BEIJING).strftime("%Y/%m/%d %H:%M"),
         "cacheVersion": CACHE_VERSION,
         "cached": False,
@@ -642,21 +831,22 @@ def _safe_portal_url(url: str) -> str:
     return url if parsed.scheme == "https" and allowed else ""
 
 
-def fetch_stripe_portal(session: str, access_token: str, *, account_id: str,
-                        country: str, timeout: float = ORDER_HTTP_TIMEOUT_S) -> Dict[str, str]:
-    """Create a Stripe customer-portal session on the bound exit."""
-    proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
-    client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
-    client.access_token = access_token
-    client.timeout = timeout
-    attempts = []
-    try:
-        for method, path in PORTAL_PATHS:
+def _request_portal_url(
+    client: ChatGPTClient,
+    account_id: str,
+    timeout: float,
+    *,
+    allow_refresh: bool = True,
+) -> tuple[str, str, List[str]]:
+    attempts: List[str] = []
+    refreshed = not allow_refresh
+    for method, path in PORTAL_PATHS:
+        body = {"account_id": account_id} if account_id else {}
+        for _attempt in range(2):
             headers = client._route_headers(path)
             headers.update(client._identity_headers())
             if method == "POST":
                 headers["Content-Type"] = "application/json"
-            body = {"account_id": account_id} if account_id else {}
             try:
                 if method == "POST":
                     response = client.http.post(APP_BASE + path, json=body, headers=headers,
@@ -668,23 +858,46 @@ def fetch_stripe_portal(session: str, access_token: str, *, account_id: str,
                 raise
             except Exception as exc:  # noqa: BLE001
                 attempts.append(f"{path}:{type(exc).__name__}")
-                continue
+                response = None
+                break
             status = int(getattr(response, "status_code", 0) or 0)
             attempts.append(f"{path}:{status}")
+            if status == 401 and not refreshed:
+                refreshed = True
+                session_token_present = bool(getattr(client, "session_token", ""))
+                if session_token_present and client.refresh_session(
+                        trust_statsig=False, reject_unauthorized=False):
+                    logger.info("account_detail_portal_token_refreshed path=%s", path)
+                    continue
             if status == 401:
                 raise _auth_error(path, response, client, bool(getattr(client, "session_token", "")))
             if status == 403:
                 raise _forbidden_error(path, response)
             if status >= 400:
                 logger.info("account_detail_portal path=%s status=%s", path, status)
-                continue
+                break
             payload = _json(response)
             url = _portal_url(payload)
             if url:
                 logger.info("account_detail_portal path=%s status=%s ok", path, status)
-                return {"url": url, "source": path}
+                return url, path, attempts
             logger.info("account_detail_portal path=%s status=%s no_url structure=%s",
                         path, status, json.dumps(_structure(payload), ensure_ascii=False)[:700])
+            break
+    return "", "", attempts
+
+
+def fetch_stripe_portal(session: str, access_token: str, *, account_id: str,
+                        country: str, timeout: float = ORDER_HTTP_TIMEOUT_S) -> Dict[str, str]:
+    """Create a Stripe customer-portal session on the bound exit."""
+    proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
+    client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
+    client.access_token = access_token
+    client.timeout = timeout
+    try:
+        url, source, attempts = _request_portal_url(client, account_id, timeout, allow_refresh=True)
+        if url:
+            return {"url": url, "source": source}
     finally:
         client.close()
     raise DomainError(

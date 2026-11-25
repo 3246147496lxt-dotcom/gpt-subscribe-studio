@@ -1,5 +1,5 @@
 import {
-  Alert, Badge, Button, Group, Loader, Modal, Paper, SimpleGrid, Stack, Table, Text, Textarea, Title,
+  Alert, Anchor, Badge, Button, Group, Loader, Modal, Paper, SimpleGrid, Stack, Table, Text, Textarea, Title,
 } from "@mantine/core";
 import { IconAlertCircle, IconExternalLink, IconRefresh } from "@tabler/icons-react";
 import { useState } from "react";
@@ -59,6 +59,7 @@ export function AccountDetailModal({ opened, onClose }: Props) {
   }
 
   const invoices = detail?.invoices ?? [];
+  const hasInvoiceLinks = invoices.some((item) => Boolean(item.invoiceUrl));
 
   async function openPortal() {
     if (portalLoading) return;
@@ -147,7 +148,12 @@ export function AccountDetailModal({ opened, onClose }: Props) {
 
             <Stack gap="xs">
               <Group justify="space-between" align="center">
-                <Text fw={600} size="sm">历史账单</Text>
+                <Group gap="xs">
+                  <Text fw={600} size="sm">历史账单</Text>
+                  {detail.billingSource === "stripe_portal" && invoices.length > 0 && (
+                    <Badge size="xs" variant="light" color="blue">Stripe 账单门户</Badge>
+                  )}
+                </Group>
                 <Button variant="subtle" size="xs" leftSection={<IconExternalLink size={14} />}
                   onClick={() => void openPortal()} loading={portalLoading}
                   disabled={!session.trim()}>
@@ -156,9 +162,9 @@ export function AccountDetailModal({ opened, onClose }: Props) {
               </Group>
               {portalError && <Text size="xs" c="red">{portalError}</Text>}
               {invoices.length === 0 ? (
-                <Text c="dimmed" size="sm" py="sm">暂无历史账单。</Text>
+                <Text c="dimmed" size="sm" py="sm">{detail.billingNote || "暂无历史账单。"}</Text>
               ) : (
-                <Table.ScrollContainer minWidth={480}>
+                <Table.ScrollContainer minWidth={hasInvoiceLinks ? 540 : 480}>
                   <Table verticalSpacing="sm" highlightOnHover>
                     <Table.Thead>
                       <Table.Tr>
@@ -166,6 +172,7 @@ export function AccountDetailModal({ opened, onClose }: Props) {
                         <Table.Th>支付时间（北京时间）</Table.Th>
                         <Table.Th>状态</Table.Th>
                         <Table.Th>金额</Table.Th>
+                        {hasInvoiceLinks && <Table.Th>凭证</Table.Th>}
                       </Table.Tr>
                     </Table.Thead>
                     <Table.Tbody>
@@ -174,11 +181,38 @@ export function AccountDetailModal({ opened, onClose }: Props) {
                           <Table.Td>{invoice.plan}</Table.Td>
                           <Table.Td>{invoice.paidAt}</Table.Td>
                           <Table.Td>
-                            <Badge color={invoice.status === "已支付" ? "green" : "gray"} variant="light">
+                            <Badge
+                              color={
+                                invoice.status === "已支付"
+                                  ? "green"
+                                  : invoice.status === "已退款"
+                                    ? "blue"
+                                    : invoice.status === "支付失败"
+                                      ? "red"
+                                      : "gray"
+                              }
+                              variant="light"
+                            >
                               {invoice.status}
                             </Badge>
                           </Table.Td>
                           <Table.Td>{invoice.amount}</Table.Td>
+                          {hasInvoiceLinks && (
+                            <Table.Td>
+                              {invoice.invoiceUrl ? (
+                                <Anchor
+                                  href={invoice.invoiceUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  size="xs"
+                                >
+                                  查看发票
+                                </Anchor>
+                              ) : (
+                                <Text size="xs" c="dimmed">-</Text>
+                              )}
+                            </Table.Td>
+                          )}
                         </Table.Tr>
                       ))}
                     </Table.Tbody>

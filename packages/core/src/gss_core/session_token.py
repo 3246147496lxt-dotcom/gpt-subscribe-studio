@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 _COUNTRY = re.compile(r"^[A-Z]{2}$")
 
@@ -124,7 +126,7 @@ def _from_mapping(data: Any, *, strip_ambient: bool = False) -> SessionBundle:
             session_id = _first_string(statsig_mapping, ("sessionId", "session_id"))
     if not token and isinstance(nested, str) and len(nested) > 20:
         token = nested.strip()
-    if not token:
+    if not token and not session_token and not refresh_token:
         raise ValueError("JSON 中没有 accessToken")
     if session_token:
         cookies.setdefault("__Secure-next-auth.session-token", session_token)
@@ -238,7 +240,52 @@ def _parse_cookie_header(text: str) -> Dict[str, str]:
     return cookies
 
 
-__all__ = ["SessionBundle", "parse_session", "parse_session_bundle", "parse_statsig_context", "identity_cookies_for_reissue"]
+__all__ = [
+    "SessionBundle",
+    "parse_session",
+    "parse_session_bundle",
+    "parse_statsig_context",
+    "identity_cookies_for_reissue",
+    "jwt_claims",
+    "access_token_exp_remaining",
+    "is_access_token_expired",
+]
+
+
+def jwt_claims(token: str) -> Dict[str, Any]:
+    """解析 3 段 JWS JWT 的 payload；非标准 JWT 或 5 段 JWE 返回空字典。"""
+    parts = str(token or "").strip().split(".")
+    if len(parts) != 3 or not parts[1]:
+        return {}
+    payload = parts[1].replace("-", "+").replace("_", "/")
+    payload += "=" * (-len(payload) % 4)
+    try:
+        data = json.loads(base64.b64decode(payload).decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def access_token_exp_remaining(
+    access_token: str, *, now: Optional[float] = None
+) -> Optional[float]:
+    """返回 JWT accessToken 距离过期的剩余秒数；非 JWT 或无 exp 时返回 None。"""
+    claims = jwt_claims(access_token)
+    exp = claims.get("exp")
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        return None
+    current = time.time() if now is None else float(now)
+    return float(exp) - current
+
+
+def is_access_token_expired(
+    access_token: str, *, leeway_seconds: int = 0, now: Optional[float] = None
+) -> bool:
+    """判断 JWT accessToken 是否已过期（或在 leeway_seconds 内即将过期）。"""
+    remaining = access_token_exp_remaining(access_token, now=now)
+    if remaining is None:
+        return False
+    return remaining <= float(leeway_seconds)
 
 def email_from_access_token(access_token: str) -> str:
     """从 ChatGPT accessToken（JWT）里取账户邮箱。

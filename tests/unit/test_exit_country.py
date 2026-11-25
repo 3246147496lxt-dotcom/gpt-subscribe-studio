@@ -1,4 +1,4 @@
-"""代理出口国家以订单目标国家为准，Session 签发地只兜底。"""
+"""出口自由：显式出口 / Session 签发地优先，账单国只兜底。"""
 
 from __future__ import annotations
 
@@ -30,14 +30,16 @@ def _write_config(tmp_path, monkeypatch):
     return config
 
 
-def test_exit_country_prefers_target_billing_country() -> None:
-    assert exit_country_for("US", "PH") == "PH"
-    assert exit_country_for("us", "ph") == "PH"
-    assert exit_country_for("US", "") == "US"
+def test_exit_country_prefers_explicit_exit_not_billing() -> None:
+    # 固定账单国不决定出口：显式出口优先，账单国只在出口缺失时兜底。
+    assert exit_country_for("PH", "US") == "PH"
+    assert exit_country_for("us", "ph") == "US"
+    assert exit_country_for("JP", "") == "JP"
+    assert exit_country_for("", "US") == "US"
     assert exit_country_for("", "") == ""
-    # 非法目标值才回退到 Session 签发地
-    assert exit_country_for("PH", "USA") == "PH"
-    assert exit_country_for("PH", "J") == "PH"
+    # 非法值跳过，继续找下一个候选。
+    assert exit_country_for("USA", "PH") == "PH"
+    assert exit_country_for("J", "") == ""
 
 
 def test_checkout_proxy_uses_target_country(tmp_path, monkeypatch) -> None:
@@ -45,12 +47,12 @@ def test_checkout_proxy_uses_target_country(tmp_path, monkeypatch) -> None:
 
     proxy = checkout_proxy_for("checkout", session_country="JP", billing_country="US")
     assert proxy is not None
-    assert proxy_exit_region(proxy) == "US"
+    assert proxy_exit_region(proxy) == "JP"
     assert "-sid-PINNED01" in proxy
 
-    # 目标国家不同时，出口跟目标国家走，不跟 Session 签发地。
+    # 账单国固定也不改写出口。
     assert proxy_exit_region(
-        checkout_proxy_for("checkout", session_country="JP", billing_country="PH")
+        checkout_proxy_for("checkout", session_country="PH", billing_country="US")
     ) == "PH"
 
 
@@ -72,4 +74,4 @@ def test_session_proxy_for_matches_checkout_helper(tmp_path, monkeypatch) -> Non
     _write_config(tmp_path, monkeypatch)
     assert proxy_exit_region(
         session_proxy_for("checkout", session_country="JP", billing_country="US")
-    ) == "US"
+    ) == "JP"

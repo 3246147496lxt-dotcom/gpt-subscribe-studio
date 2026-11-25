@@ -37,7 +37,6 @@ def create(client, **fields):
     {"billing": {"name": "private-marker"}}, {"billing": {"line1": "private-marker"}},
     {"billing_address": "private-marker"}, {"billing_verified": True},
     {"mode": {"billing": {"line1": "private-marker"}}},
-    {"billing_country": "JP"}, {"exit_country": "JP"},
 ])
 def test_create_rejects_before_side_effects(offline, verified_payer, monkeypatch, override):
     client, pipeline = offline
@@ -98,7 +97,7 @@ def test_payment_checks_claim_binding_and_both_snapshots_before_writes(
     elif issue == "vault_drift":
         secrets.billing = {**profile, "postal_code": "other"}
     elif issue == "country_drift":
-        secrets.exit_country = "JP"
+        store.get_order(oid).billing_country = "JP"
     before_vault = dict(secrets.billing)
     submitted = {"payment_method_token" if endpoint == "pay" else "payment_method_id": "pm_offline", "billing": claim}
     if issue == "shadowed_card_address":
@@ -192,7 +191,8 @@ def test_simulated_combined_purchase_cannot_reach_session_client(offline, verifi
     guard = AsyncMock()
     monkeypatch.setattr(orders, "_guard_refresh_egress", guard)
     reply = client.post("/api/orders", headers={"Idempotency-Key": "no-refresh"}, json={
-        "plan": "plus", "billing_country": "US", "payment_method_token": "offline-verified-instrument",
+        "plan": "plus", "billing_country": "US", "exit_country": "US",
+        "payment_method_token": "offline-verified-instrument",
         "session": json.dumps({"sessionToken": "private-session", "accessToken": "private-access",
                                "statsigContext": {"country": "JP"}}),
     })
@@ -210,10 +210,11 @@ def test_omitted_country_is_loaded_from_attestation_not_a_us_default(offline, ve
     headers = {"Idempotency-Key": "server-chooses-country"}
     created = client.post("/api/orders", json=body, headers=headers)
     assert created.status_code == 201, created.text
-    assert created.json()["billing_country"] == created.json()["exit_country"] == "DE"
+    # 账单来自核验记录（DE）；出口没有指定，可以自由落点，不再被账单国绑架。
+    assert created.json()["billing_country"] == "DE"
     assert created.json()["billing"] == profile
     request, = pipeline.deps.checkout.calls
-    assert request.billing_country == request.exit_country == "DE"
+    assert request.billing_country == "DE"
     assert request.verified_billing == profile
     # Same request after a lost response: original order readable, no new write.
     monkeypatch.delenv("GSS_VERIFIED_BILLING_FILE")
@@ -224,12 +225,11 @@ def test_omitted_country_is_loaded_from_attestation_not_a_us_default(offline, ve
 
 
 @pytest.mark.parametrize("fields,expected", [
-    ({"billing_country": None}, 409), ({"billing_country": ""}, 409), ({"billing_country": "JP"}, 409),
-    ({"exit_country": None}, 409), ({"exit_country": "  "}, 409), ({"exit_country": "JP"}, 409),
     ({"billing_country": "private-marker"}, 400), ({"exit_country": "private-marker"}, 400),
+    ({"billing_country": None}, 409), ({"billing_country": ""}, 409), ({"exit_country": "  "}, 409),
     ({}, 503),
 ])
-def test_explicit_region_never_repaired_or_echoed(offline, verified_payer, fields, expected):
+def test_invalid_regions_are_rejected_without_side_effects(offline, verified_payer, fields, expected):
     client, pipeline = offline
     if fields:
         verified_payer("DE")
@@ -237,6 +237,21 @@ def test_explicit_region_never_repaired_or_echoed(offline, verified_payer, field
     assert response.status_code == expected, response.text
     assert "private-marker" not in response.text
     assert not store.orders and not pipeline.deps.checkout.calls and not pipeline.deps.payment.calls
+
+
+@pytest.mark.parametrize("fields", [
+    {"billing_country": "JP"}, {"exit_country": "JP"},
+])
+def test_free_exit_never_rewrites_the_fixed_billing(offline, verified_payer, fields):
+    client, pipeline = offline
+    profile = verified_payer("DE")
+    response = client.post("/api/orders", json={"plan": "go", "session": "fixture-session", **fields})
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["billing_country"] == "DE" and body["billing"] == profile
+    request, = pipeline.deps.checkout.calls
+    assert request.billing_country == "DE"
+    assert request.verified_billing == profile
 
 
 @pytest.mark.parametrize("fields", [{}, {"billing_country": None}])

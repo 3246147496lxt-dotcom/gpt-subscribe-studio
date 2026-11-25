@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import logging
 import os
 from urllib.parse import unquote, urlsplit
@@ -17,7 +18,11 @@ from gss_core.proxies import GatewayStore, configured_proxy
 
 from .persistence import init_db
 from .store import store
-from .routers import account, events, locks, orders, promo, proxies, quick_pay, saved_cards, protocol_cards
+from .routers import (
+    account, events, locks, orders, promo, proxies, quick_pay, saved_cards,
+    protocol_cards, runtime_flags as runtime_flags_router,
+    system as system_router, webhooks as webhooks_router,
+)
 
 __version__ = "0.1.0"
 
@@ -65,12 +70,25 @@ def create_app() -> FastAPI:
     db = init_db()
     store.attach_db(db)
     from .locks import recover_incomplete_jobs
+    from .services import order_flow, reconciler, webhooks as webhook_svc
     recover_incomplete_jobs()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        order_flow.reset_shutdown()
+        reconciler.start()
+        try:
+            yield
+        finally:
+            await reconciler.stop()
+            await order_flow.drain_quick_pay(keep_draining=False)
+            await webhook_svc.drain_webhooks()
 
     app = FastAPI(
         title="gpt-subscribe-studio API",
         version=__version__,
         description="独立的 ChatGPT 订阅开通工具：粘贴 session，浏览器填卡。",
+        lifespan=lifespan,
     )
 
     @app.exception_handler(RequestValidationError)
@@ -80,7 +98,7 @@ def create_app() -> FastAPI:
         private_create = (
             path == "/api/orders"
             or path.startswith("/api/orders/")
-            or path == "/api/payments/quick-pay"
+            or path in {"/api/payments/quick-pay", "/api/payments/preflight", "/api/payments/preflight/batch"}
         )
         if request.method == "POST" and private_create:
             return JSONResponse(status_code=422, content={"detail": {
@@ -97,6 +115,9 @@ def create_app() -> FastAPI:
     app.state.gateway_store = GatewayStore()
     app.include_router(account.router)
     app.include_router(proxies.router)
+    app.include_router(runtime_flags_router.router)
+    app.include_router(webhooks_router.router)
+    app.include_router(system_router.router)
 
     @app.get("/api/health", tags=["health"])
     async def health() -> dict:
@@ -107,6 +128,9 @@ def create_app() -> FastAPI:
             "fake_adapters": use_fake_adapters(),
             "missing_upstreams": missing_upstreams(settings),
             "proxy_sid_pinned": proxy_sid_pinned,
+            "queue": order_flow.queue_stats(),
+            "reconciler": reconciler.status(),
+            "webhooks": webhook_svc.manager.health_summary(),
         }
 
     # ── 出口代理连接失败 → 503（而不是裸 500）────────────────────

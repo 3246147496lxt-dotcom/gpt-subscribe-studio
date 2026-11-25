@@ -14,4 +14,23 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("/@tabler/icons-react/")) {
+            return "vendor-icons";
+          }
+          if (id.includes("/@mantine/")) {
+            return "vendor-mantine";
+          }
+          if (id.includes("/react/") || id.includes("/react-dom/") || id.includes("/scheduler/")) {
+            return "vendor-react";
+          }
+          return undefined;
+        },
+      },
+    },
+  },
 });

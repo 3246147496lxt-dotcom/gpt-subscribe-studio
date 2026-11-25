@@ -360,7 +360,7 @@ pnpm --dir apps/web dev
 
 ### 账单地址与邮箱
 
-非 Team 建单和付款只使用本部署**同一付款主体已核验**的固定账单。管理员需在系统外核验并配置私有记录（`GSS_VERIFIED_BILLING_FILE`）；前端只读。缺少记录、资料不完整或地址冲突时，不提交新的结账或付款。不会随机补地址，也不会使用登录邮箱代替账单邮箱。详见[固定账单配置与失败行为](specs/003-verified-billing/spec.md)。
+非 Team 建单和付款只使用本部署**同一付款主体已核验**的固定账单。管理员可配置 `GSS_FIXED_BILLING_FILE`（推荐，固定美国免税地址）、`GSS_VERIFIED_BILLING_FILE` 或 `GSS_BILLING_PROFILES_FILE`；前端只读。账单国家固定，出口代理可以自由选择/轮换，二者不互相绑定。缺少记录、资料不完整或地址冲突时，不提交新的结账或付款。不会随机补地址，也不会使用登录邮箱代替账单邮箱。详见[固定账单配置与失败行为](specs/003-verified-billing/spec.md)与[固定美国免税账单 + 自由出口](docs/fixed-us-billing.md)。
 
 ---
 

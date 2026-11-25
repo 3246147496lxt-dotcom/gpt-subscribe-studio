@@ -230,9 +230,14 @@ class QuickPayJobOut(BaseModel):
     lock_id: Optional[str] = None
     timings_ms: Dict[str, int] = Field(default_factory=dict)
     diagnostics: Dict[str, Any] = Field(default_factory=dict)
+    next_action: Optional[Dict[str, Any]] = None
     events: list[QuickPayEventOut] = Field(default_factory=list)
     status: str
     stage: str
+    queue_position: Optional[int] = None
+    attempts: int = 0
+    reconcile_attempts: int = 0
+    last_reconciled_at: Optional[str] = None
     order_id: Optional[str] = None
     purchase_attempt_id: Optional[str] = None
     amount: Optional[str] = None
@@ -245,6 +250,276 @@ class QuickPayJobOut(BaseModel):
     proxy_rotations: int = 0
     proxy_last_sid: Optional[str] = None
     proxy_last_exit_ip: Optional[str] = None
+
+
+class PreflightRequest(BaseModel):
+    """Read-only pre-flight check input. Never accepts or stores card data."""
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    plan: str
+    billing_country: Optional[str] = None
+    exit_country: Optional[str] = None
+    session: str = Field(default="", repr=False)
+    debug_checkout_only: bool = False
+    check_proxy_connectivity: bool = False
+    check_account_upstream: bool = False
+
+
+class PreflightCheckOut(BaseModel):
+    key: str
+    label: str
+    status: Literal["pass", "warn", "fail"]
+    code: str
+    message: str
+
+
+class QueueStatsOut(BaseModel):
+    queued: int = 0
+    running: int = 0
+    max_concurrency: int = 3
+    draining: bool = False
+
+
+class QueueJobSummaryOut(BaseModel):
+    job_id: str
+    status: str
+    stage: str
+    queue_position: Optional[int] = None
+    attempts: int = 0
+    reconcile_attempts: int = 0
+    last_reconciled_at: Optional[str] = None
+    order_id: Optional[str] = None
+    amount: Optional[str] = None
+    currency: Optional[str] = None
+    failure_code: Optional[str] = None
+    message: Optional[str] = None
+    timings_ms: Dict[str, int] = Field(default_factory=dict)
+    created_at: str
+    finished_at: Optional[str] = None
+
+
+class QueueStatusOut(BaseModel):
+    stats: QueueStatsOut
+    jobs: list[QueueJobSummaryOut] = Field(default_factory=list)
+
+
+class PreflightOut(BaseModel):
+    ok: bool
+    blocking_code: Optional[str] = None
+    summary: str
+    checks: list[PreflightCheckOut] = Field(default_factory=list)
+    queue: QueueStatsOut
+    elapsed_ms: int = 0
+
+
+class OrderLedgerStatsOut(BaseModel):
+    total: int = 0
+    delivered: int = 0
+    paid_pending_delivery: int = 0
+    unknown: int = 0
+    failed: int = 0
+    active_locks: int = 0
+
+
+class OrderLedgerItemOut(BaseModel):
+    id: str
+    plan: str
+    billing_country: str
+    exit_country: Optional[str] = None
+    status: str
+    payment_status: str = "unpaid"
+    delivery_status: str = "pending"
+    amount: Optional[str] = None
+    currency: Optional[str] = None
+    failure_code: Optional[str] = None
+    last_error: Optional[str] = None
+    purchase_attempt_id: Optional[str] = None
+    payment_intent_id: Optional[str] = None
+    auto_cancel_renew: bool = False
+    auto_renew_status: str = "disabled"
+    auto_renew_canceled_at: Optional[str] = None
+    auto_renew_error: Optional[str] = None
+    job_id: Optional[str] = None
+    reconcile_attempts: int = 0
+    active_lock_id: Optional[str] = None
+    created_at: str
+    updated_at: str
+    unknown_since: Optional[str] = None
+    finished_at: Optional[str] = None
+
+
+class OrderLedgerOut(BaseModel):
+    stats: OrderLedgerStatsOut
+    total: int = 0
+    limit: int = 20
+    offset: int = 0
+    items: list[OrderLedgerItemOut] = Field(default_factory=list)
+
+
+class PaymentLockSummaryOut(BaseModel):
+    id: str
+    lock_key_prefix: str
+    lock_type: str
+    order_id: Optional[str] = None
+    job_id: Optional[str] = None
+    payment_intent_id: Optional[str] = None
+    state: str
+    reason: str
+    created_at: str
+    released_at: Optional[str] = None
+    released_by: Optional[str] = None
+    release_note: Optional[str] = None
+    order_plan: Optional[str] = None
+    order_status: Optional[str] = None
+    order_payment_status: Optional[str] = None
+    order_delivery_status: Optional[str] = None
+    order_amount: Optional[str] = None
+    order_currency: Optional[str] = None
+    order_billing_country: Optional[str] = None
+
+
+class PaymentLocksOut(BaseModel):
+    counts: Dict[str, int] = Field(default_factory=dict)
+    total: int = 0
+    limit: int = 50
+    offset: int = 0
+    items: list[PaymentLockSummaryOut] = Field(default_factory=list)
+
+
+class ReconcileResultOut(BaseModel):
+    order_id: Optional[str] = None
+    job_id: Optional[str] = None
+    outcome: str
+    changed: bool = False
+    order_status: Optional[str] = None
+    payment_status: Optional[str] = None
+    delivery_status: Optional[str] = None
+    job_status: Optional[str] = None
+    lock_state: Optional[str] = None
+    reconcile_attempts: int = 0
+    message: str = ""
+
+
+class ReconcilerStatusOut(BaseModel):
+    enabled: bool
+    running: bool
+    interval_s: float
+    max_attempts: int
+    pending_candidates: int = 0
+    last_run_at: Optional[str] = None
+    total_runs: int = 0
+    resolved_count: int = 0
+
+
+class WebhookConfigIn(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    enabled: bool = False
+    url: str = Field(default="", max_length=1000)
+    secret: Optional[str] = Field(default=None, max_length=256, repr=False)
+    clear_secret: bool = False
+    events: list[str] = Field(default_factory=lambda: [
+        "succeeded", "failed", "unknown", "requires_action", "paid_pending_delivery", "reconcile_resolved",
+    ])
+
+
+class WebhookConfigOut(BaseModel):
+    enabled: bool = False
+    url_masked: str = ""
+    has_url: bool = False
+    has_secret: bool = False
+    events: list[str] = Field(default_factory=list)
+    supported_events: list[str] = Field(default_factory=list)
+
+
+class WebhookDeliveryOut(BaseModel):
+    id: str
+    event: str
+    ok: bool
+    status_code: Optional[int] = None
+    elapsed_ms: int = 0
+    attempts: int = 1
+    error: Optional[str] = None
+    created_at: str
+
+
+class WebhookSettingsOut(BaseModel):
+    config: WebhookConfigOut
+    deliveries: list[WebhookDeliveryOut] = Field(default_factory=list)
+
+
+class WebhookTestOut(BaseModel):
+    ok: bool
+    status_code: Optional[int] = None
+    elapsed_ms: int = 0
+    error: Optional[str] = None
+    delivery: Optional[WebhookDeliveryOut] = None
+
+
+class BatchPreflightItemIn(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    label: str = Field(default="", max_length=60)
+    plan: str = "plus"
+    billing_country: Optional[str] = None
+    exit_country: Optional[str] = None
+    session: str = Field(default="", repr=False)
+    check_proxy_connectivity: bool = False
+    check_account_upstream: bool = False
+
+
+class BatchPreflightRequest(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    items: list[BatchPreflightItemIn] = Field(min_length=1, max_length=20)
+
+
+class BatchPreflightItemOut(BaseModel):
+    index: int
+    label: str
+    ok: bool
+    blocking_code: Optional[str] = None
+    summary: str
+    checks: list[PreflightCheckOut] = Field(default_factory=list)
+    elapsed_ms: int = 0
+
+
+class BatchPreflightOut(BaseModel):
+    total: int
+    passed: int
+    failed: int
+    elapsed_ms: int = 0
+    items: list[BatchPreflightItemOut] = Field(default_factory=list)
+
+
+class SystemCheckOut(BaseModel):
+    key: str
+    label: str
+    status: Literal["pass", "warn", "fail"]
+    code: str
+    message: str
+
+
+class SystemDiagnosticsOut(BaseModel):
+    ok: bool
+    python_version: str
+    node_version: Optional[str] = None
+    db_bytes: int = 0
+    wal_bytes: int = 0
+    table_counts: Dict[str, int] = Field(default_factory=dict)
+    cached_orders: int = 0
+    disk_free_mb: int = 0
+    checks: list[SystemCheckOut] = Field(default_factory=list)
+
+
+class MaintenanceOut(BaseModel):
+    retention_days: int
+    pruned_events: int
+    db_bytes: int
+    wal_bytes: int
+    wal_checkpoint: Optional[Dict[str, int]] = None
+    table_counts: Dict[str, int] = Field(default_factory=dict)
 
 
 class AccountSubscriptionRequest(BaseModel):
@@ -261,6 +536,7 @@ class AccountInvoiceOut(BaseModel):
     paidAt: str
     status: str
     amount: str
+    invoiceUrl: Optional[str] = None
 
 
 class AccountSubscriptionOut(BaseModel):
@@ -275,6 +551,8 @@ class AccountSubscriptionOut(BaseModel):
     paymentChannel: str
     currency: str
     invoices: list[AccountInvoiceOut] = Field(default_factory=list)
+    billingSource: Optional[str] = None
+    billingNote: Optional[str] = None
     queriedAt: str
     cached: bool = False
     stale: bool = False
@@ -290,3 +568,43 @@ class StripePortalRequest(BaseModel):
 class StripePortalOut(BaseModel):
     url: str
     source: str
+
+
+class RuntimeFlagOptionOut(BaseModel):
+    value: str
+    label: str
+
+
+class RuntimeFlagItemOut(BaseModel):
+    key: str
+    category: str
+    label: str
+    description: str
+    kind: str
+    env_var: str
+    value: Any
+    default: Any
+    env_value: Any = None
+    source: str
+    options: list[RuntimeFlagOptionOut] = Field(default_factory=list)
+    min_value: Optional[int] = None
+    max_value: Optional[int] = None
+
+
+class RuntimeFlagsOut(BaseModel):
+    items: list[RuntimeFlagItemOut] = Field(default_factory=list)
+    override_count: int = 0
+    updated_at: Optional[str] = None
+    fake_mode: bool = False
+
+
+class RuntimeFlagsUpdateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    updates: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RuntimeFlagsResetIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    keys: Optional[list[str]] = None

@@ -137,3 +137,125 @@ def test_quick_pay_requires_idempotency_key():
     })
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "idempotency_conflict"
+
+
+def test_quick_pay_omitted_billing_country_is_not_forwarded_as_null(monkeypatch):
+    seen = {}
+
+    async def create_order(payload, key, progress=None):
+        seen["fields_set"] = set(payload.model_fields_set)
+        seen["exit_country"] = payload.exit_country
+        seen["billing_country"] = payload.billing_country
+        return SimpleNamespace(id="order-omit", purchase_attempt_id="pa_omit", amount="982.14", currency="PHP")
+
+    monkeypatch.setattr(order_flow.orders, "_create_order", create_order)
+    req = QuickPayRequest(
+        plan="plus",
+        exit_country="PH",
+        session="session-fixture",
+        mode=ModeIn(),
+        debug_checkout_only=True,
+    )
+    job, _ = order_flow._reserve_job(req, "omit-billing-key", "test-owner")
+    result = asyncio.run(order_flow.run_quick_pay(job.id, req, "omit-billing-key"))
+    assert result.status == "succeeded"
+    assert "billing_country" not in seen["fields_set"]
+    assert seen["billing_country"] is None
+    assert seen["exit_country"] == "PH"
+
+
+@pytest.mark.parametrize("plan_name", ["go", "pro_lite", "pro", "pro_max"])
+def test_quick_pay_non_plus_plan_routes_to_pay_order_protocol(monkeypatch, plan_name):
+    calls = []
+
+    async def create_order(payload, key, progress=None):
+        calls.append(("create", payload.plan))
+        return SimpleNamespace(id=f"order-{plan_name}", purchase_attempt_id=f"pa-{plan_name}",
+                               amount="20.00", currency="USD")
+
+    async def bind_should_not_run(order_id, payload):
+        calls.append(("bind_plus", order_id))
+        raise AssertionError("non-Plus plan must not call Plus-only bind_and_pay_protocol")
+
+    async def pay_protocol(order_id, payload):
+        calls.append(("pay_protocol", order_id, payload.billing.country))
+        return order_flow.orders.ProtocolPayOut(
+            state="paid",
+            payment_status="succeeded",
+            delivery_status="delivered",
+            message="ok",
+        )
+
+    monkeypatch.setattr(order_flow.orders, "_create_order", create_order)
+    monkeypatch.setattr(order_flow.protocol_cards, "bind_and_pay_protocol", bind_should_not_run)
+    monkeypatch.setattr(order_flow.orders, "pay_order_protocol", pay_protocol)
+
+    base = _payload(debug=False)
+    req = QuickPayRequest(
+        plan=plan_name,
+        exit_country="PH",
+        session=base.session,
+        card=base.card,
+        billing=base.billing,
+        mode=base.mode,
+        debug_checkout_only=False,
+    )
+    job, _ = order_flow._reserve_job(req, f"key-{plan_name}", "test-owner")
+    result = asyncio.run(order_flow.run_quick_pay(job.id, req, f"key-{plan_name}"))
+    assert result.status == "succeeded"
+    assert calls == [("create", plan_name), ("pay_protocol", f"order-{plan_name}", "US")]
+
+
+def test_quick_pay_challenge_required_transitions_to_requires_action(monkeypatch):
+    async def create_order(payload, key, progress=None):
+        return SimpleNamespace(id="order-3ds", purchase_attempt_id="pa-3ds", amount="20.00", currency="USD")
+
+    async def bind_challenge(order_id, payload):
+        return {
+            "state": "challenge_required",
+            "payment_status": "processing",
+            "code": None,
+            "message": "需要完成验证",
+            "next_action": {"type": "use_stripe_sdk"},
+        }
+
+    monkeypatch.setattr(order_flow.orders, "_create_order", create_order)
+    monkeypatch.setattr(order_flow.protocol_cards, "bind_and_pay_protocol", bind_challenge)
+
+    req = _payload(debug=False)
+    job, _ = order_flow._reserve_job(req, "challenge-key", "test-owner")
+    result = asyncio.run(order_flow.run_quick_pay(job.id, req, "challenge-key"))
+    assert result.status == "requires_action"
+    assert result.stage == "requires_action"
+    assert result.lock_id is None
+
+
+def test_orders_table_persists_exit_country_on_upsert():
+    from gss_api.persistence import get_db_optional
+    from gss_api.store import OrderView
+    from gss_contracts import Mode, Order, OrderStatus, Plan
+
+    db = get_db_optional()
+    order = Order(
+        idempotency_key="exit-persist-key",
+        purchase_attempt_id="pa_exit_persist",
+        plan=Plan.PLUS,
+        billing_country="US",
+        mode=Mode(),
+        status=OrderStatus.CREATED,
+    )
+    view = OrderView()
+    db.save_order(order, view)
+
+    # Simulate remember() updating view.exit_country after initial insert.
+    view.exit_country = "PH"
+    order.status = OrderStatus.AWAITING_PAYMENT
+    db.save_order(order, view)
+
+    rows, total = db.list_orders_page(limit=10)
+    assert total == 1
+    assert rows[0]["exit_country"] == "PH"
+
+    reloaded = db.get_order_by_id(order.id)
+    assert reloaded is not None
+    assert reloaded[1].exit_country == "PH"

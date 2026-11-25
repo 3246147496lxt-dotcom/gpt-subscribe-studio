@@ -1,8 +1,11 @@
+import { requestJson } from "./http";
+
 export interface AccountInvoice {
   plan: string;
   paidAt: string;
   status: string;
   amount: string;
+  invoiceUrl?: string | null;
 }
 
 export interface AccountSubscription {
@@ -17,6 +20,8 @@ export interface AccountSubscription {
   paymentChannel: string;
   currency: string;
   invoices: AccountInvoice[];
+  billingSource?: string | null;
+  billingNote?: string | null;
   queriedAt: string;
   cached: boolean;
   stale: boolean;
@@ -30,25 +35,17 @@ export interface AccountSubscriptionInput {
 }
 
 export async function fetchAccountSubscription(input: AccountSubscriptionInput): Promise<AccountSubscription> {
-  const response = await fetch("/api/account/subscription-detail", {
+  return requestJson<AccountSubscription>("/api/account/subscription-detail", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+    body: {
       session: input.session,
       accountId: input.accountId ?? "",
       forceRefresh: Boolean(input.forceRefresh),
-    }),
+    },
+    timeoutMs: 60_000,
+    includeErrorCode: true,
+    fallbackError: "查询失败",
   });
-  const data = await response.json().catch(() => null) as
-    | { detail?: { code?: string; message?: string } }
-    | AccountSubscription
-    | null;
-  if (!response.ok) {
-    const detail = (data as { detail?: { code?: string; message?: string } } | null)?.detail;
-    const message = detail?.message || `查询失败（HTTP ${response.status}）`;
-    throw new Error(detail?.code ? `${message}（${detail.code}）` : message);
-  }
-  return data as AccountSubscription;
 }
 
 export interface StripePortal {
@@ -57,19 +54,11 @@ export interface StripePortal {
 }
 
 export async function fetchStripePortal(input: { session: string; accountId?: string }): Promise<StripePortal> {
-  const response = await fetch("/api/account/stripe-portal", {
+  return requestJson<StripePortal>("/api/account/stripe-portal", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session: input.session, accountId: input.accountId ?? "" }),
+    body: { session: input.session, accountId: input.accountId ?? "" },
+    timeoutMs: 30_000,
+    includeErrorCode: true,
+    fallbackError: "无法打开账单门户",
   });
-  const data = await response.json().catch(() => null) as
-    | { detail?: { code?: string; message?: string } }
-    | StripePortal
-    | null;
-  if (!response.ok) {
-    const detail = (data as { detail?: { code?: string; message?: string } } | null)?.detail;
-    const message = detail?.message || `无法打开账单门户（HTTP ${response.status}）`;
-    throw new Error(detail?.code ? `${message}（${detail.code}）` : message);
-  }
-  return data as StripePortal;
 }

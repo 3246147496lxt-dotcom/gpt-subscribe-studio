@@ -169,6 +169,11 @@ class Persistence:
                 lock_id TEXT,
                 timings_json TEXT NOT NULL DEFAULT '{}',
                 diagnostics_json TEXT NOT NULL DEFAULT '{}',
+                next_action_json TEXT NOT NULL DEFAULT '{}',
+                priority INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                reconcile_attempts INTEGER NOT NULL DEFAULT 0,
+                last_reconciled_at TEXT,
                 locked_by TEXT,
                 lease_until TEXT,
                 created_at TEXT NOT NULL,
@@ -257,12 +262,20 @@ class Persistence:
         for column, definition in (
             ("intent_digest", "TEXT"),
             ("diagnostics_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("next_action_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("priority", "INTEGER NOT NULL DEFAULT 0"),
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("reconcile_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_reconciled_at", "TEXT"),
         ):
             try:
                 self._conn.execute(f"ALTER TABLE quick_pay_jobs ADD COLUMN {column} {definition}")
             except sqlite3.OperationalError as exc:
                 if str(exc).lower() != f"duplicate column name: {column}":
                     raise
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_queue ON quick_pay_jobs(status, priority DESC, created_at ASC)"
+        )
         self._conn.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
             (str(SCHEMA_VERSION),),
@@ -368,6 +381,7 @@ class Persistence:
                     idempotency_key=excluded.idempotency_key,
                     account_fingerprint=excluded.account_fingerprint,
                     purchase_attempt_id=excluded.purchase_attempt_id,
+                    exit_country=excluded.exit_country,
                     status=excluded.status,
                     payment_status=excluded.payment_status,
                     delivery_status=excluded.delivery_status,
@@ -399,38 +413,77 @@ class Persistence:
             )
             self._conn.commit()
 
-    def load_orders(self) -> list[tuple[Order, "OrderView", Optional[str]]]:
+    @staticmethod
+    def _row_to_order(row: sqlite3.Row) -> tuple[Order, "OrderView", Optional[str]]:
         from .store import OrderView
+        mode = Mode(
+            account_source=row["account_source"],
+            card_source=row["card_source"],
+            billing_mode=row["billing_mode"],
+            risk_acknowledged=bool(row["risk_acknowledged"]),
+        )
+        order = Order(
+            id=row["id"], idempotency_key=row["idempotency_key"] or "",
+            purchase_attempt_id=row["purchase_attempt_id"] or "",
+            plan=Plan(row["plan"]), billing_country=row["billing_country"],
+            mode=mode, status=OrderStatus(row["status"]),
+            amount=Decimal(row["amount"]) if row["amount"] else None,
+            cost=Decimal(row["cost"]) if row["cost"] else None,
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+        view = OrderView()
+        try:
+            data = json.loads(row["view_json"] or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        for key, value in data.items():
+            if hasattr(view, key) and not isinstance(value, (bytes, bytearray)):
+                setattr(view, key, value)
+        if not view.exit_country and row["exit_country"]:
+            view.exit_country = row["exit_country"]
+        return order, view, row["account_fingerprint"]
+
+    def load_orders(self, *, limit: Optional[int] = None) -> list[tuple[Order, "OrderView", Optional[str]]]:
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM orders ORDER BY created_at").fetchall()
-        result = []
-        for row in rows:
-            mode = Mode(
-                account_source=row["account_source"],
-                card_source=row["card_source"],
-                billing_mode=row["billing_mode"],
-                risk_acknowledged=bool(row["risk_acknowledged"]),
-            )
-            order = Order(
-                id=row["id"], idempotency_key=row["idempotency_key"] or "",
-                purchase_attempt_id=row["purchase_attempt_id"] or "",
-                plan=Plan(row["plan"]), billing_country=row["billing_country"],
-                mode=mode, status=OrderStatus(row["status"]),
-                amount=Decimal(row["amount"]) if row["amount"] else None,
-                cost=Decimal(row["cost"]) if row["cost"] else None,
-                created_at=datetime.fromisoformat(row["created_at"]),
-                updated_at=datetime.fromisoformat(row["updated_at"]),
-            )
-            view = OrderView()
-            try:
-                data = json.loads(row["view_json"] or "{}")
-            except (TypeError, ValueError):
-                data = {}
-            for key, value in data.items():
-                if hasattr(view, key) and not isinstance(value, (bytes, bytearray)):
-                    setattr(view, key, value)
-            result.append((order, view, row["account_fingerprint"]))
-        return result
+            if limit is None:
+                rows = self._conn.execute("SELECT * FROM orders ORDER BY created_at").fetchall()
+            else:
+                capped = max(1, int(limit))
+                # Always load all non-terminal/unknown orders plus the newest N settled orders.
+                rows = self._conn.execute(
+                    """SELECT * FROM (
+                           SELECT * FROM orders WHERE status NOT IN ('delivered','failed','rejected','refunded')
+                           UNION
+                           SELECT * FROM (
+                               SELECT * FROM orders ORDER BY created_at DESC LIMIT ?
+                           )
+                       ) ORDER BY created_at ASC""",
+                    (capped,),
+                ).fetchall()
+        return [self._row_to_order(row) for row in rows]
+
+    def get_order_by_id(self, order_id: str) -> Optional[tuple[Order, "OrderView", Optional[str]]]:
+        if not order_id:
+            return None
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        return self._row_to_order(row) if row is not None else None
+
+    def find_order_id_by_idempotency(self, key: str) -> Optional[str]:
+        if not key:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT order_id FROM idempotency_keys WHERE key=? AND COALESCE(order_id,'')!=''",
+                (key,),
+            ).fetchone()
+            if row is not None:
+                return str(row["order_id"])
+            ord_row = self._conn.execute(
+                "SELECT id FROM orders WHERE idempotency_key=?", (key,)
+            ).fetchone()
+        return str(ord_row["id"]) if ord_row is not None else None
 
     # -- jobs --------------------------------------------------------------- #
     def get_quick_pay_by_key(self, key: str) -> Optional[dict[str, Any]]:
@@ -488,11 +541,12 @@ class Persistence:
                 if held is not None:
                     raise QuickPayAdmissionBlocked(held)
                 now = _utcnow()
+                priority = int(getattr(job, "priority", 0) or 0)
                 self._conn.execute(
                     """INSERT INTO quick_pay_jobs
-                       (id,idempotency_key,intent_digest,account_fingerprint,status,stage,created_at,updated_at)
-                       VALUES(?,?,?,?,'queued','queued',?,?)""",
-                    (job.id, key, intent_digest, owner or None, now, now),
+                       (id,idempotency_key,intent_digest,account_fingerprint,status,stage,priority,attempts,created_at,updated_at)
+                       VALUES(?,?,?,?,'queued','queued',?,0,?,?)""",
+                    (job.id, key, intent_digest, owner or None, priority, now, now),
                 )
                 self._conn.execute(
                     """INSERT INTO idempotency_keys (key,scope,job_id,state,created_at,last_seen_at)
@@ -509,13 +563,26 @@ class Persistence:
             # All writers share this boundary. No wire evidence is not the
             # same as no failure; record only an allowlisted local stage.
             diagnostics = safe_checkout_diagnostics({"stage": job.stage}) or {"stage": "failed"}
+        lease_raw = getattr(job, "lease_until", None)
+        lease_text = (
+            datetime.fromtimestamp(lease_raw, timezone.utc).isoformat()
+            if isinstance(lease_raw, (int, float))
+            else (str(lease_raw) if lease_raw else None)
+        )
+        next_action_raw = getattr(job, "next_action", None)
+        next_action_json = json.dumps(next_action_raw if isinstance(next_action_raw, dict) else {}, ensure_ascii=False)
         payload = (
             job.id, job.idempotency_key, getattr(job, "account_fingerprint", None),
             job.order_id, job.status, job.stage, job.failure_code, job.message,
             job.amount, job.currency, job.purchase_attempt_id, getattr(job, "lock_id", None),
             json.dumps(getattr(job, "timings", {}) or {}, ensure_ascii=False),
             json.dumps(diagnostics),
-            getattr(job, "locked_by", None), getattr(job, "lease_until", None),
+            next_action_json,
+            int(getattr(job, "priority", 0) or 0),
+            int(getattr(job, "attempts", 0) or 0),
+            int(getattr(job, "reconcile_attempts", 0) or 0),
+            getattr(job, "last_reconciled_at", None),
+            getattr(job, "locked_by", None), lease_text,
             datetime.fromtimestamp(job.started_at, timezone.utc).isoformat()
             if getattr(job, "started_at", None) else _utcnow(),
             _utcnow(),
@@ -527,9 +594,10 @@ class Persistence:
                 """INSERT INTO quick_pay_jobs(
                     id, idempotency_key, account_fingerprint, order_id, status, stage,
                     failure_code, message, amount, currency, purchase_attempt_id, lock_id,
-                    timings_json, diagnostics_json, locked_by, lease_until,
+                    timings_json, diagnostics_json, next_action_json, priority, attempts,
+                    reconcile_attempts, last_reconciled_at, locked_by, lease_until,
                     created_at, updated_at, finished_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status, stage=excluded.stage,
                     order_id=COALESCE(NULLIF(quick_pay_jobs.order_id,''), excluded.order_id),
@@ -539,6 +607,13 @@ class Persistence:
                     lock_id=excluded.lock_id,
                     timings_json=excluded.timings_json,
                     diagnostics_json=COALESCE(gss_existing_diag(quick_pay_jobs.diagnostics_json), excluded.diagnostics_json),
+                    next_action_json=excluded.next_action_json,
+                    priority=excluded.priority,
+                    attempts=excluded.attempts,
+                    reconcile_attempts=excluded.reconcile_attempts,
+                    last_reconciled_at=COALESCE(excluded.last_reconciled_at, quick_pay_jobs.last_reconciled_at),
+                    locked_by=excluded.locked_by,
+                    lease_until=excluded.lease_until,
                     updated_at=excluded.updated_at, finished_at=excluded.finished_at""",
                 payload,
             )
@@ -573,9 +648,9 @@ class Persistence:
                          AND EXISTS (SELECT 1 FROM order_events WHERE job_id=j.id AND stage='creating_checkout')
                          AND (SELECT stage FROM order_events WHERE job_id=j.id ORDER BY id DESC LIMIT 1)='failed'
                          AND NOT EXISTS (SELECT 1 FROM order_events WHERE job_id=j.id AND stage NOT IN
-                             ('creating_order','running','reissuing','reissued','session_refresh',
-                              'session_refreshed','browser_decode','browser_decoded','browser_decode_skipped',
-                              'creating_checkout','failed'))
+                             ('preflight','preflight_passed','creating_order','running','reissuing','reissued',
+                              'session_refresh','session_refreshed','browser_decode','browser_decoded',
+                              'browser_decode_skipped','creating_checkout','failed'))
                          AND NOT EXISTS (SELECT 1 FROM account_locks l WHERE l.state='held' AND
                              (l.lock_key='account:' || j.account_fingerprint OR l.order_id=o.id OR l.job_id=j.id))
                          AND NOT EXISTS (SELECT 1 FROM quick_pay_jobs other
@@ -595,6 +670,267 @@ class Persistence:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM quick_pay_jobs ORDER BY created_at").fetchall()
         return [dict(row) for row in rows]
+
+    def queue_position(self, job_id: str) -> Optional[int]:
+        """Return 1-based position among currently queued jobs, or None if not queued."""
+        with self._lock:
+            target = self._conn.execute(
+                "SELECT id, status, priority, created_at FROM quick_pay_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if target is None or target["status"] != "queued":
+                return None
+            ahead = self._conn.execute(
+                """SELECT COUNT(*) FROM quick_pay_jobs
+                   WHERE status='queued'
+                     AND (
+                         priority > ?
+                         OR (priority = ? AND created_at < ?)
+                         OR (priority = ? AND created_at = ? AND id < ?)
+                     )""",
+                (
+                    target["priority"],
+                    target["priority"], target["created_at"],
+                    target["priority"], target["created_at"], target["id"],
+                ),
+            ).fetchone()[0]
+        return int(ahead) + 1
+
+    def queue_stats(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS cnt FROM quick_pay_jobs WHERE status IN ('queued','running') GROUP BY status"
+            ).fetchall()
+        counts = {row["status"]: int(row["cnt"]) for row in rows}
+        return {"queued": counts.get("queued", 0), "running": counts.get("running", 0)}
+
+    def list_queue_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        capped = max(1, min(int(limit), 100))
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, order_id, status, stage, failure_code, message, amount, currency,
+                          purchase_attempt_id, lock_id, timings_json, priority, attempts,
+                          reconcile_attempts, last_reconciled_at,
+                          created_at, updated_at, finished_at
+                   FROM quick_pay_jobs
+                   ORDER BY
+                       CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END ASC,
+                       priority DESC,
+                       created_at DESC
+                   LIMIT ?""",
+                (capped,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_reconcilable_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        capped = max(1, min(int(limit), 100))
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT * FROM quick_pay_jobs
+                   WHERE status IN ('paid_pending_delivery', 'unknown', 'requires_action')
+                     AND COALESCE(order_id, '') != ''
+                   ORDER BY updated_at ASC
+                   LIMIT ?""",
+                (capped,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_job_by_order_id(self, order_id: str) -> Optional[dict[str, Any]]:
+        if not order_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM quick_pay_jobs WHERE order_id=? ORDER BY created_at DESC LIMIT 1",
+                (order_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_orders_page(
+        self,
+        *,
+        status: str = "",
+        plan: str = "",
+        search: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Paginated read-only order ledger. Never returns secrets or raw view_json."""
+        capped = max(1, min(int(limit), 100))
+        skip = max(0, int(offset))
+        where_sql, params = self._orders_filter_sql(
+            status=status, plan=plan, search=search, date_from=date_from, date_to=date_to,
+        )
+        with self._lock:
+            total = int(
+                self._conn.execute(f"SELECT COUNT(*) FROM orders o {where_sql}", params).fetchone()[0]
+            )
+            rows = self._conn.execute(
+                f"""SELECT o.id, o.plan, o.billing_country, o.exit_country, o.status,
+                           o.payment_status, o.delivery_status, o.amount, o.currency,
+                           o.failure_code, o.last_error, o.purchase_attempt_id,
+                           o.payment_intent_id, o.auto_cancel_renew, o.auto_renew_status,
+                           o.auto_renew_canceled_at, o.auto_renew_error,
+                           o.created_at, o.updated_at, o.unknown_since, o.finished_at,
+                           (SELECT j.id FROM quick_pay_jobs j WHERE j.order_id = o.id ORDER BY j.created_at DESC LIMIT 1) AS job_id,
+                           (SELECT j.reconcile_attempts FROM quick_pay_jobs j WHERE j.order_id = o.id ORDER BY j.created_at DESC LIMIT 1) AS reconcile_attempts,
+                           (SELECT l.id FROM account_locks l WHERE l.order_id = o.id AND l.state = 'held' LIMIT 1) AS active_lock_id
+                    FROM orders o
+                    {where_sql}
+                    ORDER BY o.created_at DESC
+                    LIMIT ? OFFSET ?""",
+                [*params, capped, skip],
+            ).fetchall()
+        return [dict(row) for row in rows], total
+
+    @staticmethod
+    def _orders_filter_sql(
+        *,
+        status: str = "",
+        plan: str = "",
+        search: str = "",
+        date_from: str = "",
+        date_to: str = "",
+    ) -> tuple[str, list[Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        status_norm = (status or "").strip().lower()
+        if status_norm and status_norm != "all":
+            if status_norm == "succeeded":
+                clauses.append("o.status IN ('active', 'delivered')")
+            elif status_norm == "failed":
+                clauses.append("o.status IN ('failed', 'rejected')")
+            elif status_norm == "paid_pending_delivery":
+                clauses.append("o.payment_status = 'succeeded' AND o.delivery_status != 'delivered'")
+            elif status_norm == "pending":
+                clauses.append("o.status IN ('created', 'pending_checkout', 'awaiting_payment', 'paying', 'requires_action', 'verifying')")
+            else:
+                clauses.append("o.status = ?")
+                params.append(status_norm)
+        plan_norm = (plan or "").strip().lower()
+        if plan_norm and plan_norm != "all":
+            clauses.append("o.plan = ?")
+            params.append(plan_norm)
+        search_norm = (search or "").strip()
+        if search_norm:
+            like = f"%{search_norm}%"
+            clauses.append("(o.id LIKE ? OR COALESCE(o.purchase_attempt_id,'') LIKE ? OR COALESCE(o.payment_intent_id,'') LIKE ?)")
+            params.extend([like, like, like])
+        df = (date_from or "").strip()
+        if df:
+            clauses.append("o.created_at >= ?")
+            params.append(df if "T" in df else f"{df}T00:00:00")
+        dt = (date_to or "").strip()
+        if dt:
+            clauses.append("o.created_at <= ?")
+            params.append(dt if "T" in dt else f"{dt}T23:59:59.999999+99:99")
+        where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        return where_sql, params
+
+    def export_orders_rows(
+        self,
+        *,
+        status: str = "",
+        plan: str = "",
+        search: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        capped = max(1, min(int(limit), 5000))
+        where_sql, params = self._orders_filter_sql(
+            status=status, plan=plan, search=search, date_from=date_from, date_to=date_to,
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                f"""SELECT o.id, o.plan, o.billing_country, o.exit_country, o.status,
+                           o.payment_status, o.delivery_status, o.amount, o.currency,
+                           o.failure_code, o.purchase_attempt_id, o.payment_intent_id,
+                           o.auto_renew_status, o.created_at, o.updated_at, o.finished_at
+                    FROM orders o
+                    {where_sql}
+                    ORDER BY o.created_at DESC
+                    LIMIT ?""",
+                [*params, capped],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def maintenance_stats(self) -> dict[str, Any]:
+        with self._lock:
+            counts = {}
+            for table in ("orders", "quick_pay_jobs", "order_events", "account_locks", "account_subscription_snapshots"):
+                counts[table] = int(self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        db_bytes = 0
+        wal_bytes = 0
+        if self.path != ":memory:":
+            p = Path(self.path)
+            if p.exists():
+                db_bytes = p.stat().st_size
+            wal = Path(f"{self.path}-wal")
+            if wal.exists():
+                wal_bytes = wal.stat().st_size
+        return {
+            "in_memory": self.path == ":memory:",
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
+            "table_counts": counts,
+        }
+
+    def run_maintenance(self, *, retention_days: int = 90) -> dict[str, Any]:
+        """Prune old settled events and truncate WAL safely without touching held locks or active orders."""
+        from datetime import timedelta
+        days = max(7, min(int(retention_days), 3650))
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                """DELETE FROM order_events
+                   WHERE created_at < ?
+                     AND (order_id IS NULL OR order_id NOT IN (
+                         SELECT id FROM orders WHERE status NOT IN ('delivered','failed','rejected','refunded')
+                     ))
+                     AND (order_id IS NULL OR order_id NOT IN (
+                         SELECT order_id FROM account_locks WHERE state='held' AND order_id IS NOT NULL
+                     ))""",
+                (cutoff,),
+            )
+            pruned_events = int(cur.rowcount or 0)
+            self._conn.commit()
+            checkpoint = None
+            if self.path != ":memory:":
+                row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if row is not None:
+                    checkpoint = {"busy": int(row[0]), "log": int(row[1]), "checkpointed": int(row[2])}
+        stats = self.maintenance_stats()
+        return {
+            "retention_days": days,
+            "pruned_events": pruned_events,
+            "wal_checkpoint": checkpoint,
+            **stats,
+        }
+
+    def order_summary_stats(self) -> dict[str, int]:
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN status IN ('active', 'delivered') THEN 1 ELSE 0 END) AS delivered,
+                       SUM(CASE WHEN payment_status = 'succeeded' AND delivery_status != 'delivered' THEN 1 ELSE 0 END) AS paid_pending_delivery,
+                       SUM(CASE WHEN status = 'unknown' THEN 1 ELSE 0 END) AS unknown,
+                       SUM(CASE WHEN status IN ('failed', 'rejected') THEN 1 ELSE 0 END) AS failed
+                   FROM orders"""
+            ).fetchone()
+            active_locks = int(
+                self._conn.execute("SELECT COUNT(*) FROM account_locks WHERE state = 'held'").fetchone()[0]
+            )
+        return {
+            "total": int(row["total"] or 0),
+            "delivered": int(row["delivered"] or 0),
+            "paid_pending_delivery": int(row["paid_pending_delivery"] or 0),
+            "unknown": int(row["unknown"] or 0),
+            "failed": int(row["failed"] or 0),
+            "active_locks": active_locks,
+        }
 
     # -- idempotency -------------------------------------------------------- #
     def save_idempotency(self, key: str, scope: str, *, order_id: str = "", job_id: str = "", state: str) -> None:
@@ -667,6 +1003,60 @@ class Persistence:
             )
             self._conn.commit()
             return cur.rowcount == 1
+
+    def resolve_lock_paid(self, lock_id: str, *, resolved_by: str, note: str) -> bool:
+        """Mark a held lock as resolved after authoritative confirmation of paid delivery."""
+        with self._lock:
+            cur = self._conn.execute(
+                """UPDATE account_locks SET state='resolved', released_at=?,
+                   released_by=?, release_note=? WHERE id=? AND state='held'""",
+                (_utcnow(), resolved_by, note, lock_id),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def list_locks(
+        self,
+        *,
+        state: str = "held",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+        capped = max(1, min(int(limit), 100))
+        skip = max(0, int(offset))
+        state_norm = (state or "held").strip().lower()
+        where_sql = ""
+        params: list[Any] = []
+        if state_norm and state_norm != "all":
+            where_sql = "WHERE l.state = ?"
+            params.append(state_norm)
+        with self._lock:
+            counts_rows = self._conn.execute(
+                "SELECT state, COUNT(*) AS cnt FROM account_locks GROUP BY state"
+            ).fetchall()
+            counts = {"held": 0, "released": 0, "resolved": 0}
+            for crow in counts_rows:
+                counts[str(crow["state"])] = int(crow["cnt"] or 0)
+            total = int(
+                self._conn.execute(f"SELECT COUNT(*) FROM account_locks l {where_sql}", params).fetchone()[0]
+            )
+            rows = self._conn.execute(
+                f"""SELECT l.*,
+                           o.plan AS order_plan,
+                           o.status AS order_status,
+                           o.payment_status AS order_payment_status,
+                           o.delivery_status AS order_delivery_status,
+                           o.amount AS order_amount,
+                           o.currency AS order_currency,
+                           o.billing_country AS order_billing_country
+                    FROM account_locks l
+                    LEFT JOIN orders o ON o.id = l.order_id
+                    {where_sql}
+                    ORDER BY CASE l.state WHEN 'held' THEN 0 ELSE 1 END ASC, l.created_at DESC
+                    LIMIT ? OFFSET ?""",
+                [*params, capped, skip],
+            ).fetchall()
+        return [dict(row) for row in rows], total, counts
 
     # -- events ------------------------------------------------------------- #
     def add_event(self, *, stage: str, event: str, order_id: str = "", job_id: str = "",

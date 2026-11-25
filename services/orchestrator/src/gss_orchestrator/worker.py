@@ -1,13 +1,9 @@
-"""编排 worker。
+"""[Legacy / 保留兼容] 独立轮询编排 worker。
 
-轮询待处理 Job、驱动状态机、断点续跑。实现 tasks.md T020 / T027 / T032。
-
-工作流程：
-1. 轮询数据库中待处理的 Job（未锁定且 attempts < max_attempts）
-2. 占锁（locked_by = worker_id）
-3. 根据 stage 驱动状态机推进
-4. 更新订单状态与 Job 状态
-5. 释放锁或标记失败
+注意：当前主服务已内置协程持久化调度器（``gss_api.services.order_flow``）与
+后台只读对账器（``gss_api.services.reconciler``），通过 ``gss_api.persistence``
+直接驱动队列并发、停机排空与自动对账。
+本模块保留供旧流水线契约演示与向后兼容。
 """
 
 from __future__ import annotations

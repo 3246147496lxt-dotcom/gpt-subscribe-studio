@@ -135,6 +135,39 @@ def release(lock_id: str, *, confirm_no_charge: bool, note: str, operator: str =
     return True, "已解锁", db.get_lock(lock_id)
 
 
+def resolve_paid(lock_id: str, *, note: str, operator: str = "reconciler") -> tuple[bool, str, Optional[dict[str, Any]]]:
+    """Close a held lock as ``resolved`` only when the recorded order is confirmed paid & active."""
+    db = get_db_optional()
+    if db is None:
+        return False, "持久化未初始化", None
+    lock = db.get_lock(lock_id)
+    if lock is None:
+        return False, "锁不存在", None
+    if lock.get("state") != "held":
+        return False, "锁已处理", lock
+    order_id = lock.get("order_id") or ""
+    order = store.get_order(order_id) if order_id else None
+    view = store.views.get(order_id) if order_id else None
+    confirmed = (
+        order is not None
+        and str(order.status) in {"active", "delivered"}
+        and view is not None
+        and view.payment_status == "succeeded"
+    )
+    if not confirmed:
+        return False, "订单尚未确认扣款并生效，不能按已付款核销锁", lock
+    note_clean = (note or "只读对账确认订阅已生效并交付").strip()[:500]
+    if not db.resolve_lock_paid(lock_id, resolved_by=operator, note=note_clean):
+        return False, "锁状态已变化", db.get_lock(lock_id)
+    db.add_event(
+        stage="lock", event="lock_resolved_paid", order_id=order_id,
+        job_id=lock.get("job_id") or "", code="reconcile_resolved",
+        message=note_clean,
+        metadata={"operator": operator, "payment_intent_id": lock.get("payment_intent_id")},
+    )
+    return True, "已核销为已交付", db.get_lock(lock_id)
+
+
 def recover_incomplete_jobs() -> None:
     """On startup, crash-interrupted payment stages become unknown and locked."""
     db = get_db_optional()

@@ -11,11 +11,13 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-multipart>=0.0.6",
     "httpx>=0.26.0",
+    "socksio>=1.0.0",
     "curl_cffi>=0.13.0",
 ]
 
 [project.optional-dependencies]
 browser = ["playwright>=1.50"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [tool.uv]
 # 根项目是「虚拟工作区」，不打包自身；各 service / package 独立成包。
@@ -33,3 +35,4 @@ pythonpath = [
 ]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+asyncio_default_fixture_loop_scope = "function"

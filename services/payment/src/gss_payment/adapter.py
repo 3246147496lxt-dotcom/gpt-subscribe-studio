@@ -12,7 +12,7 @@ from gss_contracts import AdapterCapabilities, PaymentRequest, PaymentResult, Pa
 from gss_contracts.adapter import PaymentReceiptEvidence
 from gss_core.money import _ZERO_DECIMAL
 from gss_contracts.errors import DomainError, ErrorCode
-from gss_core.billing import address_for
+from gss_core.fixed_billing import BILLING_COUNTRY, fixed_billing_address
 from gss_core.verified_payer import checkout_address
 from gss_core.hosted import TeamHostedClient
 from gss_core.chatgpt import (
@@ -98,7 +98,10 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
         pinned_billing = (None if str(req.plan or "").lower() == "team" else
                           checkout_address(req.exit_country or req.country, req.country, req.billing))
         billing_country = str((req.billing or {}).get("country") or "").upper()
-        target_country = billing_country if str(req.plan or "").lower() == "team" and billing_country else req.country
+        # Non-Team: the fixed billing does not choose the exit. Team keeps its
+        # declared billing country as the payment target.
+        target_country = (billing_country if str(req.plan or "").lower() == "team" and billing_country
+                          else (req.exit_country or req.country))
         pinned_proxy = req.checkout_proxy or req.approve_proxy
         if pinned_proxy:
             # 已 pin 的出口（可能是 PH 出口 + US 账单）不能被 billing_country 改写。
@@ -132,13 +135,15 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
                 "缺少 Stripe 公钥。若是 Team 长链订单，请打开长链手动支付后查询订阅。",
             )
 
-        billing = dict(pinned_billing if pinned_billing is not None else req.billing or address_for(req.country))
+        billing = dict(pinned_billing if pinned_billing is not None
+                       else req.billing or fixed_billing_address())
         checkout_id = public_checkout_id(checkout_id)
         stripe_custom = checkout_id.startswith("cs_")
         confirm_token = _confirmation_token(client, publishable_key=pk, token=req.payment_method_token or "")
         confirmed = client.confirm_checkout(
             checkout_session_id=checkout_id, confirm_token=confirm_token, checkout_url=page_url,
-            billing=billing, currency=currency_for(req.country), publishable_key=pk,
+            billing=billing, currency=currency_for(req.exit_country or req.country or BILLING_COUNTRY),
+            publishable_key=pk,
         )
         if req.credentials_current is not None and not req.credentials_current():
             # The last request ran under a valid lease. Keep its actual evidence; no follow-up.

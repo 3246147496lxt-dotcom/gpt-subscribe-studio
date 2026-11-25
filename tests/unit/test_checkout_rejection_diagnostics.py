@@ -95,7 +95,7 @@ def test_error_type_or_message_is_not_an_explicit_provider_code(monkeypatch, cap
 def test_billing_conflict_keeps_response_evidence_without_payload(monkeypatch, caplog):
     from gss_core.verified_payer import ObservedBillingConflict
 
-    def conflict(*args):
+    def conflict(*args, **kwargs):
         raise ObservedBillingConflict()
 
     monkeypatch.setattr(chatgpt, "check_observed_billing", conflict)

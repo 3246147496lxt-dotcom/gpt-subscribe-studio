@@ -125,3 +125,48 @@ def test_checkout_proxy_follows_target_billing_country(tmp_path, monkeypatch, ve
     result = asyncio.run(adapter.create_checkout(req))
     assert result.billing == fixed
     assert seen and proxy_exit_region(seen[0]) == "PH"
+
+
+def test_sentinel_proxy_tunnel_failure_rotates_sid_and_retries(monkeypatch, verified_payer):
+    fixed = verified_payer("US")
+    proxy = "http://u-region-US-sid-BASE:pw@gw.example:3010"
+    req = CheckoutRequest(session="fixture", plan=Plan.PLUS, billing_country="US",
+                          billing_mode=BillingMode.STANDARD, proxy=proxy,
+                          verified_billing=fixed)
+    seen = []
+
+    def flaky(request, used_proxy):
+        seen.append(used_proxy)
+        if len(seen) == 1:
+            raise DomainError(
+                ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                "无法签发 ChatGPT 风控令牌（Sentinel）：proxy fetch: "
+                "curl_cffi.requests.exceptions.ConnectionError: Failed to perform, "
+                "curl: (7) CONNECT tunnel failed, response 404",
+            )
+        return created()
+
+    adapter = UpstreamCheckoutAdapter()
+    monkeypatch.setattr(adapter, "_create", flaky)
+    result = asyncio.run(adapter.create_checkout(req))
+    assert len(seen) == 2
+    assert seen[0] == proxy and seen[1] != proxy
+    assert "sid-BASE" not in seen[1]
+    assert result.effective_proxy == seen[1]
+
+
+def test_non_sentinel_failure_is_not_replayed(monkeypatch, verified_payer):
+    fixed = verified_payer("US")
+    calls = []
+
+    def refused(request, used_proxy):
+        calls.append(used_proxy)
+        raise DomainError(ErrorCode.ALREADY_SUBSCRIBED, "该账号已有订阅")
+
+    adapter = UpstreamCheckoutAdapter()
+    monkeypatch.setattr(adapter, "_create", refused)
+    with pytest.raises(DomainError):
+        asyncio.run(adapter.create_checkout(CheckoutRequest(
+            session="fixture", plan=Plan.PLUS, billing_country="US",
+            billing_mode=BillingMode.STANDARD, proxy="http://x:1", verified_billing=fixed)))
+    assert len(calls) == 1

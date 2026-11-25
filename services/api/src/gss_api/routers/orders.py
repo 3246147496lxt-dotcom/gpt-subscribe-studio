@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import os
@@ -12,7 +14,8 @@ import time
 from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from gss_contracts import (
@@ -34,10 +37,11 @@ from gss_account import FakeAccountAdapter
 from gss_checkout import FakeCheckoutAdapter
 from gss_core.checkout_diagnostics import safe_checkout_diagnostics
 from gss_core.billing import address_for
+from gss_core.fixed_billing import BILLING_COUNTRY
 from gss_core.config import ORDER_HTTP_TIMEOUT_S, load_settings, use_fake_adapters
 from gss_core.browser_context import BrowserContext
 from gss_core.browser_decode import BrowserDecodeUnavailable, PlaywrightBrowserDecoder
-from gss_core.countries import currency_for, is_supported, normalize_country
+from gss_core.countries import currency_for, is_supported, locale_for, normalize_country, timezone_for
 from gss_core.billing_profiles import load_billing_profiles
 from gss_core.purchase_attempt import new_purchase_attempt_id
 from gss_core.upstream_errors import classify_upstream_failure
@@ -54,11 +58,13 @@ from gss_core.stripe_protocol import StripeProtocol, PaymentOutcome
 from gss_core.proxies import (
     ProxyPreflightError,
     checkout_proxy_for,
+    configured_exit_country,
     proxy_exit_sid,
     rotate_proxy_sid,
     verify_refresh_egress,
 )
 from gss_core.redaction import redact_sensitive
+from gss_core import runtime_flags
 from gss_core.chatgpt import (
     ChatGPTClient,
     _pick_profile,
@@ -67,6 +73,7 @@ from gss_core.chatgpt import (
 )
 from gss_core.session_token import (
     email_from_access_token,
+    is_access_token_expired,
     parse_session,
     parse_session_bundle,
 )
@@ -87,12 +94,18 @@ from ..schemas import (
     ErrorOut,
     ModeIn,
     OrderCreateRequest,
+    OrderLedgerItemOut,
+    OrderLedgerOut,
+    OrderLedgerStatsOut,
     OrderOut,
     OrderPayRequest,
+    QuickPayEventOut,
+    ReconcileResultOut,
     SubscriptionOut,
     TeamPrepareRequest,
     TeamQuoteRequest,
 )
+from ..persistence import get_db_optional
 from ..store import store
 from .. import locks, purchase_claims
 from .events import notify_order_update
@@ -188,6 +201,7 @@ def _verified_order_billing(order, secrets: OrderSecrets, *claims):
                                         verification_id=view.billing_verification_id)
     codes = [order.billing_country]
     if not split_exit_billing_allowed():
+        # Strict mode only: the exit is part of the billing assertion.
         codes += [view.exit_country, secrets.exit_country]
     if any(code != verified["country"] for code in codes):
         raise HTTPException(409, "订单账单国家与核验记录不一致，未提交。")
@@ -371,9 +385,10 @@ def _to_out(order: Order) -> OrderOut:
     if not team and view.billing_verified and view.billing_verification_id and view.billing:
         try:
             active_profile = None
-            if os.environ.get("GSS_BILLING_PROFILES_FILE", "").strip() and view.currency:
+            if view.currency:
                 try:
-                    active_profile = load_billing_profiles().resolve(view.currency)
+                    active_profile = load_billing_profiles().resolve_for_country(
+                        normalize_country(order.billing_country), view.currency)
                 except MissingProfile:
                     active_profile = None
             public_billing = require_verified_billing(
@@ -506,6 +521,18 @@ def _env_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _reissue_on_exit_enabled() -> bool:
+    """默认在真实上游模式下，只要含 ST/refresh_token 就在当前充值出口重颁新 AT。
+
+    优先级：面板覆盖（runtime-flags.json） > 环境变量 GSS_REISSUE_SESSION_ON_EXIT > 默认值。
+    """
+    return runtime_flags.get_bool("reissue_session_on_exit")
+
+
+def _reissue_keep_ua() -> bool:
+    return runtime_flags.get_bool("reissue_keep_ua")
+
+
 def _mark(progress: Callable[[str], None] | None, stage: str) -> None:
     if progress is not None:
         try:
@@ -561,7 +588,7 @@ def _release_create_failure(claim_dir, order_id: str, idempotency_key: str | Non
 
 
 async def _guard_refresh_egress(proxy: str | None, country: str) -> None:
-    if not _env_on("GSS_PROXY_PREFLIGHT"):
+    if not runtime_flags.get_bool("proxy_preflight"):
         return
     if use_fake_adapters():
         # Fake adapters do not implement authentication. Never hit a real refresh
@@ -592,6 +619,122 @@ async def _create_checkout_once(pipeline, *, proxy: str, **kwargs):
         raise DomainError(
             ErrorCode.CHECKOUT_UPSTREAM_ERROR, "建单请求未获确认，已停止且不自动重试。",
         ) from None
+
+
+def _csv_safe(value: Any) -> str:
+    text = "" if value is None else str(value)
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
+
+@router.get("/orders", response_model=OrderLedgerOut)
+async def list_orders_ledger(
+    status_filter: str = Query(default="all", alias="status", max_length=40),
+    plan: str = Query(default="all", max_length=40),
+    search: str = Query(default="", max_length=80),
+    date_from: str = Query(default="", max_length=40),
+    date_to: str = Query(default="", max_length=40),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> OrderLedgerOut:
+    """Server-side paginated read-only order ledger (zero secrets)."""
+    db = get_db_optional()
+    if db is None:
+        return OrderLedgerOut(stats=OrderLedgerStatsOut(), total=0, limit=limit, offset=offset, items=[])
+    rows, total = db.list_orders_page(
+        status=status_filter, plan=plan, search=search,
+        date_from=date_from, date_to=date_to, limit=limit, offset=offset,
+    )
+    stats = OrderLedgerStatsOut(**db.order_summary_stats())
+    items = [
+        OrderLedgerItemOut(
+            id=row["id"],
+            plan=row["plan"],
+            billing_country=row["billing_country"],
+            exit_country=row.get("exit_country"),
+            status=row["status"],
+            payment_status=row.get("payment_status") or "unpaid",
+            delivery_status=row.get("delivery_status") or "pending",
+            amount=row.get("amount"),
+            currency=row.get("currency"),
+            failure_code=row.get("failure_code"),
+            last_error=row.get("last_error"),
+            purchase_attempt_id=row.get("purchase_attempt_id"),
+            payment_intent_id=row.get("payment_intent_id"),
+            auto_cancel_renew=bool(row.get("auto_cancel_renew")),
+            auto_renew_status=row.get("auto_renew_status") or "disabled",
+            auto_renew_canceled_at=row.get("auto_renew_canceled_at"),
+            auto_renew_error=row.get("auto_renew_error"),
+            job_id=row.get("job_id"),
+            reconcile_attempts=int(row.get("reconcile_attempts") or 0),
+            active_lock_id=row.get("active_lock_id"),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            unknown_since=row.get("unknown_since"),
+            finished_at=row.get("finished_at"),
+        )
+        for row in rows
+    ]
+    return OrderLedgerOut(stats=stats, total=total, limit=limit, offset=offset, items=items)
+
+
+@router.get("/orders/export.csv")
+async def export_orders_csv(
+    status_filter: str = Query(default="all", alias="status", max_length=40),
+    plan: str = Query(default="all", max_length=40),
+    search: str = Query(default="", max_length=80),
+    date_from: str = Query(default="", max_length=40),
+    date_to: str = Query(default="", max_length=40),
+) -> StreamingResponse:
+    """Export redacted server-side ledger as UTF-8 BOM CSV with formula-injection protection."""
+    db = get_db_optional()
+    rows = (
+        db.export_orders_rows(
+            status=status_filter, plan=plan, search=search,
+            date_from=date_from, date_to=date_to,
+        )
+        if db is not None
+        else []
+    )
+    columns = (
+        "id", "plan", "billing_country", "exit_country", "status",
+        "payment_status", "delivery_status", "amount", "currency",
+        "failure_code", "purchase_attempt_id", "payment_intent_id",
+        "auto_renew_status", "created_at", "updated_at", "finished_at",
+    )
+    buf = io.StringIO()
+    buf.write("\ufeff")
+    writer = csv.writer(buf)
+    writer.writerow(columns)
+    for row in rows:
+        writer.writerow([_csv_safe(row.get(col)) for col in columns])
+    content = buf.getvalue().encode("utf-8")
+    return StreamingResponse(
+        iter([content]),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="gss-order-ledger.csv"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get("/orders/{order_id}/events", response_model=list[QuickPayEventOut])
+async def get_order_events(order_id: str) -> list[QuickPayEventOut]:
+    db = get_db_optional()
+    if db is None:
+        return []
+    return [QuickPayEventOut(**ev) for ev in db.list_events(order_id=order_id)]
+
+
+@router.post("/orders/{order_id}/reconcile", response_model=ReconcileResultOut)
+async def reconcile_order_endpoint(order_id: str) -> ReconcileResultOut:
+    from ..services import reconciler
+    result = await reconciler.reconcile_order(order_id, force=True)
+    if result.get("outcome") == "order_not_found":
+        raise HTTPException(404, detail={"code": "not_found", "message": "订单不存在"})
+    return ReconcileResultOut(**result)
 
 
 @router.post(
@@ -691,12 +834,21 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             status.HTTP_400_BAD_REQUEST, ErrorCode.COMPLIANCE_BLOCKED,
             f"不支持的出口地区: {normalize_country(payload.exit_country)}" if not non_team else "不支持的出口地区，未创建订单。",
         )
+    original_country = normalize_country(bundle.country)
+    if non_team:
+        # 出口自由：显式出口 → Session 签发地 → 已配置网关地区 → 账单国兜底。
+        # 固定账单（美国免税地址）不参与出口选择。
+        exit_country = (normalize_country(payload.exit_country) or original_country
+                        or configured_exit_country()
+                        or normalize_country(payload.billing_country) or BILLING_COUNTRY)
+    else:
+        # Team 保持原流程：出口跟随其显式结账地区。
+        exit_country = normalize_country(payload.exit_country or payload.billing_country)
     billing_profile = None
-    if non_team and os.environ.get("GSS_BILLING_PROFILES_FILE", "").strip():
+    if non_team:
         try:
-            profile_currency = currency_for(normalize_country(
-                payload.exit_country or payload.billing_country or "US"))
-            billing_profile = load_billing_profiles().resolve(profile_currency)
+            profile_currency = currency_for(exit_country)
+            billing_profile = load_billing_profiles().resolve_for_country(BILLING_COUNTRY, profile_currency)
         except MissingProfile:
             raise HTTPException(503, detail={
                 "code": "BILLING_PROFILE_UNAVAILABLE",
@@ -708,11 +860,28 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     # The Team schema still requires its original explicit country.
     country = verified["country"] if verified is not None else normalize_country(payload.billing_country)
     if verified is not None and payload.billing_country is not None and normalize_country(payload.billing_country) != country:
-        raise HTTPException(409, "结账账单国家与已核验账单不一致，未创建订单。")
-    exit_country = normalize_country(payload.exit_country or country)
-    # This channel also uses the exit in its checkout billing details; do not silently substitute.
+        # 旧客户端会把出口国当账单国提交；固定账单优先，静默忽略这个提示。
+        logger.info("billing_country_ignored submitted=%s fixed=%s",
+                    normalize_country(payload.billing_country), country)
     if verified is not None and exit_country != country and not split_exit_billing_allowed():
-        raise HTTPException(409, "所选出口与本渠道的固定账单不兼容，未创建订单。")
+        raise HTTPException(409, "当前为严格模式：出口必须与固定账单国家一致，未创建订单。")
+    cross_country = bool(original_country and original_country != exit_country)
+    at_missing = not bundle.access_token
+    at_expired = bool(
+        bundle.access_token and is_access_token_expired(bundle.access_token, leeway_seconds=60)
+    )
+    proactive_exit_reissue = bool(
+        not cross_country and not at_missing and _reissue_on_exit_enabled()
+    )
+    need_st_reissue = bool(
+        bundle.session_token
+        and (cross_country or at_missing or at_expired or proactive_exit_reissue)
+    )
+    need_oauth_reissue = bool(
+        not need_st_reissue
+        and bundle.refresh_token
+        and (cross_country or at_missing or at_expired or _reissue_on_exit_enabled())
+    )
     pipeline = None
     if non_team:
         if payload.payment_method_token:
@@ -720,11 +889,8 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             _require_offline_instrument(pipeline, payload.payment_method_token)
             # The simulator adapters do not replace the router's Session client.
             # Do not let a simulated instrument trigger a real refresh/preflight.
-            session_country = normalize_country(bundle.country)
-            if bundle.session_token and (not bundle.access_token
-                    or (session_country and session_country != exit_country)):
+            if need_st_reissue or need_oauth_reissue:
                 raise HTTPException(409, "离线付款工具不能触发上游会话刷新，未提交。")
-    original_country = normalize_country(bundle.country)
     session_reissued = False
 
     # 出口选择不授权更改已核验账单。
@@ -765,21 +931,25 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     )
 
     def _session_json(client: ChatGPTClient, country: str) -> str:
-        return json.dumps({
+        resolved_ua = getattr(client, "user_agent", "") or getattr(client, "ua", "")
+        data: Dict[str, Any] = {
             "accessToken": client.access_token,
             "sessionToken": client.extra_cookies.get("__Secure-next-auth.session-token", client.session_token),
             "deviceId": client.device_id,
             "sessionId": client.oai_session_id,
-            "userAgent": client.user_agent,
+            "userAgent": resolved_ua,
             "cookies": client.extra_cookies,
             "statsigContext": {
                 "deviceId": client.device_id,
-                "userAgent": client.user_agent,
+                "userAgent": resolved_ua,
                 "country": country,
             },
-        })
+        }
+        if getattr(client, "refresh_token", ""):
+            data["refresh_token"] = client.refresh_token
+        return json.dumps(data)
 
-    if original_country and original_country != exit_country and not bundle.session_token:
+    if original_country and original_country != exit_country and not bundle.session_token and not bundle.refresh_token:
         raise _error(
             status.HTTP_401_UNAUTHORIZED,
             ErrorCode.INVALID_SESSION,
@@ -816,48 +986,84 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         view.purchase_attempt_id = order.purchase_attempt_id
         view.session_reissued_for_country = session_reissued
         view.exit_country = exit_country
+        store.persist(order.id)
         return item
 
-    cross_country = bool(original_country and original_country != exit_country)
     route_plan = route_plan_from_env()
     browser_context: BrowserContext | None = None
     access_token = bundle.access_token
     stage_started = time.perf_counter()
-    if bundle.session_token and (cross_country or not access_token):
+    if need_st_reissue or need_oauth_reissue:
         _mark(progress, "reissuing" if cross_country else "session_refresh")
         try:
             await _guard_refresh_egress(exit_proxy, exit_country)
         except HTTPException:
             _release_create_failure(claim_dir, order.id, idempotency_key)
             raise
-        if cross_country:
+        use_clean_st_reissue = bool(
+            need_st_reissue and (cross_country or at_expired or proactive_exit_reissue)
+        )
+        if need_oauth_reissue:
             try:
                 client = await asyncio.to_thread(
-                    ChatGPTClient.reauthorize_for_country, raw_session,
+                    ChatGPTClient.reauthorize_oauth, raw_session,
                     proxy=exit_proxy, country=exit_country,
                 )
             except DomainError as exc:
+                _release_create_failure(claim_dir, order.id, idempotency_key)
                 raise _from_domain(exc, nonteam=plan is not Plan.TEAM)
             except Exception:
+                _release_create_failure(claim_dir, order.id, idempotency_key)
+                raise _error(503, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "会话请求中断，已停止。") from None
+        elif use_clean_st_reissue:
+            reauth_kwargs: Dict[str, Any] = {"proxy": exit_proxy, "country": exit_country}
+            if _reissue_keep_ua():
+                reauth_kwargs["preserve_user_agent"] = True
+            try:
+                client = await asyncio.to_thread(
+                    ChatGPTClient.reauthorize_for_country, raw_session, **reauth_kwargs,
+                )
+            except DomainError as exc:
+                _release_create_failure(claim_dir, order.id, idempotency_key)
+                raise _from_domain(exc, nonteam=plan is not Plan.TEAM)
+            except Exception:
+                _release_create_failure(claim_dir, order.id, idempotency_key)
                 raise _error(503, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "会话请求中断，已停止。") from None
         else:
-            client = ChatGPTClient.from_raw_session(raw_session, proxy=exit_proxy)
+            client = ChatGPTClient.from_raw_session(raw_session, proxy=exit_proxy, strip_ambient=True)
+            client.language = locale_for(exit_country)
+            client.timezone = timezone_for(exit_country)
+            client.session_country = exit_country
         try:
-            if not cross_country:
+            if need_st_reissue and not use_clean_st_reissue:
                 try:
                     refreshed = await asyncio.to_thread(client.refresh_session, reject_unauthorized=True)
                 except DomainError as exc:
+                    _release_create_failure(claim_dir, order.id, idempotency_key)
                     raise _from_domain(exc, nonteam=plan is not Plan.TEAM)
                 if not refreshed:
+                    _release_create_failure(claim_dir, order.id, idempotency_key)
                     raise _error(401, ErrorCode.INVALID_SESSION, "session token 刷新未获确认，已停止。")
             access_token = client.access_token
             if not access_token:
+                _release_create_failure(claim_dir, order.id, idempotency_key)
                 raise _error(401, ErrorCode.INVALID_SESSION, "会话刷新未返回 accessToken")
             session_reissued = cross_country
             # Persist the refreshed credential before any further upstream call.
             raw_session = _session_json(client, exit_country)
-            item = remember(raw_session, client.user_agent, client.device_id)
-            if cross_country and _env_on("GSS_WARM_ACCOUNT"):
+            if not fingerprint:
+                fingerprint = locks.account_fingerprint(raw_session)
+                held = locks.find_active_lock(fingerprint)
+                if held is not None:
+                    _release_create_failure(claim_dir, order.id, idempotency_key)
+                    raise HTTPException(409, detail={
+                        "code": "payment_unknown_lock",
+                        "message": "存在未核销的 unknown 订单，请先人工核对账单",
+                        **locks.lock_payload(held),
+                    })
+            resolved_ua = getattr(client, "user_agent", "") or getattr(client, "ua", "")
+            item = remember(raw_session, resolved_ua, client.device_id)
+            if cross_country and runtime_flags.get_bool("warm_account"):
                 # Optional lab warm-up. Default off keeps the proven 00331ce
                 # main path free of extra account-endpoint requests.
                 await asyncio.sleep(random.uniform(1.0, 1.5))
@@ -881,7 +1087,15 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         _mark(progress, "reissued" if cross_country else "session_refreshed")
     else:
         if not access_token:
+            _release_create_failure(claim_dir, order.id, idempotency_key)
             raise _error(401, ErrorCode.INVALID_SESSION, "JSON 中没有 accessToken")
+        if at_expired:
+            _release_create_failure(claim_dir, order.id, idempotency_key)
+            raise _error(
+                401,
+                ErrorCode.SESSION_EXPIRED,
+                "accessToken 已过期且缺少 sessionToken/refresh_token，请重新登录导出完整 Session",
+            )
         item = remember(raw_session, bundle.user_agent, bundle.device_id)
 
     view = store.view(order.id)
@@ -968,7 +1182,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                 )
                 break
             except DomainError as exc:
-                if (checkout_attempt == 0 and exit_proxy and _env_on("GSS_CHECKOUT_ROTATE")
+                if (checkout_attempt == 0 and exit_proxy and runtime_flags.get_bool("checkout_rotate")
                         and _is_retryable_checkout_tunnel(exc)):
                     logger.warning("checkout_proxy_rotating code=proxy_tunnel_failed")
                     exit_proxy = rotate_proxy_sid(exit_proxy, force=True)
@@ -1781,7 +1995,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     session_raw = secrets.session or ""
     billing_country = normalize_country(order.billing_country)
     exit_country = normalize_country(
-        getattr(secrets, "exit_country", "") or billing_country
+        getattr(secrets, "exit_country", "") or configured_exit_country() or billing_country
     )
     # 全链路粘性：优先复用建单时 pin 的出口，禁止每次支付换 SID。
     # 只有老订单没有 proxy 时才按 exit_country 新建一次。

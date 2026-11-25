@@ -47,9 +47,19 @@ body { margin: 0; background: var(--studio-page); color: var(--studio-ink); }
 .header-tools .theme-toggle:hover, .logout-button:hover { border-color: var(--studio-brand); background: var(--studio-tint); }
 .studio-app :is(button, a, summary):focus-visible { outline: 2px solid var(--studio-brand); outline-offset: 3px; }
 
-.workspace-tabs .workspace-list { gap: 4px; margin-bottom: 20px; flex-wrap: nowrap; }
+.workspace-tabs .workspace-list {
+  gap: 4px;
+  margin-bottom: 20px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.workspace-tabs .workspace-list::-webkit-scrollbar { display: none; }
 .workspace-tabs .workspace-list::before { border-color: var(--studio-line); }
 .workspace-tabs .workspace-tab {
+  flex: 0 0 auto;
   min-height: 44px; padding: 10px 16px; white-space: nowrap;
   color: var(--studio-body); font-size: 14px; font-weight: 550;
 }

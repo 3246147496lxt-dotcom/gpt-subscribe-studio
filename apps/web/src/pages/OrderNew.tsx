@@ -175,34 +175,30 @@ export function OrderNew({ onRecord }: Props) {
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
   }
 
-  // 用 SSE 实时订阅订单状态，替代轮询
+  // 用 SSE 实时订阅订单状态，替代轮询；仅在订单 ID 或终态变化时建立/关闭连接，避免每次更新重连。
+  const activeStreamOrderId = result && !isSettled(result.status) ? result.id : null;
   useEffect(() => {
-    if (!result || isSettled(result.status)) return;
-    
-    const id = result.id;
-    console.log(`[订单 ${id}] 开始 SSE 订阅`);
-    
-    const unsubscribe = subscribeOrderUpdates(id, async (event: OrderUpdateEvent) => {
-      console.log(`[订单 ${id}] SSE 更新:`, event);
-      
-      // 收到状态更新后，重新获取完整订单数据
+    if (!activeStreamOrderId) return;
+
+    let cancelled = false;
+    const unsubscribe = subscribeOrderUpdates(activeStreamOrderId, async (_event: OrderUpdateEvent) => {
       try {
-        const next = await getOrder(id);
+        const next = await getOrder(activeStreamOrderId);
+        if (cancelled) return;
         setResult(next);
         if (isSettled(next.status)) {
           onRecord(next);
-          console.log(`[订单 ${id}] 已结算，停止订阅`);
         }
-      } catch (err) {
-        console.error(`[订单 ${id}] 获取最新状态失败:`, err);
+      } catch {
+        // Ignore transient fetch errors; subsequent SSE event or manual verify can recover.
       }
     });
-    
+
     return () => {
-      console.log(`[订单 ${id}] 取消 SSE 订阅`);
+      cancelled = true;
       unsubscribe();
     };
-  }, [result, onRecord]);
+  }, [activeStreamOrderId, onRecord]);
 
   // 3DS2（use_stripe_sdk）没有跳转链接：用 PaymentIntent 的 client_secret 让 Stripe.js 弹出验证窗口，
   // 验证结束后反复查询订阅状态，直到生效或超时。

@@ -63,7 +63,7 @@ def test_rotation_is_checkpointed_before_client_close_and_failed_checkout(monkey
         "accessToken": "old-fixture-access", "sessionToken": "old-fixture-cookie",
         "statsigContext": {"country": origin},
     })
-    payload = {"plan": "plus", "billing_country": "US", "session": submitted}
+    payload = {"plan": "plus", "billing_country": "US", "exit_country": "US", "session": submitted}
     try:
         response = api.post("/api/orders", json=payload, headers={"Idempotency-Key": key})
         assert response.status_code == 400

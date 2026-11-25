@@ -75,7 +75,7 @@ def test_cross_country_reissues_session_and_uses_target_country(monkeypatch, ver
 
     created = client.post(
         "/api/orders",
-        json={"plan": "plus", "billing_country": "PH", "session": _session("US")},
+        json={"plan": "plus", "billing_country": "PH", "exit_country": "PH", "session": _session("US")},
     )
     assert created.status_code == 201, created.text
     body = created.json()
@@ -170,15 +170,16 @@ def test_cross_country_without_session_token_is_rejected(monkeypatch, verified_p
         }
     )
     created = client.post(
-        "/api/orders", json={"plan": "plus", "billing_country": "PH", "session": session}
+        "/api/orders", json={"plan": "plus", "billing_country": "PH", "exit_country": "PH", "session": session}
     )
     assert created.status_code == 401
     store.clear()
 
 
 @pytest.mark.usefixtures("verified_us_payer")
-def test_conflicting_channel_billing_country_rejected_before_refresh(monkeypatch):
+def test_strict_mode_rejects_split_exit_before_refresh(monkeypatch):
     monkeypatch.setenv("GSS_USE_FAKE", "1")
+    monkeypatch.setenv("GSS_REQUIRE_EXIT_BILLING_MATCH", "1")
     pipeline = build_pipeline()
     monkeypatch.setattr(orders_router, "build_pipeline", lambda: pipeline)
     reauth = _fake_reauth(monkeypatch)
@@ -189,6 +190,26 @@ def test_conflicting_channel_billing_country_rejected_before_refresh(monkeypatch
     assert response.status_code == 409
     assert not reauth and not pipeline.deps.checkout.calls
     assert not store.orders and not store.jobs
+
+
+@pytest.mark.usefixtures("verified_us_payer")
+def test_split_exit_and_fixed_billing_allowed_by_default(monkeypatch):
+    monkeypatch.setenv("GSS_USE_FAKE", "1")
+    pipeline = build_pipeline()
+    monkeypatch.setattr(orders_router, "build_pipeline", lambda: pipeline)
+    _fake_reauth(monkeypatch)
+    store.clear()
+    created = TestClient(create_app()).post("/api/orders", json={
+        "plan": "plus", "billing_country": "US", "exit_country": "PH", "session": _session("JP"),
+    })
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["billing_country"] == "US"
+    assert body["exit_country"] == "PH"
+    assert body["billing"]["country"] == "US"
+    call = pipeline.deps.checkout.calls[0]
+    assert call.billing_country == "US" and call.exit_country == "PH"
+    store.clear()
 
 
 @pytest.mark.parametrize("stage", ["checkout", "pay"])
@@ -203,7 +224,8 @@ def test_failure_reports_session_state_without_credentials(monkeypatch, stage, r
     client = TestClient(create_app())
     pipeline = build_pipeline()
     monkeypatch.setattr(orders_router, "build_pipeline", lambda: pipeline)
-    order = {"plan": "plus", "billing_country": "PH", "session": _session("US" if reissued else "PH")}
+    order = {"plan": "plus", "billing_country": "PH", "exit_country": "PH",
+             "session": _session("US" if reissued else "PH")}
     order_id = None
 
     token, cookie = "fixture-access-value", "fixture-cookie-value"

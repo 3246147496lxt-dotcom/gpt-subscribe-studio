@@ -93,7 +93,8 @@ def _sync_quote(client: ChatGPTClient, context: dict, billing: dict) -> None:
     payload = _json(response)
     if int(response.status_code) >= 400:
         client._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "读取账单税费")
-    check_observed_billing(payload, billing)
+    check_observed_billing(payload, billing,
+                           alternate_countries=(str(context.get("exit_country") or ""),))
     session = payload.get("checkout_session")
     if not isinstance(session, dict) or session.get("checkout_session_id") != context["checkout_id"]:
         raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "税费响应缺少匹配的结账会话")
@@ -394,7 +395,8 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
         if read_only:
             return outcome("pending", "checkout", "原结账尚未提交付款，状态查询不会准备卡片或确认支付")
         billing = billing or context.get("protocol_billing") or {}
-        check_observed_billing(original, billing)
+        check_observed_billing(original, billing,
+                               alternate_countries=(str(context.get("exit_country") or ""),))
         _sync_quote(client, context, billing)
         if _minor(context["amount"], context["currency"]) != _minor(spec["expected_amount"], spec["expected_currency"]) or context["currency"] != str(spec["expected_currency"]).upper():
             return outcome("pending", "checkout", "账单税费已更新，请确认当前应付金额后再提交付款")

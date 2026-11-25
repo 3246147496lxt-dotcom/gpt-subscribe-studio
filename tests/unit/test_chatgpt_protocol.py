@@ -257,7 +257,8 @@ def test_billing_address_matches_country() -> None:
         assert address["city"]
         assert address["postal_code"]
     us = address_for("US")
-    assert us["state"] in {"OR", "DE"}
+    assert us["state"] in {"AK", "DE", "MT", "NH", "OR"}
+    assert us == address_for("US")  # 固定地址，不再随机
     assert us["postal_code"].isdigit() and len(us["postal_code"]) == 5
 
 
@@ -1057,13 +1058,13 @@ def test_prepare_risk_uses_session_country_over_billing(monkeypatch) -> None:
     assert client.timezone == timezone_for("JP")
 
 
-def test_exit_country_prefers_target_country() -> None:
-    assert exit_country_for("US", "PH") == "PH"
+def test_exit_country_prefers_explicit_exit() -> None:
+    assert exit_country_for("PH", "US") == "PH"
     assert exit_country_for("US", "") == "US"
     assert exit_country_for("", "") == ""
-    # 非法目标国家码才回退到 Session 签发地。
-    assert exit_country_for("PH", "USA") == "PH"
-    assert exit_country_for("PH", "japan") == "PH"
+    # 非法出口码继续向下兜底到账单国。
+    assert exit_country_for("USA", "PH") == "PH"
+    assert exit_country_for("japan", "") == ""
 
 
 def test_quote_currency_prefers_checkout_state_over_unrelated_nested_currency() -> None:
@@ -1111,18 +1112,15 @@ def test_quote_parses_nested_checkout_session_tax_response() -> None:
     assert amount == Decimal("982.14")
 
 
-def test_conflicting_checkout_country_stops_before_any_request(monkeypatch, verified_us_payer) -> None:
-    from unittest.mock import Mock
-
-    http = Mock()
+def test_checkout_uses_billing_country_with_free_exit(monkeypatch, verified_us_payer) -> None:
+    http = _FakeHttp("")
     client = ChatGPTClient("fixture-token", account_id="fixture-account", _http=http)
-    prepare = Mock()
-    monkeypatch.setattr(client, "prepare_risk", prepare)
-    with pytest.raises(DomainError) as exc:
-        client.create_checkout(plan="plus", country="PH", billing_country="US", verified_billing=verified_us_payer)
-    assert exc.value.code is ErrorCode.BILLING_COUNTRY_MISMATCH
-    prepare.assert_not_called()
-    assert not http.mock_calls
+    monkeypatch.setattr(client, "prepare_risk", lambda **kwargs: None)
+    client.create_checkout(plan="plus", country="PH", billing_country="US", verified_billing=verified_us_payer)
+    create = [post for post in http.posts if post["url"].endswith("/checkout")][0]
+    assert create["json"]["billing_details"] == {"country": "US", "currency": "PHP"}
+    taxes = [post for post in http.posts if post["url"].endswith("/checkout/taxes")][0]
+    assert taxes["json"]["billing_country"] == "US"
 
 
 def test_checkout_tax_quote_submits_exact_verified_address(monkeypatch, verified_us_payer) -> None:
@@ -1162,12 +1160,13 @@ def test_provider_billing_echo_vetoes_checkout_without_another_request(monkeypat
     assert calls[-1] == boundary and calls.count(boundary) == 1
 
 
-def test_pro_lite_cl_payload_uses_cl_price_but_keeps_us_tax_billing() -> None:
+def test_pro_lite_cl_price_keeps_us_billing_country() -> None:
     from gss_core.chatgpt import _checkout_body
 
-    body = _checkout_body(plan="pro_lite", country="CL", currency="CLP")
+    body = _checkout_body(plan="pro_lite", country="CL", currency="CLP", billing_country="US")
     assert body["plan_name"] == "chatgptprolite"
-    assert body["billing_details"] == {"country": "CL", "currency": "CLP"}
+    # 出口 CL 决定币种；账单国固定 US（与网页端实测一致）。
+    assert body["billing_details"] == {"country": "US", "currency": "CLP"}
     assert body["checkout_ui_mode"] == "custom"
     assert body["checkout_source"] == "chatgpt_web_merged"
     assert body["purchase_attempt_id"]

@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -20,6 +21,11 @@ logger = logging.getLogger("gss.api.events")
 # 全局订阅管理器：order_id -> set of asyncio.Queue
 _subscribers: dict[str, set[asyncio.Queue[dict]]] = {}
 _lock = asyncio.Lock()
+
+# Thread-safe, loop-aware QuickPay SSE subscribers: job_id -> set[(loop, queue)]
+_qp_lock = threading.Lock()
+_qp_subscribers: dict[str, set[tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict]]]] = {}
+_QP_FINAL_STATUSES = {"succeeded", "failed", "unknown", "paid_pending_delivery"}
 
 
 def _sse(payload: dict) -> str:
@@ -134,4 +140,96 @@ async def stream_order_updates(order_id: str, request: Request) -> StreamingResp
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+def publish_quick_pay(job_id: str, snapshot: dict[str, Any]) -> None:
+    """Thread-safe non-blocking broadcast of a QuickPayJobOut snapshot to SSE listeners."""
+    if not job_id:
+        return
+    with _qp_lock:
+        targets = list(_qp_subscribers.get(job_id, ()))
+    if not targets:
+        return
+    dead: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict]]] = []
+    event = {"type": "update", "timestamp": time.time(), "job": snapshot}
+
+    def _enqueue(queue: asyncio.Queue[dict], item: dict[str, Any]) -> None:
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+                queue.put_nowait(item)
+            except Exception:  # noqa: BLE001
+                pass
+
+    for loop, q in targets:
+        if loop.is_closed():
+            dead.append((loop, q))
+            continue
+        try:
+            loop.call_soon_threadsafe(_enqueue, q, event)
+        except RuntimeError:
+            dead.append((loop, q))
+    if dead:
+        with _qp_lock:
+            bucket = _qp_subscribers.get(job_id)
+            if bucket is not None:
+                for pair in dead:
+                    bucket.discard(pair)
+                if not bucket:
+                    del _qp_subscribers[job_id]
+
+
+async def _quick_pay_stream(job_id: str, initial: dict[str, Any]) -> AsyncGenerator[str, None]:
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue[dict] = asyncio.Queue(maxsize=32)
+    pair = (loop, q)
+    with _qp_lock:
+        _qp_subscribers.setdefault(job_id, set()).add(pair)
+    try:
+        yield _sse({"type": "init", "timestamp": time.time(), "job": initial})
+        if str(initial.get("status") or "") in _QP_FINAL_STATUSES:
+            return
+        while True:
+            try:
+                item = await asyncio.wait_for(q.get(), timeout=25.0)
+                yield _sse(item)
+                job_data = item.get("job") if isinstance(item, dict) else None
+                if isinstance(job_data, dict) and str(job_data.get("status") or "") in _QP_FINAL_STATUSES:
+                    return
+            except asyncio.TimeoutError:
+                yield f": heartbeat {time.time()}\n\n"
+    except asyncio.CancelledError:
+        logger.info("quick_pay SSE cancelled job=%s", job_id)
+    finally:
+        with _qp_lock:
+            bucket = _qp_subscribers.get(job_id)
+            if bucket is not None:
+                bucket.discard(pair)
+                if not bucket:
+                    del _qp_subscribers[job_id]
+
+
+@router.get("/quick-pay/{job_id}/stream")
+async def stream_quick_pay_updates(job_id: str) -> StreamingResponse:
+    """Subscribe to real-time QuickPay job stage/status updates via SSE."""
+    from ..routers.quick_pay import _out
+    from ..services.order_flow import get_job
+
+    job = get_job(job_id)
+    if job is None:
+        async def not_found():
+            yield _sse({"type": "error", "code": "not_found", "message": "quick-pay 任务不存在"})
+        return StreamingResponse(
+            not_found(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+    initial = _out(job, admitted=True).model_dump()
+    return StreamingResponse(
+        _quick_pay_stream(job_id, initial),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )

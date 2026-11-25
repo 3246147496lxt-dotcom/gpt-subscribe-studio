@@ -254,7 +254,9 @@ class PlusHarProtocol:
         if user_agent:
             self.device = apply_user_agent(self.device, user_agent)
 
-        self.mode = (telemetry or os.environ.get("GSS_HAR_TELEMETRY", "full")).lower()
+        from gss_core import runtime_flags
+
+        self.mode = (telemetry or runtime_flags.get_str("har_telemetry")).lower()
         self.read_only = bool(read_only)
         # True when this attempt re-issued the session for a different country.
         self.session_reissued = False
@@ -510,6 +512,8 @@ class PlusHarProtocol:
                 # exit replaces both the web cookie and the login country.
                 self.client = ChatGPTClient.from_raw_session(
                     self.session, proxy=self.proxy, strip_ambient=True)
+                if not self.read_only:
+                    self.client.access_token = ""
                 self.session_reissued = True
             elif cross_country and imported.session_token:
                 # Cross-region takeover: keep only the session cookie and
@@ -522,12 +526,17 @@ class PlusHarProtocol:
                 # statsig country and cookie jar, then warm on this exit.
                 self.client = ChatGPTClient.from_raw_session(
                     self.session, proxy=self.proxy, strip_ambient=True)
+                if not self.read_only and imported.session_token:
+                    # Drop the exported AT before warm_exit_session re-issues on this exit.
+                    self.client.access_token = ""
                 self.session_reissued = False
             self.client.timeout = self.timeout
             self.client.language = self.device.locale
             self.client.timezone = self.device.timezone
             if not self.client.user_agent:
                 self.client.user_agent = self.device.ua
+            elif self.session_reissued:
+                self.device = apply_user_agent(self.device, self.client.user_agent)
             if not self.read_only:
                 try:
                     accounts = self.client.warm_exit_session(
@@ -644,7 +653,7 @@ class PlusHarProtocol:
                               f"创建结账失败 HTTP {status}",
                               detail={"upstream_status": status,
                                       "upstream_code": str(payload.get("code") or payload.get("type") or "")})
-        check_observed_billing(payload, self.billing)
+        check_observed_billing(payload, self.billing, alternate_countries=(self.exit_country,))
         self.checkout_id = public_checkout_id(str(payload.get("checkout_session_id") or ""))
         self.publishable_key = str(payload.get("publishable_key") or self.publishable_key)
         self.processor = str(payload.get("processor_entity") or self.processor)
@@ -866,7 +875,7 @@ class PlusHarProtocol:
         payload = _json(response)
         if int(getattr(response, "status_code", 0) or 0) >= 400:
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "读取账单税费失败")
-        check_observed_billing(payload, self.billing)
+        check_observed_billing(payload, self.billing, alternate_countries=(self.exit_country,))
         session = payload.get("checkout_session") if isinstance(payload.get("checkout_session"), dict) else {}
         if session.get("publishable_key"):
             self.publishable_key = str(session["publishable_key"])
@@ -1533,7 +1542,7 @@ class PlusHarProtocol:
                 out.state = "pending"
                 out.message = "原结账已完成，正在核对订阅"
             return out
-        check_observed_billing(payload, self.billing)
+        check_observed_billing(payload, self.billing, alternate_countries=(self.exit_country,))
         self.amount_minor = self._total_minor(payload)
         logger.info("plus_har_checkout id=%s status=%s total=%s %s",
                     self.checkout_id, payload.get("status"), self.amount_minor, self.currency)
@@ -1805,6 +1814,8 @@ def run_har_context(
         confirm_return_url=str(spec.get("confirm_return_url") or ""),
         device=device,
         read_only=read_only,
+        user_agent=str(getattr(client, "user_agent", "") or ""),
+        device_id=str(getattr(client, "device_id", "") or ""),
         hcaptcha_token=str(context.get("hcaptcha_token") or ""),
         browser_context=browser_context or context.get("browser_context"),
         purchase_attempt_id=purchase_attempt_id or str(context.get("purchase_attempt_id") or ""),
@@ -1876,8 +1887,10 @@ def run_har_context(
 
 
 def har_engine_enabled() -> bool:
-    """`GSS_PLUS_ENGINE=legacy` keeps the previous checkout_v2 implementation."""
-    return os.environ.get("GSS_PLUS_ENGINE", "har").strip().lower() != "legacy"
+    """`GSS_PLUS_ENGINE=legacy`（或策略开关面板选择 legacy）恢复旧版 checkout_v2。"""
+    from gss_core import runtime_flags
+
+    return runtime_flags.get_str("plus_engine") != "legacy"
 
 
 class _RecordingSession:

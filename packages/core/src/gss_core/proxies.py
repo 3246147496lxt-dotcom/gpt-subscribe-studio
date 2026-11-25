@@ -197,12 +197,23 @@ def configured_proxy(role: str) -> str | None:
         return None
 
 
+def _sid_alphabet() -> str:
+    """Default to digits: the gateway accepts 8-digit sessions reliably.
+
+    Alphanumeric sessions are routed to broken backends by some providers
+    (CONNECT 404 / SSL_ERROR_SYSCALL). Set GSS_PROXY_SID_ALNUM=1 only when the
+    provider explicitly requires mixed case.
+    """
+    alnum = os.environ.get("GSS_PROXY_SID_ALNUM", "").strip().lower() in {"1", "true", "yes", "on"}
+    return string.ascii_letters + string.digits if alnum else string.digits
+
+
 def new_proxy_sid() -> str:
     # GSS_PROXY_SID pins the sticky session (debugging / solver-IP alignment).
     pinned = os.environ.get("GSS_PROXY_SID", "").strip()
     if pinned:
         return pinned
-    alphabet = string.ascii_letters + string.digits
+    alphabet = _sid_alphabet()
     return "".join(secrets.choice(alphabet) for _ in range(8))
 
 
@@ -243,7 +254,7 @@ def rewrite_proxy_exit(proxy: str, *, region: str = "", sid: str = "") -> str:
 def fresh_proxy_sid(exclude: set[str] | None = None) -> str:
     """Generate a SID even when GSS_PROXY_SID is pinned (checkout retry only)."""
     exclude = {str(item) for item in (exclude or set())}
-    alphabet = string.ascii_letters + string.digits
+    alphabet = _sid_alphabet()
     for _ in range(20):
         sid = "".join(secrets.choice(alphabet) for _ in range(8))
         if sid not in exclude:
@@ -257,12 +268,13 @@ def rotate_proxy_sid(proxy: str, *, force: bool = False) -> str:
 
 
 def exit_country_for(session_country: str = "", billing_country: str = "") -> str:
-    """选择代理出口国家：订单目标国家（billing_country）优先，Session 签发地兜底。
+    """选择代理出口国家：显式出口 / Session 签发地优先，账单国只兜底。
 
-    跨区充值以目标国家为准；Session 签发地只用于判断是否需要重签发，
-    不能反过来覆盖目标国家。
+    账单是固定资料（美国免税地址），不能反过来决定出口。调用方把订单的
+    ``exit_country`` 放在 ``session_country`` 参数里传入；只有出口缺失时才
+    回退到账单国。
     """
-    for candidate in (billing_country, session_country):
+    for candidate in (session_country, billing_country):
         code = normalize_region(candidate)
         if _COUNTRY_CODE.match(code):
             return code
@@ -362,6 +374,18 @@ def session_proxy_for(
     return session_proxy(role, exit_country_for(session_country, billing_country))
 
 
+def configured_exit_country() -> str:
+    """Read the region already configured on the gateway (no network request)."""
+    for role in ROLES:
+        try:
+            region = GatewayStore().get(role).region
+        except (OSError, ValueError, TypeError):
+            continue
+        if region:
+            return region
+    return ""
+
+
 def checkout_proxy_for(
     role: str, *, session_country: str = "", billing_country: str = ""
 ) -> str | None:
@@ -420,6 +444,7 @@ __all__ = [
     "session_proxy",
     "session_proxy_for",
     "checkout_proxy_for",
+    "configured_exit_country",
     "exit_country_for",
     "proxy_exit_region",
     "align_proxy_region",

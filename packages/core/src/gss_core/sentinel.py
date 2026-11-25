@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict
+
+from .redaction import redact_sensitive
+
+logger = logging.getLogger("gss.sentinel")
 
 _ASSETS = Path(__file__).with_name("sentinel_assets")
 _BRIDGE = _ASSETS / "sentinel_bridge.js"
@@ -46,6 +51,23 @@ def extract_build(html: str) -> tuple[str, str, str]:
         seq_match.group(1) if seq_match else "",
         session_match.group(1) if session_match else "",
     )
+
+
+def _compact_bridge_error(text: str) -> str:
+    """Keep the actionable tail (exception line), not the head of a traceback."""
+    raw = str(text or "").strip()
+    if "reqfail:" in raw:
+        body = raw.split("reqfail:", 1)[1]
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(body)
+            inner = str(parsed.get("e") or "")
+            line = next((item for item in reversed(inner.splitlines()) if item.strip()), "")
+            if line:
+                return ("proxy fetch: " + line.strip())[:320]
+        except (ValueError, AttributeError, TypeError):
+            pass
+    lines = [item for item in raw.splitlines() if item.strip()]
+    return (lines[-1] if lines else raw)[:320]
 
 
 def header_value(token: Dict[str, Any]) -> str:
@@ -132,15 +154,21 @@ def mint(
     output = (process.stdout or b"").decode("utf-8", "replace").strip()
     stderr = (process.stderr or b"").decode("utf-8", "replace").strip()
     if process.returncode != 0:
-        return {"_error": f"node exit {process.returncode}: {stderr[:240]}"}
+        logger.warning("sentinel_bridge_exit code=%s stderr=%s",
+                       process.returncode, redact_sensitive(stderr)[:1500])
+        return {"_error": f"node exit {process.returncode}: {_compact_bridge_error(stderr)}"}
     if not output:
-        return {"_error": f"empty node output: {stderr[:240]}"}
+        logger.warning("sentinel_bridge_empty stderr=%s", redact_sensitive(stderr)[:1500])
+        return {"_error": f"empty node output: {_compact_bridge_error(stderr)}"}
     try:
         result = json.loads(output)
     except json.JSONDecodeError:
+        logger.warning("sentinel_bridge_bad_json output=%s", redact_sensitive(output)[:1500])
         return {"_error": f"bad node json: {output[:120]}"}
     if result.get("error"):
-        return {"_error": str(result.get("error"))[:240]}
+        raw_error = str(result.get("error"))
+        logger.warning("sentinel_bridge_error %s", redact_sensitive(raw_error)[:1500])
+        return {"_error": _compact_bridge_error(raw_error)}
     if not result.get("main"):
         return {"_error": "node returned no main token"}
     try:
