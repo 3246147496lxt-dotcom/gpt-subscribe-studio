@@ -578,6 +578,7 @@ class PlusHarProtocol:
             device_id=self.client.device_id or self.device.guid,
             email=self.email,
             country=self.country,
+            exit_country=self.exit_country,
             page_url="https://chatgpt.com/",
             started_at=self.t0,
         ))
@@ -1793,6 +1794,8 @@ def run_har_context(
     stored = context.get("har_device")
     if isinstance(stored, dict) and stored:
         device = DeviceProfile.from_dict(stored)
+        if exit_country:
+            device.align_exit(exit_country)
     currency = str(spec.get("currency") or "USD").upper()
     country = str(spec.get("country") or (billing or {}).get("country") or "US").upper()
     engine = PlusHarProtocol(

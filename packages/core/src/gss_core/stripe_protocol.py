@@ -30,7 +30,8 @@ import httpx
 
 from gss_contracts.errors import DomainError, ErrorCode
 
-from gss_core.chatgpt import profile_from_session_ua
+from gss_core.chatgpt import impersonate_for_ua, profile_from_session_ua
+from gss_core.countries import locale_for, timezone_for
 from gss_core.redaction import redact_sensitive
 
 try:
@@ -132,6 +133,7 @@ class CheckoutContext:
     init_checksum: str = ""
     config_id: str = ""
     amount: str = "0"
+    currency: str = "usd"
     return_url: str = ""
     site_key: str = ""
     rqdata: str = ""
@@ -174,9 +176,15 @@ class StripeProtocol:
         profile: dict | None = None,
         user_agent: str = "",
         pin_proxy: bool = False,
+        publishable_key: str = "",
+        currency: str = "",
+        exit_country: str = "",
     ) -> None:
         self.proxy = proxy or None
         self.pin_proxy = pin_proxy
+        self.publishable_key = (publishable_key or "").strip() or PUBLISHABLE_KEY
+        self.currency = (currency or "").strip().lower()
+        self.exit_country = (exit_country or "").strip().upper()
         self.credentials_current = lambda: True
         self.locale = ""
         self.timezone = ""
@@ -252,13 +260,22 @@ class StripeProtocol:
             proxies = None
             if self.proxy:
                 proxies = {"http": self.proxy, "https": self.proxy}
-            self._client = curl_requests.Session(
-                impersonate="chrome150",
-                proxies=proxies,
-                timeout=self.timeout,
-                headers={"User-Agent": self.ua, "Accept": "application/json"},
-            )
-            log("   使用 curl_cffi（Chrome TLS 指纹）")
+            target_impersonate = impersonate_for_ua(self.ua)
+            try:
+                self._client = curl_requests.Session(
+                    impersonate=target_impersonate,
+                    proxies=proxies,
+                    timeout=self.timeout,
+                    headers={"User-Agent": self.ua, "Accept": "application/json"},
+                )
+            except Exception:
+                self._client = curl_requests.Session(
+                    impersonate="chrome150",
+                    proxies=proxies,
+                    timeout=self.timeout,
+                    headers={"User-Agent": self.ua, "Accept": "application/json"},
+                )
+            log(f"   使用 curl_cffi（Chrome TLS 指纹 {target_impersonate}）")
         return self._client
 
     def close(self) -> None:
@@ -321,14 +338,34 @@ class StripeProtocol:
                 pass
             time.sleep(random.uniform(0.05, 0.2))
 
+    def _exit_locale_tz(self) -> tuple[str, str, int]:
+        """Return (locale, timezone, utc_offset_minutes) driven by exit IP country.
+
+        Falls back to billing country only when no explicit exit country is set;
+        never forces billing address to match the exit IP.
+        """
+        region = self.exit_country or (self.billing.get("country") or "US").upper()
+        loc, tz = self._LOCALE_BY_COUNTRY.get(region, (locale_for(region), timezone_for(region)))
+        offset_min = -300
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            offset = datetime.now(ZoneInfo(tz)).utcoffset()
+            if offset is not None:
+                offset_min = int(offset.total_seconds() // 60)
+        except Exception:
+            pass
+        return loc, tz, offset_min
+
     # ── ① 指纹 ──────────────────────────────────────────────
     def register_fingerprint(self) -> Fingerprint:
         log("① m.stripe.com/6 注册指纹")
         guid, muid, sid = _hex_id(), _hex_id(), _hex_id()
         fp_id = os.urandom(16).hex()
-        # 必须与 UA / profile 一致，否则 m.stripe.com 指纹与 UA 打架
+        # 必须与 UA / profile / 出口地区一致，避免 m.stripe.com 指纹与出口 IP 打架
         platform_str = self.platform
-        locale = random.choice(["en-US", "en-US", "en-US", "en-GB"])
+        locale, _tz, tz_offset = self._exit_locale_tz()
         sw, sh = self.screen[0], self.screen[1]
         dpr = 1
         vh = sh - random.randint(40, 70)
@@ -352,8 +389,6 @@ class StripeProtocol:
             canvas_bits = "".join(random.choice("01") for _ in range(49))
             # webgl 指纹是 32 位 hex
             webgl_hex = os.urandom(16).hex()
-            # 时区偏移，美国范围 -300 到 -480 分钟
-            tz_offset = -random.choice([300, 360, 420, 480])
             return {
                 "v2": v2, "id": fp_id,
                 "t": round(random.uniform(140, 180), 1),
@@ -482,16 +517,16 @@ class StripeProtocol:
     }
 
     def _align_locale(self, proxy: str | None) -> tuple[str, str]:
-        """返回 (locale, timezone)，以账单国家为准。
+        """返回 (locale, timezone)，以出口地区优先（未指定时回退账单国）。
 
-        只做一件事：查出口 IP 供日志留痕，并在出口国家与账单国家不一致时告警。
-        locale/timezone 不再跟随 IP——住宅池会漂移，跟着漂会制造矛盾指纹。
+        允许出口地区（如 PH）与固定美国账单（US）分离：浏览器 locale/timezone
+        跟随出口地区以匹配代理 IP，账单地址保持原样不变。
         """
-        country = (self.billing.get("country") or "US").upper()
-        locale, tz = self._LOCALE_BY_COUNTRY.get(country, ("en-US", "America/New_York"))
+        region = self.exit_country or (self.billing.get("country") or "US").upper()
+        locale, tz, _ = self._exit_locale_tz()
 
         if not proxy:
-            log(f"   无代理，locale={locale} tz={tz}（按账单国 {country}）")
+            log(f"   无代理，locale={locale} tz={tz}（按地区 {region}）")
             return locale, tz
 
         try:
@@ -505,10 +540,10 @@ class StripeProtocol:
                     cc = (j.get("countryCode") or "").upper()
                     self._geo = {"country": cc, "timezone": j.get("timezone") or "",
                                  "region": j.get("regionName")}
-                    if cc and cc != country:
-                        log(f"   ⚠ 出口 {cc} ≠ 账单 {country}（locale 仍按账单国）")
+                    if cc and cc != region:
+                        log(f"   ⚠ 实际出口 {cc} ≠ 预期出口 {region}（locale 仍按 {region}）")
                     else:
-                        log(f"   出口 {cc} 与账单国一致，locale={locale} tz={tz}")
+                        log(f"   出口 {cc} 与预期一致，locale={locale} tz={tz}")
         except Exception as e:
             log(f"   出口地理查询失败（不影响流程）: {str(e)[:60]}")
         return locale, tz
@@ -521,7 +556,7 @@ class StripeProtocol:
         """
         r = self._get(
             f"{STRIPE_API}/v1/payment_pages/allowed_origins",
-            {"key": PUBLISHABLE_KEY},
+            {"key": self.publishable_key},
             {"Accept": "application/json",
              "Origin": "https://js.stripe.com",
              "Referer": "https://js.stripe.com/",
@@ -541,7 +576,7 @@ class StripeProtocol:
             "browser_locale": locale,
             "browser_timezone": tz,
             "eid": "NA",
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "redirect_type": "url",
         }
         r = self._post(
@@ -553,39 +588,43 @@ class StripeProtocol:
         j = r.json()
         ls = j.get("link_settings") or {}
         due = (j.get("total_summary") or {}).get("due")
+        cur = str(j.get("currency") or self.currency or "usd").strip().lower() or "usd"
         ctx = CheckoutContext(
             stripe_js_id=js_id,
             init_checksum=j.get("init_checksum") or "",
             config_id=j.get("config_id") or "",
             amount=str(due) if due is not None else "0",
+            currency=cur,
             return_url=j.get("url") or j.get("stripe_hosted_url") or "",
             site_key=ls.get("hcaptcha_site_key") or "",
             rqdata=ls.get("hcaptcha_rqdata") or "",
             rv_timestamp=self._make_rv_timestamp(),
         )
-        log(f"   amount={ctx.amount} siteKey={ctx.site_key} rqdata={len(ctx.rqdata)}")
+        log(f"   amount={ctx.amount} currency={ctx.currency} siteKey={ctx.site_key} rqdata={len(ctx.rqdata)}")
         log(f"   config_id={ctx.config_id[:12]}")
         return j, ctx
 
     # ── ③ elements/sessions ─────────────────────────────────
     def elements_session(self, cs_id: str, ctx: CheckoutContext,
                          locale: str = "en-US") -> dict[str, Any]:
+        cur = (ctx.currency or self.currency or "usd").strip().lower() or "usd"
+        tz = self.timezone or self._geo.get("timezone") or "America/New_York"
         params = {
             "_stripe_version": V_ELEMENTS,
-            "browser_timezone": self._geo.get("timezone", "America/New_York"),
+            "browser_timezone": tz,
             "checkout_session_id": cs_id,
             "client_betas[0]": "google_pay_beta_1",
             "client_betas[1]": "disable_deferred_intent_client_validation_beta_1",
             "client_betas[2]": "blocked_card_brands_beta_2",
-            "currency": "usd",
+            "currency": cur,
             "deferred_intent[amount]": ctx.amount or "0",
-            "deferred_intent[currency]": "usd",
+            "deferred_intent[currency]": cur,
             "deferred_intent[mode]": "subscription",
             "deferred_intent[payment_method_types][0]": "card",
             "deferred_intent[setup_future_usage]": "off_session",
             "elements_init_source": "checkout",
             "hosted_surface": "checkout",
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "locale": locale,
             "referrer_host": "pay.openai.com",
             "stripe_js_id": ctx.stripe_js_id,
@@ -610,7 +649,7 @@ class StripeProtocol:
         log("④ 提交 tax_region（country）")
         data = {
             "eid": "NA",
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "tax_region[country]": self.billing.get("country", "US"),
         }
         r = self._post(f"{STRIPE_API}/v1/payment_pages/{cs_id}",
@@ -673,7 +712,7 @@ class StripeProtocol:
             "client_attribution_metadata[merchant_integration_version]": "hosted_checkout",
             "client_attribution_metadata[payment_method_selection_flow]": "merchant_specified",
             "guid": fp.guid, "muid": fp.muid, "sid": fp.sid,
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "_stripe_version": V_HOSTED,
         }
         r = self._post(
@@ -701,7 +740,7 @@ class StripeProtocol:
             "expected_payment_method_type": "card",
             "_stripe_version": V_HOSTED,
             "guid": fp.guid, "muid": fp.muid, "sid": fp.sid,
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "link_brand": "link",
             "client_attribution_metadata[client_session_id]": fp.client_session_id,
             "client_attribution_metadata[checkout_session_id]": cs_id,
@@ -781,7 +820,7 @@ class StripeProtocol:
             "client_secret": client_secret,
             "challenge_response_token": token,
             "captcha_vendor_name": "hcaptcha",
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             # 挑战来自 hosted checkout（payment_pages/{cs}/confirm），
             # 版本必须和该流程一致；用 V_FULL 会让 token 被判无效。
             "_stripe_version": V_HOSTED,
@@ -805,7 +844,7 @@ class StripeProtocol:
             time.sleep(2)
             r = self._get(
                 f"{STRIPE_API}/v1/payment_pages/{cs_id}/poll",
-                {"key": PUBLISHABLE_KEY, "_stripe_version": V_BASE},
+                {"key": self.publishable_key, "_stripe_version": V_BASE},
                 self.headers,
             )
             try:

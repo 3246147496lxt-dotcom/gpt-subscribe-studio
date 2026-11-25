@@ -82,6 +82,7 @@ class TelemetryContext:
     device_id: str = ""
     email: str = ""
     country: str = ""
+    exit_country: str = ""
     customer_id: str = ""
     hcaptcha_token: str = ""
     page_url: str = "https://chatgpt.com/"
@@ -429,7 +430,7 @@ class StripeTelemetry:
                     },
                     "email": c.email,
                     "userAgent": c.device.ua,
-                    "country": c.country,
+                    "country": c.exit_country or c.country,
                     "locale": c.device.locale,
                     "appVersion": f"26.{random.randint(1000, 1100)}.{random.randint(90000, 99999)}",
                     "custom": {

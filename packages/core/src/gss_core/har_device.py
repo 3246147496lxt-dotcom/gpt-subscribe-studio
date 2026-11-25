@@ -34,7 +34,7 @@ from typing import Any, Dict, Optional
 
 import sys
 
-from .countries import timezone_for
+from .countries import locale_for, timezone_for
 
 # Chrome releases around the capture (Oct 2026).  Each entry is a real
 # versionhistory.googleapis.com build string; the flow only needs a coherent
@@ -222,10 +222,10 @@ class DeviceProfile:
         if len(host_screen) >= 4 and int(host_screen[0]) >= 1024 and int(host_screen[1]) >= 700:
             sw, sh, _avail, dpr = host_screen[:4]
             chrome_px = max(0, int(sh) - int(host_screen[2]))
-        tz = timezone or host.get("timezone") or timezone_for(country) or prof["tz_default"]
-        # The capture keeps the UI language at en-US even on a JP account;
-        # only the timezone follows the billing country.
-        loc = locale or "en-US"
+        # 时区与语言始终跟随出口 IP 国家（例如 PH 出口 -> Asia/Manila + en-PH），
+        # 与固定美国账单地址解耦；宿主机指纹时区仅在未提供出口国家时兜底。
+        tz = timezone or (timezone_for(country) if country else "") or host.get("timezone") or prof["tz_default"]
+        loc = locale or (locale_for(country) if country else "") or "en-US"
         language = loc
         primary = loc.split("-")[0]
 
@@ -279,6 +279,25 @@ class DeviceProfile:
             frame_token=_seg_b64(24),
         )
 
+    def align_exit(self, country: str) -> "DeviceProfile":
+        """Align browser timezone and locale with the order's exit IP country.
+
+        Billing country (e.g. fixed US tax-free address) is intentionally
+        decoupled from the exit IP country (e.g. PH) and never overrides these
+        browser environment signals.
+        """
+        code = str(country or "").strip().upper()
+        if not code:
+            return self
+        tz = timezone_for(code)
+        loc = locale_for(code)
+        primary = loc.split("-")[0]
+        self.timezone = tz
+        self.timezone_offset_min = _offset_minutes(tz)
+        self.locale = loc
+        self.languages = f"{loc},{primary}" if primary != loc else loc
+        return self
+
     def rotate_attempt_ids(self) -> None:
         """New page load, same device: guid/muid/sid stay, Stripe.js ids roll."""
         self.stripe_js_id = _uuid()
@@ -307,7 +326,7 @@ class DeviceProfile:
     @property
     def sec_ch_ua(self) -> str:
         m = self.chrome_major
-        return f'"Not:A-Brand";v="8", "Chromium";v="{m}", "Google Chrome";v="{m}"'
+        return f'"Google Chrome";v="{m}", "Chromium";v="{m}", "Not(A:Brand";v="24"'
 
     @property
     def sec_ch_ua_full_version(self) -> str:
@@ -316,7 +335,7 @@ class DeviceProfile:
     @property
     def sec_ch_ua_full_version_list(self) -> str:
         b = self.chrome_build
-        return f'"Not:A-Brand";v="8.0.0.0", "Chromium";v="{b}", "Google Chrome";v="{b}"'
+        return f'"Google Chrome";v="{b}", "Chromium";v="{b}", "Not(A:Brand";v="24.0.0.0"'
 
     @property
     def frame_base(self) -> str:
@@ -544,6 +563,8 @@ def device_for_account(account_id: str, country: str = "US") -> "DeviceProfile":
             try:
                 profile = DeviceProfile.from_dict(entry)
                 profile.rotate_attempt_ids()
+                if country:
+                    profile.align_exit(country)
                 return profile
             except Exception:  # noqa: BLE001
                 pass

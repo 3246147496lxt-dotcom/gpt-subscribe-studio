@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from gss_contracts import (
     AdapterCapabilities,
@@ -16,11 +17,12 @@ from gss_contracts import (
     Plan,
 )
 from gss_contracts.errors import DomainError, ErrorCode
+from gss_core import runtime_flags
 from gss_core.billing import address_for
 from gss_core.verified_payer import checkout_address
 from gss_core.chatgpt import ChatGPTClient, clamp_team_seats
-from gss_core.config import ORDER_HTTP_TIMEOUT_S
-from gss_core.session_token import parse_session
+from gss_core.config import ORDER_HTTP_TIMEOUT_S, use_fake_adapters
+from gss_core.session_token import parse_session, parse_session_bundle
 from gss_core.countries import country_codes, currency_for
 from gss_core.proxies import (
     align_proxy_region,
@@ -128,7 +130,12 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         # A dead proxy session fails inside Sentinel before the checkout POST.
         # Rotate only that SID and recreate the client; the retried request uses
         # the new exit for both Sentinel and the checkout, keeping one IP.
+        # When ST / OAuth refresh_token is available, re-issue AT on the rotated
+        # exit IP so OpenAI never sees an AT bound to the previous IP.
         created = None
+        effective_session: Optional[str] = None
+        effective_ua: Optional[str] = None
+        effective_device_id: Optional[str] = None
         for attempt in range(2):
             try:
                 created = await asyncio.to_thread(self._create, req, proxy)
@@ -137,6 +144,12 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
                 if attempt == 0 and proxy and _retryable_sentinel_transport(exc):
                     logger.warning("checkout_sentinel_proxy_rotated code=%s", exc.code.value)
                     proxy = rotate_proxy_sid(proxy, force=True)
+                    rotated = await asyncio.to_thread(
+                        self._reissue_for_rotated_exit, req.session, proxy, exit_country,
+                    )
+                    if rotated is not None:
+                        effective_session, effective_ua, effective_device_id = rotated
+                        req = replace(req, session=effective_session, session_reissued=True)
                     continue
                 raise
         if created is None:
@@ -160,7 +173,58 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
             checkout_kind=created.checkout_kind or ("hosted" if req.plan is Plan.TEAM else "custom"),
             confirm_return_url=created.confirm_return_url or "",
             effective_proxy=proxy,
+            effective_session=effective_session,
+            effective_user_agent=effective_ua,
+            effective_device_id=effective_device_id,
         )
+
+    @staticmethod
+    def _reissue_for_rotated_exit(
+        raw_session: str, proxy: str, exit_country: str
+    ) -> Optional[tuple[str, str, str]]:
+        """Re-issue AT on the newly rotated exit IP when ST/refresh_token is present."""
+        if use_fake_adapters() or not runtime_flags.get_bool("reissue_session_on_exit"):
+            return None
+        try:
+            bundle = parse_session_bundle(raw_session)
+        except ValueError:
+            return None
+        if not bundle.session_token and not bundle.refresh_token:
+            return None
+        client: Optional[ChatGPTClient] = None
+        try:
+            if bundle.session_token:
+                kwargs: Dict[str, object] = {"proxy": proxy, "country": exit_country}
+                if runtime_flags.get_bool("reissue_keep_ua"):
+                    kwargs["preserve_user_agent"] = True
+                client = ChatGPTClient.reauthorize_for_country(raw_session, **kwargs)
+            else:
+                client = ChatGPTClient.reauthorize_oauth(
+                    raw_session, proxy=proxy, country=exit_country,
+                )
+            resolved_ua = getattr(client, "user_agent", "") or getattr(client, "ua", "")
+            snapshot: Dict[str, object] = {
+                "accessToken": client.access_token,
+                "sessionToken": client.extra_cookies.get(
+                    "__Secure-next-auth.session-token", client.session_token,
+                ),
+                "deviceId": client.device_id,
+                "sessionId": client.oai_session_id,
+                "userAgent": resolved_ua,
+                "cookies": client.extra_cookies,
+                "statsigContext": {
+                    "deviceId": client.device_id,
+                    "userAgent": resolved_ua,
+                    "country": exit_country,
+                },
+            }
+            if getattr(client, "refresh_token", ""):
+                snapshot["refresh_token"] = client.refresh_token
+            logger.info("checkout_sentinel_rotated_reissue_ok exit_country=%s", exit_country)
+            return json.dumps(snapshot), resolved_ua, client.device_id
+        finally:
+            if client is not None:
+                client.close()
 
     def _create(self, req: CheckoutRequest, proxy: Optional[str]):
         client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)

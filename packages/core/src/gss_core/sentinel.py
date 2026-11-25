@@ -107,6 +107,9 @@ def mint(
     screen_h: int = 1080,
     avail_h: int = 1032,
     cores: int = 8,
+    impersonate: str = "",
+    sec_ch_ua: str = "",
+    sec_ch_ua_platform: str = "",
 ) -> Dict[str, Any]:
     """返回哨兵 JSON；失败返回空 dict，由调用方决定是否中止。"""
 
@@ -131,6 +134,9 @@ def mint(
             "maxTouchPoints": 0,
             "cookieHeader": cookie_header,
             "sentinelOrigin": "https://chatgpt.com",
+            "impersonate": impersonate or "",
+            "secChUa": sec_ch_ua or "",
+            "secChUaPlatform": sec_ch_ua_platform or "",
         },
         separators=(",", ":"),
     ).encode("utf-8")

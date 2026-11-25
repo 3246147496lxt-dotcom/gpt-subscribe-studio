@@ -170,7 +170,7 @@ function solvePoW(g, seed, difficulty) {
   return "gAAAAAB" + ERR_PREFIX + b64Compact(null) + "~S";
 }
 
-function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOrigin, frameUrl) {
+function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOrigin, frameUrl, secChUa, secChUaPlatform) {
   // sdk 里的 fetch 桥到 fetchImpl：改写 URL 到 sentinel.openai.com、补头、走代理。
   // 关键：dispatcher 与 fetchImpl 必须来自同一个 undici 版本，否则 Node 内置 fetch
   // 校验外部 dispatcher 的 Request handler 会报 "invalid onRequestStart method"。
@@ -190,6 +190,8 @@ function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOr
         "user-agent": ua,
         accept: "*/*",
         "accept-language": `${language},${language.split("-")[0]};q=0.9,en;q=0.8`,
+        ...(secChUa ? { "sec-ch-ua": secChUa, "sec-ch-ua-mobile": "?0" } : {}),
+        ...(secChUaPlatform ? { "sec-ch-ua-platform": secChUaPlatform } : {}),
         ...(cookieHeader ? { cookie: cookieHeader } : {}),
       },
       opts.headers || {}
@@ -282,7 +284,7 @@ function curlDaemonSockets() {
 
 let curlDaemonCursor = 0;
 
-function residentCurlFetch(proxy, url, opts) {
+function residentCurlFetch(proxy, url, opts, impersonate) {
   const sockets = curlDaemonSockets();
   if (!sockets.length) return null;
   const net = require("net");
@@ -312,6 +314,7 @@ function residentCurlFetch(proxy, url, opts) {
           headers: opts.headers || {},
           body: opts.body == null ? null : String(opts.body),
           proxy,
+          impersonate: impersonate || "chrome150",
           timeout: 120,
         }));
       } catch (e) {
@@ -351,7 +354,7 @@ function curlDaemonCursorSafe() {
   return curlDaemonCursor;
 }
 
-function makePythonCurlFetch(proxy) {
+function makePythonCurlFetch(proxy, impersonate) {
   const { spawn } = require("child_process");
   const helper = require("path").join(__dirname, "sentinel_curl_fetch.py");
   const python = resolvePython();
@@ -390,6 +393,7 @@ function makePythonCurlFetch(proxy) {
         headers: opts.headers || {},
         body: opts.body == null ? null : String(opts.body),
         proxy,
+        impersonate: impersonate || "chrome150",
         timeout: 120,
       }));
     });
@@ -397,7 +401,7 @@ function makePythonCurlFetch(proxy) {
 
   return function pythonCurlFetch(url, opts) {
     opts = opts || {};
-    const viaDaemon = residentCurlFetch(proxy, url, opts);
+    const viaDaemon = residentCurlFetch(proxy, url, opts, impersonate);
     if (!viaDaemon) return spawnCurlFetch(url, opts);
     return viaDaemon.catch(() => spawnCurlFetch(url, opts));
   };
@@ -424,6 +428,9 @@ async function handleRequest(raw) {
   const timezone = args.timezone || "America/Chicago";
   const cookieHeader = args.cookieHeader || "";
   const sentinelOrigin = args.sentinelOrigin || "https://chatgpt.com";
+  const impersonate = String(args.impersonate || "").trim() || "chrome150";
+  const secChUa = String(args.secChUa || "").trim();
+  const secChUaPlatform = String(args.secChUaPlatform || "").trim();
   // 指纹档案驱动（与请求 UA/平台/屏幕一致，避免哨兵身份与请求身份打架）
   const platform = args.platform || "Win32";
   const platformLabel = args.platformLabel || "Windows";
@@ -440,12 +447,15 @@ async function handleRequest(raw) {
     undici = require("undici");
   } catch (_) {}
 
-  // 代理（undici ProxyAgent）——与注册同 IP 命中 /sentinel/req。
-  // 注意：undici 不会自动解析 URL 里的 user:pass@，必须显式给 Proxy-Authorization token。
+  // 默认所有代理（含 HTTP/HTTPS 与 SOCKS）均走项目 curl_cffi BoringSSL Chrome TLS，
+  // 保证 /backend-api/sentinel/req 与 /api/auth/session、/payments/checkout 的 TLS 指纹一致，
+  // 避免同一出口 IP 下出现 Node TLS vs Chrome TLS 分裂。
+  // 仅当显式设置 SENTINEL_HTTP_TRANSPORT=undici 时退回 Node undici ProxyAgent。
+  const forceUndici = String(process.env.SENTINEL_HTTP_TRANSPORT || "").trim().toLowerCase() === "undici";
   let dispatcher = null;
   let fetchImpl = undici && undici.fetch ? undici.fetch : fetch;
   if (proxy) {
-    if (undici && /^https?:/i.test(proxy)) {
+    if (forceUndici && undici && /^https?:/i.test(proxy)) {
       try {
         const pu = new URL(proxy);
         const opts = { uri: pu.origin }; // http://host:port（去掉 userinfo）
@@ -458,9 +468,7 @@ async function handleRequest(raw) {
         return JSON.stringify({ error: "ProxyAgent 构造失败：" + ((e && e.message) || e) });
       }
     } else {
-      // SOCKS 代理在 Windows 系统 curl/Schannel 下会出现
-      // SEC_E_NO_CREDENTIALS；复用项目 curl_cffi 的 BoringSSL TLS 栈。
-      fetchImpl = makePythonCurlFetch(proxy);
+      fetchImpl = makePythonCurlFetch(proxy, impersonate);
     }
   }
 
@@ -484,7 +492,9 @@ async function handleRequest(raw) {
       dispatcher,
       fetchImpl,
       sentinelOrigin,
-      frameUrl
+      frameUrl,
+      secChUa,
+      secChUaPlatform
     ),
     TextEncoder,
     TextDecoder,

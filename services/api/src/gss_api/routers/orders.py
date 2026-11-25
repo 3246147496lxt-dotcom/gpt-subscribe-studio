@@ -1000,9 +1000,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         except HTTPException:
             _release_create_failure(claim_dir, order.id, idempotency_key)
             raise
-        use_clean_st_reissue = bool(
-            need_st_reissue and (cross_country or at_expired or proactive_exit_reissue)
-        )
+        use_clean_st_reissue = bool(need_st_reissue)
         if need_oauth_reissue:
             try:
                 client = await asyncio.to_thread(
@@ -1035,15 +1033,6 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
             client.timezone = timezone_for(exit_country)
             client.session_country = exit_country
         try:
-            if need_st_reissue and not use_clean_st_reissue:
-                try:
-                    refreshed = await asyncio.to_thread(client.refresh_session, reject_unauthorized=True)
-                except DomainError as exc:
-                    _release_create_failure(claim_dir, order.id, idempotency_key)
-                    raise _from_domain(exc, nonteam=plan is not Plan.TEAM)
-                if not refreshed:
-                    _release_create_failure(claim_dir, order.id, idempotency_key)
-                    raise _error(401, ErrorCode.INVALID_SESSION, "session token 刷新未获确认，已停止。")
             access_token = client.access_token
             if not access_token:
                 _release_create_failure(claim_dir, order.id, idempotency_key)
@@ -1186,6 +1175,40 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                         and _is_retryable_checkout_tunnel(exc)):
                     logger.warning("checkout_proxy_rotating code=proxy_tunnel_failed")
                     exit_proxy = rotate_proxy_sid(exit_proxy, force=True)
+                    # Re-issue AT on the newly rotated exit IP when ST/OAuth is available
+                    # so OpenAI does not see an AT minted on the previous SID's IP.
+                    if (not use_fake_adapters()
+                            and (need_st_reissue or need_oauth_reissue or _reissue_on_exit_enabled())):
+                        cur_bundle = parse_session_bundle(raw_session)
+                        if cur_bundle.session_token or cur_bundle.refresh_token:
+                            reissued_client = None
+                            try:
+                                if cur_bundle.session_token:
+                                    rkw: Dict[str, Any] = {"proxy": exit_proxy, "country": exit_country}
+                                    if _reissue_keep_ua():
+                                        rkw["preserve_user_agent"] = True
+                                    reissued_client = await asyncio.to_thread(
+                                        ChatGPTClient.reauthorize_for_country, raw_session, **rkw,
+                                    )
+                                else:
+                                    reissued_client = await asyncio.to_thread(
+                                        ChatGPTClient.reauthorize_oauth, raw_session,
+                                        proxy=exit_proxy, country=exit_country,
+                                    )
+                                raw_session = _session_json(reissued_client, exit_country)
+                                resolved_ua = (
+                                    getattr(reissued_client, "user_agent", "")
+                                    or getattr(reissued_client, "ua", "")
+                                )
+                                item.user_agent = resolved_ua
+                                item.device_id = reissued_client.device_id
+                                item.profile = (
+                                    profile_from_session_ua(item.user_agent)
+                                    or _pick_profile(item.device_id)
+                                )
+                            finally:
+                                if reissued_client is not None:
+                                    reissued_client.close()
                     item.proxy = exit_proxy
                     item.session = raw_session
                     vault.put(order.id, item)
@@ -1274,6 +1297,16 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         effective_proxy = getattr(checkout, "effective_proxy", None)
         if effective_proxy is not None:
             secrets.proxy = effective_proxy
+        effective_session = getattr(checkout, "effective_session", None)
+        if effective_session:
+            secrets.session = effective_session
+            eff_ua = getattr(checkout, "effective_user_agent", None)
+            if eff_ua:
+                secrets.user_agent = eff_ua
+            eff_did = getattr(checkout, "effective_device_id", None)
+            if eff_did:
+                secrets.device_id = eff_did
+            secrets.profile = profile_from_session_ua(secrets.user_agent) or _pick_profile(secrets.device_id)
         vault.put(order.id, secrets)
     store.update_status(order.id, OrderStatus.PENDING_CHECKOUT)
     store.update_status(order.id, OrderStatus.AWAITING_PAYMENT)
@@ -2092,6 +2125,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
             user_agent=getattr(secrets, "user_agent", "") or "",
             pin_proxy=True,
             publishable_key=publishable_key,
+            currency=currency,
+            exit_country=exit_country,
         )
         # 默认全关（批量模式）；网页上勾选后逐项打开
         sp.step_fingerprint = payload.steps.fingerprint

@@ -15,17 +15,35 @@ import sys
 from curl_cffi import requests
 
 
+def _request_with_impersonate(payload: dict):
+    requested = str(payload.get("impersonate") or "chrome150").strip() or "chrome150"
+    candidates = []
+    for item in (requested, "chrome150", "chrome136"):
+        if item and item not in candidates:
+            candidates.append(item)
+    last_exc: Exception | None = None
+    for target in candidates:
+        try:
+            return requests.request(
+                method=str(payload.get("method") or "GET"),
+                url=str(payload.get("url") or ""),
+                headers={str(k): str(v) for k, v in (payload.get("headers") or {}).items()},
+                data=payload.get("body") if payload.get("body") is not None else None,
+                proxy=str(payload.get("proxy") or "") or None,
+                timeout=float(payload.get("timeout") or 120),
+                impersonate=target,
+            )
+        except ValueError as exc:
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("no curl_cffi impersonate target available")
+
+
 def handle(payload: dict) -> dict:
-    """与历史实现逐字段一致的请求逻辑。"""
-    response = requests.request(
-        method=str(payload.get("method") or "GET"),
-        url=str(payload.get("url") or ""),
-        headers={str(k): str(v) for k, v in (payload.get("headers") or {}).items()},
-        data=payload.get("body") if payload.get("body") is not None else None,
-        proxy=str(payload.get("proxy") or "") or None,
-        timeout=float(payload.get("timeout") or 120),
-        impersonate="chrome136",
-    )
+    """与主链路共享一致的 curl_cffi Chrome TLS 指纹。"""
+    response = _request_with_impersonate(payload)
     return {
         "status": int(response.status_code),
         "body": response.text,

@@ -78,6 +78,9 @@ class CheckoutResult:
     checkout_kind: str = "custom"
     confirm_return_url: str = ""
     effective_proxy: Optional[str] = field(default=None, repr=False)
+    effective_session: Optional[str] = field(default=None, repr=False)
+    effective_user_agent: Optional[str] = field(default=None, repr=False)
+    effective_device_id: Optional[str] = field(default=None, repr=False)
 
 
 @runtime_checkable

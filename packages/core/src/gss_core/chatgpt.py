@@ -38,15 +38,38 @@ STRIPE_BASE = "https://api.stripe.com"
 OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 OAUTH_CLIENT_ID = os.environ.get("GSS_OAUTH_CLIENT_ID", "app_EMoamEEZ73f0CkXaXp7hrann")
 _IMPERSONATE = "chrome150"
+_SUPPORTED_CHROME_IMPERSONATES = (
+    (150, "chrome150"),
+    (146, "chrome146"),
+    (145, "chrome145"),
+    (142, "chrome142"),
+    (136, "chrome136"),
+    (133, "chrome133a"),
+)
+
+
+def impersonate_for_major(major: str) -> str:
+    """Map a Chrome major version string to the nearest curl_cffi TLS target."""
+    try:
+        target = int(str(major or "").split(".", 1)[0])
+    except (TypeError, ValueError):
+        return _IMPERSONATE
+    return min(_SUPPORTED_CHROME_IMPERSONATES, key=lambda row: abs(row[0] - target))[1]
+
+
+def impersonate_for_ua(ua: str) -> str:
+    match = _UA_CHROME_VERSION.search(str(ua or ""))
+    return impersonate_for_major(match.group(1)) if match else _IMPERSONATE
+
+
 _CLIENT_VERSION = "prod-db390ebea64862bf1899c420a4c736e0cf639747"
 _CLIENT_BUILD = "7904904"
-# ── 真实 Chrome 146-150 profile（versionhistory.googleapis.com）──────────
+# ── 真实 Chrome profile（大版本严格对齐 curl_cffi TLS impersonate 目标）────
 _PROFILES = {
     "windows": {
-        "builds": ["150.0.7871.189", "149.0.7827.201", "148.0.7778.218",
-                   "147.0.7727.139", "146.0.7680.180",
-                   "150.0.7871.187", "149.0.7827.199", "148.0.7778.216",
-                   "147.0.7727.137", "146.0.7680.178"],
+        "builds": ["150.0.7871.189", "150.0.7871.187",
+                   "146.0.7680.180", "146.0.7680.178",
+                   "145.0.7632.116", "142.0.7444.175"],
         "platform": "Win32",
         "label": "Windows",
         "screen": (1920, 1080, 1032),
@@ -61,10 +84,9 @@ _PROFILES = {
         },
     },
     "macos": {
-        "builds": ["150.0.7871.189", "149.0.7827.201", "148.0.7778.217",
-                   "147.0.7727.139", "146.0.7680.180",
-                   "150.0.7871.187", "149.0.7827.199", "148.0.7778.215",
-                   "147.0.7727.137", "146.0.7680.177"],
+        "builds": ["150.0.7871.189", "150.0.7871.187",
+                   "146.0.7680.180", "146.0.7680.177",
+                   "145.0.7632.116", "142.0.7444.175"],
         "platform": "MacIntel",
         "label": "macOS",
         "screen": (1512, 982, 938),
@@ -79,10 +101,9 @@ _PROFILES = {
         },
     },
     "linux": {
-        "builds": ["150.0.7871.186", "149.0.7827.200", "148.0.7778.215",
-                   "147.0.7727.137", "146.0.7680.177",
-                   "150.0.7871.181", "149.0.7827.196", "148.0.7778.178",
-                   "147.0.7727.116", "146.0.7680.164"],
+        "builds": ["150.0.7871.186", "150.0.7871.181",
+                   "146.0.7680.177", "146.0.7680.164",
+                   "145.0.7632.116", "142.0.7444.175"],
         "platform": "Linux x86_64",
         "label": "Linux",
         "screen": (1920, 1080, 1053),
@@ -628,10 +649,11 @@ class ChatGPTClient:
             _strip_ambient=True,
         )
         try:
-            if not client.refresh_session(trust_statsig=False, reject_unauthorized=True):
+            # _strip_ambient=True already blocks echoed statsig overrides inside refresh_session.
+            if not client.refresh_session(reject_unauthorized=True):
                 raise DomainError(
                     ErrorCode.INVALID_SESSION,
-                    f"无法在目标国家 {country} 重签发 Session，请检查该国家出口代理是否可用",
+                    f"无法在目标国家 {country} 用 session token 重签发 Session，请检查 session token 或该国家出口代理是否可用",
                 )
             rotated = client.extra_cookies.get(session_cookie, "")
             if rotated:
@@ -707,6 +729,10 @@ class ChatGPTClient:
     @property
     def chrome_major(self) -> str:
         return self.chrome_build.split(".", 1)[0]
+
+    @property
+    def impersonate(self) -> str:
+        return impersonate_for_major(self.chrome_major)
 
     @property
     def sec_ch_ua(self) -> str:
@@ -995,7 +1021,7 @@ class ChatGPTClient:
             "User-Agent": self.ua,
         }
         try:
-            session = _new_session(proxy=self.proxy, timeout=self.timeout)
+            session = _new_session(proxy=self.proxy, timeout=self.timeout, impersonate=self.impersonate)
             try:
                 response = session.post(OAUTH_TOKEN_URL, data=form, headers=headers)
             finally:
@@ -1190,6 +1216,9 @@ class ChatGPTClient:
             timezone=self.timezone,
             cookie_header=self._cookie_header(),
             timeout_s=max(5.0, min(self.timeout, float(os.environ.get("GSS_SENTINEL_TIMEOUT", "15") or 15), 90.0)),
+            impersonate=self.impersonate,
+            sec_ch_ua=self.sec_ch_ua,
+            sec_ch_ua_platform=str(self.profile.get("hints", {}).get("sec-ch-ua-platform") or ""),
             **self.sentinel_profile,
         )
         value = header_value(token)
@@ -1221,7 +1250,7 @@ class ChatGPTClient:
     def http(self):
         self._check_credentials()
         if self._http is None:
-            self._http = _new_session(proxy=self.proxy, timeout=self.timeout)
+            self._http = _new_session(proxy=self.proxy, timeout=self.timeout, impersonate=self.impersonate)
             jar = getattr(self._http, "cookies", None)
             setter = getattr(jar, "set", None) if jar is not None else None
             if callable(setter):
@@ -1249,7 +1278,7 @@ class ChatGPTClient:
     def stripe_http(self):
         self._check_credentials()
         if self._stripe_http is None:
-            self._stripe_http = _new_session(proxy=self.proxy, timeout=self.timeout)
+            self._stripe_http = _new_session(proxy=self.proxy, timeout=self.timeout, impersonate=self.impersonate)
             self._stripe_http.headers.update(
                 {
                     "User-Agent": self.ua,
