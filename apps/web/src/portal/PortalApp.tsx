@@ -122,6 +122,7 @@ export function PortalApp() {
   const [selectedPlanId, setSelectedPlanId] = useState<string>("plus");
   const [codexPoints, setCodexPoints] = useState<number>(500);
   const [regionCode, setRegionCode] = useState<string>("PH");
+  const [regionManualOverride, setRegionManualOverride] = useState<boolean>(false);
   const [regionExpanded, setRegionExpanded] = useState<boolean>(false);
 
   const [sessionText, setSessionText] = useState<string>("");
@@ -204,6 +205,16 @@ export function PortalApp() {
       .catch(() => {
         setConnected(false);
       });
+    // Refresh live reference prices every 5 minutes while the tab is visible (matching reference portal).
+    const refreshTimer = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      void fetchSiteConfig()
+        .then((cfg) => {
+          setSiteConfig(cfg);
+          setConnected(Boolean(cfg.connected));
+        })
+        .catch(() => undefined);
+    }, 5 * 60 * 1000);
     void fetchAuthMe(ctrl.signal)
       .then((me) => setAuth(me))
       .catch(() => undefined);
@@ -221,8 +232,20 @@ export function PortalApp() {
           saveLastTaskId("");
         });
     }
-    return () => ctrl.abort();
+    return () => {
+      ctrl.abort();
+      window.clearInterval(refreshTimer);
+    };
   }, [attachTask]);
+
+  // Keep settlement region synced to the winning lowest-price region unless user manually overrode it.
+  useEffect(() => {
+    if (regionManualOverride) return;
+    const matched = siteConfig.plans.find((p) => p.id === selectedPlanId);
+    if (matched?.default_region && siteConfig.regions.some((r) => r.code === matched.default_region)) {
+      setRegionCode(matched.default_region);
+    }
+  }, [siteConfig.plans, siteConfig.regions, selectedPlanId, regionManualOverride]);
 
   const sessionInfo = useMemo(() => inspectSession(sessionText), [sessionText]);
   const rawSessionEmail = useMemo(() => {
@@ -289,6 +312,7 @@ export function PortalApp() {
 
   const handleSelectPlan = (plan: PortalPlanConfig) => {
     setSelectedPlanId(plan.id);
+    setRegionManualOverride(false);
     if (plan.default_region && siteConfig.regions.some((r) => r.code === plan.default_region)) {
       setRegionCode(plan.default_region);
     }
@@ -757,7 +781,7 @@ export function PortalApp() {
               <p className="portal-price-caption">
                 {selectedPlan.id === "codex"
                   ? t.codexComingSoon
-                  : `${lang === "en" ? siteConfig.price_note_en : siteConfig.price_note}${siteConfig.price_updated_at ? ` · ${lang === "en" ? "Updated" : "参考价更新于"} ${siteConfig.price_updated_at}` : ""}`}
+                  : `${lang === "en" ? siteConfig.price_note_en : siteConfig.price_note}${siteConfig.price_updated_at ? ` · ${lang === "en" ? "Updated" : "参考价更新于"} ${siteConfig.price_updated_at}` : ""}${siteConfig.reference_price_status?.stale ? (lang === "en" ? " · Refresh pending, showing last valid rates." : " · 参考价更新暂未完成，沿用上次有效价格。") : ""}`}
               </p>
 
               {/* Codex Points Selector (1:1 layout preserved; marked coming soon) */}
@@ -811,14 +835,22 @@ export function PortalApp() {
                     <div className="portal-region-pills">
                       {siteConfig.regions.map((reg) => {
                         const active = reg.code === selectedRegion.code;
+                        const regPrice = selectedPlan.region_prices?.[reg.code];
+                        const regPriceLabel = regPrice
+                          ? (displayCurrency === "RMB" ? `¥${regPrice.cny.toFixed(2)}` : `$${regPrice.usd.toFixed(2)}`)
+                          : "";
                         return (
                           <button
                             key={reg.code}
                             type="button"
                             className={`portal-region-pill ${active ? "active" : ""}`}
-                            onClick={() => setRegionCode(reg.code)}
+                            onClick={() => {
+                              setRegionManualOverride(true);
+                              setRegionCode(reg.code);
+                            }}
                           >
                             {lang === "en" ? reg.label_en : reg.label} / {reg.currency}
+                            {regPriceLabel ? ` · ${regPriceLabel}` : ""}
                           </button>
                         );
                       })}

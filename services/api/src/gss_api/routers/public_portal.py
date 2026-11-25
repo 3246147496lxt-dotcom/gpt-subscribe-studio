@@ -62,6 +62,7 @@ from ..schemas import (
     StripePortalOut,
     StripePortalRequest,
 )
+from ..services import reference_pricing
 from ..services.order_flow import get_job, start_quick_pay
 from ..store import store
 from .account import _http as _account_http
@@ -201,10 +202,17 @@ class PortalSiteConfigUpdateIn(BaseModel):
     announcements: Optional[List[Any]] = None
 
 
+class LocalPriceOverrideIn(BaseModel):
+    plan: str = Field(min_length=1, max_length=32)
+    country: str = Field(min_length=2, max_length=2)
+    currency: str = Field(min_length=3, max_length=6)
+    amount: float = Field(gt=0)
+
+
 # ── site config ──────────────────────────────────────────────────────────
 @router.get("/site-config")
 async def get_public_site_config() -> Dict[str, Any]:
-    cfg = load_portal_config()
+    cfg = reference_pricing.apply_to_site_config(load_portal_config())
     return {
         **cfg,
         "connected": True,
@@ -214,13 +222,42 @@ async def get_public_site_config() -> Dict[str, Any]:
 
 @admin_router.get("/portal-site")
 async def get_admin_portal_site_config() -> Dict[str, Any]:
-    return load_portal_config()
+    return reference_pricing.apply_to_site_config(load_portal_config())
 
 
 @admin_router.put("/portal-site")
 async def update_admin_portal_site_config(payload: PortalSiteConfigUpdateIn) -> Dict[str, Any]:
     patch = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
-    return save_portal_config(patch)
+    return reference_pricing.apply_to_site_config(save_portal_config(patch))
+
+
+@admin_router.post("/reference-prices/refresh")
+async def refresh_admin_reference_prices() -> Dict[str, Any]:
+    status_out = await asyncio.to_thread(reference_pricing.refresh_fx_sync)
+    cfg = reference_pricing.apply_to_site_config(load_portal_config())
+    return {
+        "status": status_out,
+        "reference_prices": cfg.get("reference_prices") or {},
+        "reference_price_status": cfg.get("reference_price_status") or {},
+    }
+
+
+@admin_router.put("/reference-prices/local")
+async def update_admin_local_price(payload: LocalPriceOverrideIn) -> Dict[str, Any]:
+    ok = reference_pricing.record_observed_price(
+        plan=payload.plan,
+        country=payload.country,
+        currency=payload.currency,
+        amount=payload.amount,
+        source="manual",
+    )
+    if not ok:
+        raise HTTPException(400, detail={"code": "invalid_local_price", "message": "套餐或地区价格参数无效。"})
+    cfg = reference_pricing.apply_to_site_config(load_portal_config())
+    return {
+        "reference_prices": cfg.get("reference_prices") or {},
+        "reference_price_status": cfg.get("reference_price_status") or {},
+    }
 
 
 # ── customer auth (cross-device sync + guest task claiming) ──────────────

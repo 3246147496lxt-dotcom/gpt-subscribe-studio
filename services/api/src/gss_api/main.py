@@ -70,16 +70,18 @@ def create_app() -> FastAPI:
     db = init_db()
     store.attach_db(db)
     from .locks import recover_incomplete_jobs
-    from .services import order_flow, reconciler, webhooks as webhook_svc
+    from .services import order_flow, reconciler, reference_pricing, webhooks as webhook_svc
     recover_incomplete_jobs()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         order_flow.reset_shutdown()
         reconciler.start()
+        reference_pricing.start()
         try:
             yield
         finally:
+            await reference_pricing.stop()
             await reconciler.stop()
             await order_flow.drain_quick_pay(keep_draining=False)
             await webhook_svc.drain_webhooks()
@@ -144,6 +146,7 @@ def create_app() -> FastAPI:
             "proxy_sid_pinned": proxy_sid_pinned,
             "queue": order_flow.queue_stats(),
             "reconciler": reconciler.status(),
+            "reference_pricing": reference_pricing.status(),
             "webhooks": webhook_svc.manager.health_summary(),
         }
 

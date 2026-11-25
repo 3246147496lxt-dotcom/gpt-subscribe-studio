@@ -1,6 +1,14 @@
 import type { AccountSubscription, StripePortal } from "../api/account";
 import type { QuickPayEvent, QuickPayNextAction } from "../api/quickPay";
 
+export type PortalRegionPrice = {
+  country: string;
+  currency: string;
+  local_price: number;
+  usd: number;
+  cny: number;
+};
+
 export type PortalPlanConfig = {
   id: string;
   title: string;
@@ -9,10 +17,22 @@ export type PortalPlanConfig = {
   default_region: string;
   usd_price: number | null;
   cny_price: number | null;
+  local_price?: number | null;
+  local_currency?: string | null;
+  base_usd?: number | null;
   discount: string;
   discount_en: string;
   available: boolean;
   coming_soon?: boolean;
+  region_prices?: Record<string, PortalRegionPrice>;
+};
+
+export type PortalReferencePriceStatus = {
+  enabled: boolean;
+  updated_at?: number;
+  fx_updated_at?: number;
+  fx_source?: string;
+  stale: boolean;
 };
 
 export type PortalRegionConfig = {
@@ -55,6 +75,7 @@ export type PortalSiteConfig = {
   announcements: PortalAnnouncement[];
   plans: PortalPlanConfig[];
   regions: PortalRegionConfig[];
+  reference_price_status?: PortalReferencePriceStatus;
   connected: boolean;
   guest_ttl_days: number;
 };

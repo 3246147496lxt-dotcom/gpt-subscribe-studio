@@ -648,6 +648,29 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             job.purchase_attempt_id = order.purchase_attempt_id
             job.amount = order.amount
             job.currency = order.currency
+            # Self-calibrate dynamic reference local prices from real non-promo Stripe checkouts.
+            if (
+                not use_fake_adapters()
+                and not payload.promo_code
+                and not payload.promo_campaign_id
+                and order.amount
+                and order.currency
+            ):
+                try:
+                    from . import reference_pricing
+                    observed_country = str(
+                        getattr(order, "exit_country", None) or payload.exit_country or ""
+                    ).strip().upper()
+                    if observed_country:
+                        reference_pricing.record_observed_price(
+                            plan=payload.plan,
+                            country=observed_country,
+                            currency=str(order.currency),
+                            amount=order.amount,
+                            source="checkout",
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
             _set_stage(job, "checkout_created", "结账单已生成")
             if payload.debug_checkout_only:
                 job.status = "succeeded"
