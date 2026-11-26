@@ -303,9 +303,11 @@ class PlusProtocol:
                 "browser_timezone": (self.profile or {}).get("timezone", "America/New_York"),
                 "type": "deferred_intent",
             }
-            r = self.client.stripe_http.get(
-                "https://api.stripe.com/v1/elements/sessions", params=params,
-                timeout=self.timeout)
+            from .chatgpt import _without_session_headers
+            with _without_session_headers(self.client.stripe_http, {"content-type"}):
+                r = self.client.stripe_http.get(
+                    "https://api.stripe.com/v1/elements/sessions", params=params,
+                    timeout=self.timeout)
             j = r.json() if r.content else {}
             sid = str(j.get("session_id") or "")
             self._elements_session_id = sid
@@ -347,11 +349,13 @@ class PlusProtocol:
         if len(num) < 6:
             return
         try:
-            self.client.stripe_http.get(
-                "https://api.stripe.com/edge-internal/card-metadata",
-                params={"bin_prefix": num[:6], "key": self.publishable_key,
-                        "_stripe_version": "2025-03-31.basil"},
-                timeout=self.timeout)
+            from .chatgpt import _without_session_headers
+            with _without_session_headers(self.client.stripe_http, {"content-type"}):
+                self.client.stripe_http.get(
+                    "https://api.stripe.com/edge-internal/card-metadata",
+                    params={"bin_prefix": num[:6], "key": self.publishable_key,
+                            "_stripe_version": "2025-03-31.basil"},
+                    timeout=self.timeout)
             log(f"   暖场 card-metadata bin={num[:6]}")
         except Exception as exc:  # noqa: BLE001
             log(f"   暖场 card-metadata 失败: {str(exc)[:70]}")

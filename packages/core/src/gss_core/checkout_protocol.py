@@ -51,7 +51,11 @@ def _page_url(context: dict) -> str:
 def _read_checkout(client: ChatGPTClient, context: dict) -> dict:
     _require_live(context)
     route = f"/backend-api/payments/checkout/{context['processor']}/{context['checkout_id']}"
-    response = client.http.get(APP_BASE + route, headers=client._route_headers(route, page_url=_page_url(context)), timeout=client.timeout)
+    http_get = getattr(client, "_http_get", None)
+    if callable(http_get):
+        response = http_get(route, page_url=_page_url(context))
+    else:
+        response = client.http.get(APP_BASE + route, headers=client._route_headers(route, page_url=_page_url(context)), timeout=client.timeout)
     payload = _json(response)
     if int(response.status_code) >= 400:
         client._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "读取原结账状态")
@@ -121,7 +125,10 @@ def _read_elements(client: ChatGPTClient, context: dict) -> None:
               "deferred_intent[payment_method_types][1]": "link"}
     if context.get("customer_session_client_secret"):
         params["customer_session_client_secret"] = context["customer_session_client_secret"]
-    response = client.stripe_http.get(STRIPE_BASE + "/v1/elements/sessions", params=params, timeout=client.timeout)
+    stripe_http = client.stripe_http
+    from .chatgpt import _without_session_headers
+    with _without_session_headers(stripe_http, {"content-type"}):
+        response = stripe_http.get(STRIPE_BASE + "/v1/elements/sessions", params=params, timeout=client.timeout)
     payload = _json(response)
     if int(response.status_code) >= 400:
         client._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "读取当前结账支付上下文")

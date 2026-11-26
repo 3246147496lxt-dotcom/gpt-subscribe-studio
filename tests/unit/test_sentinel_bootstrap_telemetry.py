@@ -31,8 +31,7 @@ const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
 
-// node -e <src> <assets> <flow> <screenW>：-e 模式下 argv 里没有脚本路径，
-// 取末尾三个参数最稳。
+const { performance: hostPerf } = require("perf_hooks");
 const cliArgs = process.argv.slice(-3);
 const assets = cliArgs[0];
 const flow = cliArgs[1];
@@ -70,6 +69,7 @@ const sandbox = {
     });
   },
   TextEncoder, TextDecoder,
+  __HOST_NOW__: () => hostPerf.now(),
   btoa: (s) => Buffer.from(String(s), "latin1").toString("base64"),
   atob: (s) => Buffer.from(String(s), "base64").toString("latin1"),
   crypto: globalThis.crypto,
@@ -113,12 +113,12 @@ const sandbox = {
   const soH = sandbox.__oai_so_h || [];
   const windowKeys = Object.keys(sandbox);
   const perfNow = sandbox.performance.now();
-  // 连续高频调用 >1200 次验证 performance.now() 绝不因 % 1000 回绕倒退。
+  // 连续高频调用 >1200 次验证 performance.now() 单调不减、绝不回绕倒退。
   let prevP = perfNow;
   let monotonicOk = true;
   for (let i = 0; i < 1250; i++) {
     const cur = sandbox.performance.now();
-    if (!(cur > prevP)) { monotonicOk = false; break; }
+    if (!(cur >= prevP)) { monotonicOk = false; break; }
     prevP = cur;
   }
   const out = {

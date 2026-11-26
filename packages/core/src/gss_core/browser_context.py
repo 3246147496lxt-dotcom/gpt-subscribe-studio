@@ -10,6 +10,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict
 
 
+def _accept_language_for(locale: str) -> str:
+    loc = str(locale or "en-US").strip() or "en-US"
+    primary = loc.split("-", 1)[0]
+    value = f"{loc},{primary};q=0.9" if primary and primary != loc else loc
+    if primary != "en":
+        value += ",en;q=0.8"
+    return value
+
+
 @dataclass(frozen=True)
 class BrowserContext:
     user_agent: str = ""
@@ -35,10 +44,11 @@ class BrowserContext:
             out["User-Agent"] = self.user_agent
         if self.sec_ch_ua:
             out["sec-ch-ua"] = self.sec_ch_ua
-        if self.sec_ch_ua_platform:
-            out["sec-ch-ua-platform"] = f'"{self.sec_ch_ua_platform}"'
+        plat = self.sec_ch_ua_platform.strip().strip('"')
+        if plat:
+            out["sec-ch-ua-platform"] = f'"{plat}"'
         if self.locale:
-            out["Accept-Language"] = f"{self.locale},{self.locale.split('-')[0]};q=0.9,en;q=0.8"
+            out["Accept-Language"] = _accept_language_for(self.locale)
         return {k: v for k, v in out.items() if not k.startswith(":")}
 
     def merged_cookies(self, base: Dict[str, str] | None = None) -> Dict[str, str]:

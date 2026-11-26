@@ -54,14 +54,18 @@ from gss_contracts.adapter import PaymentReceiptEvidence
 from .verified_payer import ObservedBillingConflict, check_observed_billing
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.failure_trace import build_redacted_http_trace
+from gss_core import ua_ch
 from gss_core.chatgpt import (
     APP_BASE,
     STRIPE_API_VERSION,
     STRIPE_BASE,
     ChatGPTClient,
+    _PLATFORM_CH_DEFAULTS,
+    _TASKBAR_PX,
     _intent_object,
     _PLAN_NAME,
     _json,
+    _without_session_headers,
     parse_account_check,
     _log_upstream_failure,
     payment_intent_from_confirm,
@@ -71,6 +75,7 @@ from gss_core.chatgpt import (
 )
 from gss_core.har_device import (
     DeviceProfile,
+    _languages_for,
     apply_user_agent,
     device_for_account,
     g_state_cookie,
@@ -258,6 +263,8 @@ class PlusHarProtocol:
             resolved_ua = str(getattr(client, "ua", "") or getattr(client, "user_agent", "") or "").strip()
         if resolved_ua:
             self.device = apply_user_agent(self.device, resolved_ua)
+        if self.browser_context is not None:
+            self._sync_device_with_browser_context()
 
         from gss_core import runtime_flags
 
@@ -356,7 +363,7 @@ class PlusHarProtocol:
         web_headers = self.device.web_headers(referer="https://chatgpt.com/")
         web_headers.setdefault("accept-encoding", "gzip, deflate, br, zstd")
         if self.browser_context is not None:
-            web_headers.update(self.browser_context.headers())
+            web_headers.update({k.lower(): v for k, v in (self.browser_context.headers() or {}).items()})
         session.headers.update(web_headers)
         cookies = dict(getattr(self.client, "extra_cookies", {}) or {})
         if self.browser_context is not None:
@@ -419,6 +426,14 @@ class PlusHarProtocol:
         headers = self.device.web_headers(referer=referer)
         if json_body:
             headers["content-type"] = "application/json"
+        else:
+            headers.pop("origin", None)
+            headers.pop("content-type", None)
+        if self.browser_context is not None:
+            headers.update({k.lower(): v for k, v in (self.browser_context.headers() or {}).items()})
+            if not json_body:
+                headers.pop("origin", None)
+                headers.pop("content-type", None)
         if self.client is None:
             return headers
         if self.client.access_token:
@@ -447,6 +462,7 @@ class PlusHarProtocol:
              referer: str = "https://chatgpt.com/") -> Any:
         self._require_credentials()
         url = f"{APP_BASE}{route}"
+        is_get = method.strip().upper() == "GET"
         headers = self._web_headers(referer=referer, json_body=json_body is not None,
                                     telemetry=telemetry)
         kwargs: Dict[str, Any] = {"headers": headers, "timeout": self.timeout}
@@ -454,7 +470,11 @@ class PlusHarProtocol:
             kwargs["json"] = json_body
         if params:
             kwargs["params"] = params
-        return self._web_session().request(method, url, **kwargs)
+        session = self._web_session()
+        if is_get:
+            with _without_session_headers(session, {"origin", "content-type"}):
+                return session.request(method, url, **kwargs)
+        return session.request(method, url, **kwargs)
 
     # ── 0. account + sentinel ──────────────────────────────────────
     def _claim_exit(self) -> None:
@@ -506,6 +526,45 @@ class PlusHarProtocol:
             except ValueError:
                 seconds = 1800
             cool_proxy(self.proxy, reason=f"{status}:{code or 'risk'}", seconds=max(1, seconds))
+
+    def _sync_device_with_browser_context(self) -> None:
+        ctx = self.browser_context
+        if ctx is None:
+            return
+        ctx_ua = str(getattr(ctx, "user_agent", "") or "").strip()
+        if ctx_ua:
+            # 必须走 apply_user_agent 同步更新 chrome_build / chrome_major / impersonate，
+            # 不能只改 device.ua 导致 UA 版本与 TLS 指纹 / sec-ch-ua-full-version 分裂。
+            self.device = apply_user_agent(self.device, ctx_ua)
+        self.device.sec_ch_ua_override = str(getattr(ctx, "sec_ch_ua", "") or "")
+        plat = str(getattr(ctx, "sec_ch_ua_platform", "") or "").strip().strip('"')
+        if plat:
+            self.device.ch_platform = f'"{plat}"'
+            if plat in _PLATFORM_CH_DEFAULTS:
+                ctx_h = {k.lower(): str(v) for k, v in (ctx.headers() or {}).items()}
+                def_arch, def_bits, def_ver = _PLATFORM_CH_DEFAULTS[plat]
+                self.device.ch_arch = ctx_h.get("sec-ch-ua-arch") or def_arch
+                self.device.ch_bitness = ctx_h.get("sec-ch-ua-bitness") or def_bits
+                self.device.ch_platform_version = (
+                    ctx_h.get("sec-ch-ua-platform-version") or def_ver
+                ).strip('"')
+            if plat == "macOS":
+                self.device.os_key, self.device.platform, self.device.os_label = "macos", "MacIntel", "MacOS"
+            elif plat == "Windows":
+                self.device.os_key, self.device.platform, self.device.os_label = "windows", "Win32", "Windows"
+            elif plat == "Linux":
+                self.device.os_key, self.device.platform, self.device.os_label = "linux", "Linux x86_64", "Linux"
+        ctx_locale = str(getattr(ctx, "locale", "") or "").strip()
+        if ctx_locale:
+            self.device.locale = ctx_locale
+            self.device.languages = _languages_for(ctx_locale)
+        ctx_tz = str(getattr(ctx, "timezone_id", "") or "").strip()
+        if ctx_tz:
+            self.device.timezone = ctx_tz
+        self.device.screen_w = int(getattr(ctx, "viewport_width", 0) or self.device.screen_w)
+        self.device.screen_h = int(getattr(ctx, "viewport_height", 0) or self.device.screen_h)
+        taskbar = _TASKBAR_PX.get(plat or self.device.os_label, 40)
+        self.device.avail_h = max(1, self.device.screen_h - taskbar)
 
     def _prepare(self) -> None:
         self._claim_exit()
@@ -570,12 +629,7 @@ class PlusHarProtocol:
             # Route C headers, Sentinel profile and ChatGPT client must share
             # the same browser identity; never keep a separate session profile.
             self.client.apply_browser_context(self.browser_context)
-            self.device.ua = self.browser_context.user_agent or self.device.ua
-            self.device.screen_w = int(self.browser_context.viewport_width or self.device.screen_w)
-            self.device.screen_h = int(self.browser_context.viewport_height or self.device.screen_h)
-            self.device.avail_h = max(1, self.device.screen_h - 80)
-            if self.browser_context.sec_ch_ua_platform:
-                self.device.ch_platform = f'"{self.browser_context.sec_ch_ua_platform.strip(chr(34))}"'
+            self._sync_device_with_browser_context()
 
         self.telemetry = StripeTelemetry(self._m_session(), TelemetryContext(
             device=self.device,
@@ -783,9 +837,11 @@ class PlusHarProtocol:
 
     def _elements_session(self) -> None:
         logger.info("plus_har_elements amount=%s %s", self.amount_minor, self.currency)
-        response = self._stripe_session().get(f"{STRIPE_BASE}/v1/elements/sessions",
-                                              params=self._elements_params(),
-                                              timeout=self.timeout)
+        session = self._stripe_session()
+        with _without_session_headers(session, {"content-type"}):
+            response = session.get(f"{STRIPE_BASE}/v1/elements/sessions",
+                                   params=self._elements_params(),
+                                   timeout=self.timeout)
         payload: Dict[str, Any] = {}
         if getattr(response, "content", b""):
             try:
@@ -856,12 +912,14 @@ class PlusHarProtocol:
         if len(number) < 6:
             return
         try:
-            self._stripe_session().get(
-                f"{STRIPE_BASE}/edge-internal/card-metadata",
-                params={"bin_prefix": number[:6], "key": self.publishable_key,
-                        "_stripe_version": STRIPE_API_VERSION},
-                timeout=self.timeout,
-            )
+            session = self._stripe_session()
+            with _without_session_headers(session, {"content-type"}):
+                session.get(
+                    f"{STRIPE_BASE}/edge-internal/card-metadata",
+                    params={"bin_prefix": number[:6], "key": self.publishable_key,
+                            "_stripe_version": STRIPE_API_VERSION},
+                    timeout=self.timeout,
+                )
         except Exception:  # noqa: BLE001
             pass
 
@@ -937,14 +995,16 @@ class PlusHarProtocol:
             # payment attempt, or hCaptcha sees two different browsers.
             "meta": {
                 "brands": [
-                    {"brand": "Google Chrome", "version": self.device.chrome_major},
-                    {"brand": "Chromium", "version": self.device.chrome_major},
-                    {"brand": "Not=A?Brand", "version": "24"},
+                    {"brand": b, "version": v}
+                    for b, v in ua_ch.brand_list(
+                        self.device.chrome_major, self.device.sec_ch_ua_override or None
+                    )
                 ],
                 "fullVersionList": [
-                    {"brand": "Google Chrome", "version": self.device.chrome_build},
-                    {"brand": "Chromium", "version": self.device.chrome_build},
-                    {"brand": "Not=A?Brand", "version": "24.0.0.0"},
+                    {"brand": b, "version": v}
+                    for b, v in ua_ch.full_version_brand_list(
+                        self.device.chrome_build, self.device.sec_ch_ua_override or None
+                    )
                 ],
                 "fullVersion": self.device.chrome_build,
                 "platform": (self.device.ch_platform or "").strip('"') or self.device.os_label,

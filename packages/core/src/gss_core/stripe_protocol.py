@@ -313,7 +313,10 @@ class StripeProtocol:
         if not self.credentials_current():
             raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
         c = self._http()
-        response = c.get(url, params=params, headers=headers)
+        clean_headers = {k: v for k, v in (headers or {}).items() if k.lower() != "content-type"}
+        from .chatgpt import _without_session_headers
+        with _without_session_headers(c, {"content-type"}):
+            response = c.get(url, params=params, headers=clean_headers)
         _log_http_failure(url, response)
         return response
 

@@ -35,6 +35,7 @@ from typing import Any, Dict, Optional
 import sys
 
 from .countries import locale_for, timezone_for
+from . import ua_ch
 
 # Chrome releases around the capture (Oct 2026).  Each entry is a real
 # versionhistory.googleapis.com build string; the flow only needs a coherent
@@ -119,6 +120,17 @@ _PLUGINS = (
 _ALNUM = string.ascii_letters + string.digits
 
 
+def _languages_for(locale: str) -> str:
+    loc = str(locale or "en-US").strip() or "en-US"
+    primary = loc.split("-", 1)[0]
+    parts = [loc]
+    if primary and primary not in parts:
+        parts.append(primary)
+    if primary != "en" and "en" not in parts:
+        parts.append("en")
+    return ",".join(parts)
+
+
 def _seg_b64(n: int = 32) -> str:
     """URL-safe base64 chunk, the shape the capture's frame host uses."""
     return base64.urlsafe_b64encode(secrets.token_bytes(n)).rstrip(b"=").decode()
@@ -193,6 +205,7 @@ class DeviceProfile:
     frame_host: str = ""
     frame_path: str = ""
     frame_token: str = ""
+    sec_ch_ua_override: str = ""
     created_at: float = field(default_factory=time.time)
 
     # ── construction ────────────────────────────────────────────────
@@ -226,8 +239,6 @@ class DeviceProfile:
         # 与固定美国账单地址解耦；宿主机指纹时区仅在未提供出口国家时兜底。
         tz = timezone or (timezone_for(country) if country else "") or host.get("timezone") or prof["tz_default"]
         loc = locale or (locale_for(country) if country else "") or "en-US"
-        language = loc
-        primary = loc.split("-")[0]
 
         return cls(
             os_key=os_key,
@@ -252,7 +263,7 @@ class DeviceProfile:
             timezone=tz,
             timezone_offset_min=_offset_minutes(tz),
             locale=loc,
-            languages=f"{language},{primary}",
+            languages=_languages_for(loc),
             canvas=host.get("canvas") or "".join(rng.choice("01") for _ in range(55)),
             audio=host.get("audio") or _hex(16),
             plugins=_PLUGINS,
@@ -291,11 +302,10 @@ class DeviceProfile:
             return self
         tz = timezone_for(code)
         loc = locale_for(code)
-        primary = loc.split("-")[0]
         self.timezone = tz
         self.timezone_offset_min = _offset_minutes(tz)
         self.locale = loc
-        self.languages = f"{loc},{primary}" if primary != loc else loc
+        self.languages = _languages_for(loc)
         return self
 
     def rotate_attempt_ids(self) -> None:
@@ -325,8 +335,9 @@ class DeviceProfile:
     # ── derived header values ───────────────────────────────────────
     @property
     def sec_ch_ua(self) -> str:
-        m = self.chrome_major
-        return f'"Google Chrome";v="{m}", "Chromium";v="{m}", "Not(A:Brand";v="24"'
+        # 与 chatgpt.py 共用同一张 GREASE 轮换表：同一 UA 在两条链路上必须输出
+        # 完全相同的品牌集合，否则同一会话会出现两套 Client Hints。
+        return ua_ch.sec_ch_ua(self.chrome_major, self.sec_ch_ua_override or None)
 
     @property
     def sec_ch_ua_full_version(self) -> str:
@@ -334,8 +345,7 @@ class DeviceProfile:
 
     @property
     def sec_ch_ua_full_version_list(self) -> str:
-        b = self.chrome_build
-        return f'"Google Chrome";v="{b}", "Chromium";v="{b}", "Not(A:Brand";v="24.0.0.0"'
+        return ua_ch.sec_ch_ua_full_version_list(self.chrome_build, self.sec_ch_ua_override or None)
 
     @property
     def frame_base(self) -> str:
@@ -372,8 +382,9 @@ class DeviceProfile:
 
     def accept_language(self) -> str:
         """`en-US,en;q=0.9` exactly as the capture sends it."""
-        primary = self.locale.split("-")[0]
-        value = f"{self.locale},{primary};q=0.9"
+        loc = str(self.locale or "en-US").strip() or "en-US"
+        primary = loc.split("-", 1)[0]
+        value = f"{loc},{primary};q=0.9" if primary and primary != loc else loc
         if primary != "en":
             value += ",en;q=0.8"
         return value

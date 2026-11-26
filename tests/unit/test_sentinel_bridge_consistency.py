@@ -221,7 +221,8 @@ def test_bridge_pow_reuses_real_sentinel_sdk_req_fingerprint():
         "screenW": 1920,
         "screenH": 1080,
         "availH": 1032,
-        "secChUa": '"Google Chrome";v="150", "Chromium";v="150", "Not(A:Brand";v="24"',
+        # 与主站同一次 GREASE 轮换（低熵在前），哨兵高熵列表必须跟随。
+        "secChUa": '"Not;A=Brand";v="24", "Chromium";v="150", "Google Chrome";v="150"',
         "secChUaPlatform": '"Windows"',
     }
     try:
@@ -251,6 +252,10 @@ def test_bridge_pow_reuses_real_sentinel_sdk_req_fingerprint():
     assert req_hdrs.get("sec-ch-ua-arch") == '"x86"'
     assert req_hdrs.get("sec-ch-ua-bitness") == '"64"'
     assert req_hdrs.get("sec-ch-ua-platform-version") == '"10.0.0"'
+    # GREASE 品牌必须来自传入的 sec-ch-ua（不能写死 Not(A:Brand/24）。
+    assert req_hdrs.get("sec-ch-ua") == '"Not;A=Brand";v="24", "Chromium";v="150", "Google Chrome";v="150"'
+    assert '"Not;A=Brand";v="24.0.0.0"' in req_hdrs.get("sec-ch-ua-full-version-list", "")
+    assert "Not(A:Brand" not in req_hdrs.get("sec-ch-ua-full-version-list", "")
 
     req_payload = json.loads(raw_body.decode("utf-8"))
     assert req_payload["p"].startswith("gAAAAAC"), "真实 sdk.js 前缀应为 gAAAAAC"
@@ -268,3 +273,178 @@ def test_bridge_pow_reuses_real_sentinel_sdk_req_fingerprint():
     assert "Philippine Standard Time" in pow_cfg[1]
     assert "Asia/Manila" not in pow_cfg[1]
     assert isinstance(pow_cfg[17], int)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="需要 node 运行 sentinel bridge")
+def test_bridge_preserves_sec_ch_ua_order_and_edge_brand_and_query_keys():
+    seen_hdrs: list[dict[str, str]] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            seen_hdrs.append({k.lower(): v for k, v in self.headers.items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({
+                    "token": "edge-chal",
+                    "proofofwork": {"required": True, "seed": "0.5", "difficulty": "0fffff"},
+                }).encode("utf-8")
+            )
+
+        def log_message(self, *args):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    edge_ch = '"Microsoft Edge";v="146", "Chromium";v="146", "Not.A/Brand";v="24"'
+    request = {
+        "ua": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/146.0.7680.180 Safari/537.36 Edg/146.0.0.0"
+        ),
+        "cores": 8,
+        "deviceId": "edge-device",
+        "flow": "chatgpt_checkout",
+        "proxy": "",
+        "version": "20260810913b",
+        "pageUrl": "https://chatgpt.com/?cta_tab=personal",
+        "language": "en-US",
+        "timezone": "America/New_York",
+        "sentinelOrigin": f"http://127.0.0.1:{port}",
+        "platform": "Win32",
+        "platformLabel": "Windows",
+        "screenW": 1920,
+        "screenH": 1080,
+        "availH": 1032,
+        "secChUa": edge_ch,
+        "secChUaPlatform": '"Windows"',
+    }
+    try:
+        proc = subprocess.run(
+            ["node", str(ASSETS_DIR / "sentinel_bridge.js")],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(ASSETS_DIR),
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    out = json.loads(proc.stdout.strip())
+    assert "error" not in out, out
+    assert seen_hdrs
+    assert seen_hdrs[0]["sec-ch-ua"] == edge_ch
+    assert seen_hdrs[0]["sec-ch-ua-full-version-list"] == (
+        '"Microsoft Edge";v="146.0.7680.180", "Chromium";v="146.0.7680.180", "Not.A/Brand";v="24.0.0.0"'
+    )
+    pow_cfg = _decode_p(json.loads(out["main"])["p"], allowed_prefixes=("gAAAAAB",))
+    assert pow_cfg[15] == "cta_tab"
+
+
+def test_bridge_uses_curl_cffi_even_without_proxy():
+    bridge = (ASSETS_DIR / "sentinel_bridge.js").read_text()
+    assert "if (!forceUndici && (proxy || curlHelperExists))" in bridge or (
+        "else if (!forceUndici && (proxy || curlHelperExists))" in bridge
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="需要 node 运行 sentinel bridge")
+def test_bridge_defaults_sec_ch_ua_when_omitted_and_omits_origin_ct_on_get(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    for name in ("sentinel_bootstrap.js", "sentinel_bridge.js", "package.json"):
+        shutil.copy(ASSETS_DIR / name, assets / name)
+    (assets / "sentinel_sdk.js").write_text(
+        """
+var SentinelSDK = {
+  __proto2: async function (flow) {
+    await fetch("/backend-api/sentinel/probe", { method: "GET" });
+    var brands = globalThis.navigator.userAgentData.brands;
+    await fetch("/backend-api/sentinel/req", {
+      method: "POST",
+      body: JSON.stringify({ brands: brands, flow: flow })
+    });
+    return JSON.stringify({ c: "chal-default-ch", powReq: false });
+  }
+};
+"""
+    )
+
+    seen: list[tuple[str, str, dict[str, str], bytes]] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _handle(self, method: str):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else b""
+            seen.append((method, self.path, {k.lower(): v for k, v in self.headers.items()}, body))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def do_GET(self):
+            self._handle("GET")
+
+        def do_POST(self):
+            self._handle("POST")
+
+        def log_message(self, *args):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    request = {
+        "ua": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/146.0.7680.180 Safari/537.36"
+        ),
+        "cores": 8,
+        "deviceId": "default-ch-dev",
+        "flow": "chatgpt_checkout",
+        "proxy": "",
+        "version": "20260810913b",
+        "pageUrl": "https://chatgpt.com/",
+        "language": "en-US",
+        "timezone": "America/New_York",
+        "sentinelOrigin": f"http://127.0.0.1:{srv.server_address[1]}",
+        "platform": "Win32",
+        "platformLabel": "Windows",
+        "screenW": 1920,
+        "screenH": 1080,
+        "availH": 1032,
+        # 故意不传 secChUa / secChUaPlatform：两侧仍须一致输出 Chrome 146 GREASE
+    }
+    try:
+        proc = subprocess.run(
+            ["node", str(assets / "sentinel_bridge.js")],
+            input=json.dumps(request),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(assets),
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    out = json.loads(proc.stdout.strip())
+    assert "error" not in out, out
+    by_method = {m: (h, b) for m, _p, h, b in seen}
+    get_h, _ = by_method["GET"]
+    post_h, post_b = by_method["POST"]
+    assert "content-type" not in get_h, get_h
+    assert "origin" not in get_h, get_h
+    expected_ch = '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"'
+    assert post_h["sec-ch-ua"] == expected_ch
+    assert post_h["sec-ch-ua-platform"] == '"Windows"'
+    js_brands = json.loads(post_b.decode("utf-8"))["brands"]
+    assert ", ".join(f'"{x["brand"]}";v="{x["version"]}"' for x in js_brands) == expected_ch

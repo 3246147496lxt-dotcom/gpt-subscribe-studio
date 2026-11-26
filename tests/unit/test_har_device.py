@@ -142,3 +142,22 @@ def test_device_store_refuses_cross_account_reuse(tmp_path, monkeypatch):
 
     fresh = device_for_account("acct_b", "US")
     assert fresh.guid != stolen["guid"]
+
+
+def test_device_languages_include_english_fallback_for_non_english_locales():
+    d = DeviceProfile.random(country="JP", seed="jp-langs")
+    assert d.languages == "ja-JP,ja,en"
+    assert d.accept_language() == "ja-JP,ja;q=0.9,en;q=0.8"
+
+    d.align_exit("CL")
+    assert d.languages == "es-CL,es,en"
+    assert d.accept_language() == "es-CL,es;q=0.9,en;q=0.8"
+
+    d.sec_ch_ua_override = (
+        f'"Microsoft Edge";v="{d.chrome_major}", "Chromium";v="{d.chrome_major}", "Not;A=Brand";v="8"'
+    )
+    assert d.sec_ch_ua == (
+        f'"Microsoft Edge";v="{d.chrome_major}", "Chromium";v="{d.chrome_major}", "Not;A=Brand";v="8"'
+    )
+    assert f'"Microsoft Edge";v="{d.chrome_build}"' in d.sec_ch_ua_full_version_list
+    assert '"Google Chrome"' not in d.sec_ch_ua_full_version_list

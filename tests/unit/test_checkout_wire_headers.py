@@ -111,10 +111,17 @@ def test_chatgpt_client_wire_headers_and_single_cookie_after_warmup():
     assert "referer" not in warmup_map
     assert warmup_map["sec-fetch-site"] == "none"
     assert warmup_map["sec-fetch-user"] == "?1"
-    # curl_cffi/libcurl 不把 `priority` 写到线上（HTTP/2 下由协议层处理），
-    # 这里只校验我们声明的取值，避免把传输层行为当成回归。
-    assert warmup_map.get("priority", "u=0, i") == "u=0, i"
+    # 冷导航只发低熵 UA-CH：高熵 hints 需要站点通过 Accept-CH 持久化策略后才上送。
+    for hint in ("sec-ch-ua-full-version", "sec-ch-ua-full-version-list",
+                 "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-platform-version",
+                 "sec-ch-ua-model"):
+        assert hint not in warmup_map, f"冷导航不应携带高熵 hint {hint}"
+    assert warmup_map["sec-ch-ua"] == client.sec_ch_ua
+    assert warmup_map["sec-ch-ua-platform"] == '"Windows"'
     assert "text/html" in warmup_map["accept"]
+    # HTTP/1.1 回环上 libcurl 不写 priority（RFC 9218 里它是 H2/H3 语义）；
+    # 这里显式断言「没发出」，H2 线上的表现属于未验证边界，不做假绿断言。
+    assert "priority" not in warmup_map
 
     _, _, post_hdrs = captured[1]
     lower_names = [k.lower() for k, _ in post_hdrs]
@@ -145,10 +152,11 @@ def test_chatgpt_client_wire_headers_and_single_cookie_after_warmup():
 
     # 高熵 Client Hints：真实 Chrome 在 chatgpt.com 的 API 请求上全部发送。
     assert post_map["sec-ch-ua-full-version"] == f'"{build}"'
-    assert post_map["sec-ch-ua-full-version-list"] == (
-        f'"Google Chrome";v="{build}", "Chromium";v="{build}", '
-        '"Not(A:Brand";v="24.0.0.0"'
-    )
+    # 低熵与高熵必须共用同一个 GREASE 品牌（单一来源 gss_core.ua_ch）。
+    assert post_map["sec-ch-ua-full-version-list"] == client.sec_ch_ua_full_list
+    grease_brand = client._grease_brand()[0]
+    assert f'"{grease_brand}"' in post_map["sec-ch-ua"]
+    assert f'"{grease_brand}"' in post_map["sec-ch-ua-full-version-list"]
     assert f';v="{build.split(".")[0]}"' in post_map["sec-ch-ua"]
     assert post_map["sec-ch-ua-model"] == '""'
     assert post_map["x-openai-rate-limit-join-workspace"] == "1"
@@ -334,7 +342,10 @@ console.log(JSON.stringify({
   origin: sandbox.origin,
   vw: sandbox.visualViewport.width,
   vh: sandbox.visualViewport.height,
+  oh: sandbox.outerHeight,
+  ah: sandbox.screen.availHeight,
   brands: sandbox.navigator.userAgentData.brands,
+  dpr: sandbox.devicePixelRatio,
   languages: sandbox.navigator.languages,
 }));
 """
@@ -348,10 +359,14 @@ console.log(JSON.stringify({
     data = json.loads(proc.stdout.strip())
     assert data["origin"] == "https://chatgpt.com"
     assert data["vw"] == 1512
-    assert data["vh"] == 938
+    # 真窗口有标签栏+地址栏：innerHeight 必须显著小于 availHeight，macOS 单屏无 +16 DWM 边框。
+    assert data["vh"] < data["ah"]
+    assert data["oh"] - data["vh"] >= 80
     assert data["languages"] == ["en-PH", "en"]
-    assert {"brand": "Not(A:Brand", "version": "24"} in data["brands"]
+    assert {"brand": "Not-A.Brand", "version": "24"} in data["brands"]
     assert {"brand": "Google Chrome", "version": "146"} in data["brands"]
+    # macOS Retina 档案的 dpr 必须是 2，不能写死 1。
+    assert data["dpr"] == 2
 
 
 def test_sentinel_assets_share_one_fingerprint_registry():
@@ -457,6 +472,38 @@ console.log(JSON.stringify({
         assert data[key]["pointers"] > 0
         assert data[key]["clicks"] == 2
 
-    # 注册流仍保留姓名输入轨迹。
-    assert data["signup"]["keydowns"] == 12
-    assert data["signup"]["keys"] == 12
+    # 注册流仍保留姓名 + 生日输入轨迹（含大写 Shift keydown，长度逐单随机）。
+    assert 11 <= data["signup"]["keydowns"] <= 36
+    assert data["signup"]["keys"] == data["signup"]["keydowns"]
+
+
+def test_stripe_http_carries_storage_access_and_tracks_browser_context():
+    from types import SimpleNamespace
+
+    client = ChatGPTClient(access_token="tok", device_id="did-stripe-ctx")
+    try:
+        hdrs0 = {k.lower(): v for k, v in client.stripe_http.headers.items()}
+        assert hdrs0["sec-fetch-storage-access"] == "active"
+        assert hdrs0["sec-ch-ua-platform"] == '"Windows"'
+
+        client.apply_browser_context(
+            SimpleNamespace(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/146.0.7680.180 Safari/537.36"
+                ),
+                sec_ch_ua='"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+                sec_ch_ua_platform="macOS",
+                locale="ja-JP",
+                timezone_id="Asia/Tokyo",
+                cookies={},
+                headers=lambda: {"sec-ch-ua-platform": '"macOS"'},
+            )
+        )
+        hdrs1 = {k.lower(): v for k, v in client.stripe_http.headers.items()}
+        assert hdrs1["sec-fetch-storage-access"] == "active"
+        assert hdrs1["sec-ch-ua-platform"] == '"macOS"'
+        assert hdrs1["sec-ch-ua"] == '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"'
+        assert hdrs1["accept-language"] == "ja-JP,ja;q=0.9,en;q=0.8"
+    finally:
+        client.close()

@@ -21,11 +21,37 @@ import random
 import time
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .har_device import DeviceProfile
+
+
+@contextmanager
+def _without_headers(http: Any, omit_lower: set[str], *, prefix_oai: bool = False):
+    http_headers = getattr(http, "headers", None)
+    if http_headers is None:
+        inner = getattr(http, "_inner", None)
+        http_headers = getattr(inner, "headers", None) if inner is not None else None
+    saved: list[tuple[str, Any]] = []
+    if http_headers is not None and hasattr(http_headers, "pop"):
+        for key in list(http_headers.keys()):
+            low_key = str(key).lower()
+            if low_key in omit_lower or (prefix_oai and low_key.startswith("oai-")):
+                old = http_headers.pop(key, None)
+                if old is not None:
+                    saved.append((key, old))
+    try:
+        yield
+    finally:
+        if http_headers is not None and saved:
+            for key, old in saved:
+                try:
+                    http_headers[key] = old
+                except Exception:  # noqa: BLE001
+                    pass
 
 _CATALOG_PATH = Path(__file__).with_name("stripe_events.json")
 _CATALOG: Optional[Dict[str, Any]] = None
@@ -242,11 +268,35 @@ class StripeTelemetry:
     def warm_assets(self) -> None:
         """The SDK/iframe resources the capture loads before fingerprinting."""
         for url, referer in self.ASSETS:
-            headers = (self.device.fingerprint_headers() if "m.stripe.network" in url
-                       else {**self.device.stripe_headers(), "accept": "*/*"})
-            headers["referer"] = referer
+            is_html = url.endswith(".html")
+            url_host = urllib.parse.urlsplit(url).netloc
+            ref_host = urllib.parse.urlsplit(referer).netloc
+            sec_site = "same-origin" if url_host == ref_host else "cross-site"
+            headers: Dict[str, str] = {
+                "accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,image/apng,*/*;q=0.8"
+                    if is_html else "*/*"
+                ),
+                "accept-language": self.device.accept_language(),
+                "priority": "u=0, i" if is_html else "u=2",
+                "referer": referer,
+                "sec-ch-ua": self.device.sec_ch_ua,
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": self.device.ch_platform,
+                "sec-fetch-dest": "iframe" if is_html else "script",
+                "sec-fetch-mode": "navigate" if is_html else "no-cors",
+                "sec-fetch-site": sec_site,
+                "user-agent": self.device.ua,
+            }
+            omit = {"origin", "content-type", "sec-fetch-storage-access"}
+            if "m.stripe.network" in url:
+                headers["cookie"] = f"m={self.device.guid}"
+            else:
+                omit.add("cookie")
             try:
-                self.http.get(url, headers=headers, timeout=10.0)
+                with _without_headers(self.http, omit):
+                    self.http.get(url, headers=headers, timeout=10.0)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -525,15 +575,29 @@ def _sha256_hex() -> str:
 
 def sentinel_ping(http: Any, device: DeviceProfile, *, timeout: float = 10.0) -> None:
     """The keep-alive the sentinel iframe fires after each /sentinel/req."""
-    headers = {
+    headers: Dict[str, Any] = {
         **device.web_headers(referer="https://chatgpt.com/"),
         "cache-control": "no-cache",
         "pragma": "no-cache",
     }
-    headers.pop("x-openai-checkout-source", None)
-    headers.pop("x-openai-rate-limit-join-workspace", None)
+    omit = {
+        "authorization",
+        "content-type",
+        "chatgpt-account-id",
+        "x-openai-checkout-source",
+        "x-openai-rate-limit-join-workspace",
+    }
+    for key in list(headers):
+        low = key.lower()
+        if low in omit or low.startswith("oai-"):
+            headers.pop(key, None)
+    raw_http = getattr(http, "_inner", http)
+    if type(raw_http).__module__.startswith("curl_cffi"):
+        # libcurl 对空 POST 默认补 application/x-www-form-urlencoded；传 None 彻底禁用。
+        headers["Content-Type"] = None
     try:
-        http.post(SENTINEL_PING, content=b"", headers=headers, timeout=timeout)
+        with _without_headers(http, omit, prefix_oai=True):
+            http.post(SENTINEL_PING, content=b"", headers=headers, timeout=timeout)
     except Exception:  # noqa: BLE001
         pass
 

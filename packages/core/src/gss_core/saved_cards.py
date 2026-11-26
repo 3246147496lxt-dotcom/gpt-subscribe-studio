@@ -79,10 +79,14 @@ def prepare_account_setup(client: ChatGPTClient, context: dict[str, Any], expect
 def account_payment_methods(client: ChatGPTClient, account_id: str) -> list[dict[str, Any]]:
     route = "/backend-api/payments/payment_methods"
     _check_lease(client)
-    response = client.http.get(
-        f"{APP_BASE}{route}", params={"account_id": account_id},
-        headers=client._route_headers(route), timeout=client.timeout,
-    )
+    http_get = getattr(client, "_http_get", None)
+    if callable(http_get):
+        response = http_get(route, params={"account_id": account_id})
+    else:
+        response = client.http.get(
+            f"{APP_BASE}{route}", params={"account_id": account_id},
+            headers=client._route_headers(route), timeout=client.timeout,
+        )
     status = int(getattr(response, "status_code", 0) or 0)
     if status == 401:
         raise DomainError(ErrorCode.INVALID_SESSION, "账号会话已失效，请重新提交")

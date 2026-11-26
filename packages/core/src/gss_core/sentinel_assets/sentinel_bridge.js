@@ -23,11 +23,16 @@ const vm = require("vm");
 function resolvePython() {
   const configured = String(process.env.PYTHON_BIN || process.env.SENTINEL_PYTHON || "").trim();
   if (configured) return configured;
-  const projectRoot = path.resolve(__dirname, "..", "..");
-  const local = process.platform === "win32"
-    ? path.join(projectRoot, ".venv", "Scripts", "python.exe")
-    : path.join(projectRoot, ".venv", "bin", "python");
-  if (fs.existsSync(local)) return local;
+  let dir = __dirname;
+  for (let i = 0; i < 7; i++) {
+    const local = process.platform === "win32"
+      ? path.join(dir, ".venv", "Scripts", "python.exe")
+      : path.join(dir, ".venv", "bin", "python");
+    if (fs.existsSync(local)) return local;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
   return process.platform === "win32" ? "python" : "python3";
 }
 
@@ -130,6 +135,7 @@ function makeGenerator(ua, cores, language, timezone, screenW, screenH, opts) {
     sid: overrides.sid || uuidv4(),
     heapLimit: Number(overrides.heapLimit) || 4294705152,
     sdkUrl: String(overrides.sdkUrl || ""),
+    pageUrl: String(overrides.pageUrl || ""),
     // 与真实浏览器一致：screen.width + screen.height（指纹数组 [0]）
     screenNum: sw + sh,
     nine: 0,
@@ -176,6 +182,15 @@ function formatConfigDate(g, now) {
   );
 }
 
+function queryKeyString(pageUrl) {
+  try {
+    if (!pageUrl) return "";
+    return [...new URL(pageUrl).searchParams.keys()].join(",");
+  } catch (_) {
+    return "";
+  }
+}
+
 function configArray(g) {
   const perfNow = g.initialPerformance + Math.max(0, Date.now() - g.startedAt);
   const tstr = formatConfigDate(g, new Date());
@@ -195,7 +210,7 @@ function configArray(g) {
     g.eventName, // 12
     perfNow, // 13
     g.sid, // 14
-    "", // 15
+    queryKeyString(g.pageUrl), // 15 与 sdk.js [...new URLSearchParams(location.search).keys()].join(",") 对齐
     g.cores, // 16
     g.loadTs, // 17
     0, 0, 0, 0, 0, 0, 0, // 18..24
@@ -266,18 +281,84 @@ function solvePoW(g, seed, difficulty, captured) {
 }
 
 
-function highEntropyClientHints(ua, extra) {
+const _GREASEY_CHARS = " (:-./);=?_";
+const _GREASE_VERSIONS = ["8", "99", "24"];
+const _BRAND_ORDERS = [
+  [0, 1, 2],
+  [0, 2, 1],
+  [1, 0, 2],
+  [1, 2, 0],
+  [2, 0, 1],
+  [2, 1, 0],
+];
+const _KNOWN_REAL_BRANDS = new Set([
+  "Chromium",
+  "Google Chrome",
+  "Microsoft Edge",
+  "HeadlessChrome",
+  "Opera",
+  "Brave",
+  "Vivaldi",
+]);
+
+function chromiumBrandEntries(major) {
+  const seed = parseInt(String(major || "150"), 10) || 150;
+  const m = String(major || seed);
+  const n = _GREASEY_CHARS.length;
+  const greaseBrand = `Not${_GREASEY_CHARS[seed % n]}A${_GREASEY_CHARS[(seed + 1) % n]}Brand`;
+  const greaseVer = _GREASE_VERSIONS[seed % _GREASE_VERSIONS.length];
+  const items = [
+    { brand: greaseBrand, version: greaseVer, isGrease: true },
+    { brand: "Chromium", version: m, isGrease: false },
+    { brand: "Google Chrome", version: m, isGrease: false },
+  ];
+  const order = _BRAND_ORDERS[seed % _BRAND_ORDERS.length];
+  return [0, 1, 2].map((pos) => items[order.indexOf(pos)]);
+}
+
+function parseSecChUaTokens(secChUa) {
+  const re = /"([^"]*)"\s*;\s*v="([^"]*)"/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(String(secChUa || "")))) {
+    if (m[1]) out.push({ brand: m[1], version: m[2] });
+  }
+  return out;
+}
+
+function isGreaseBrand(brand, version, major) {
+  if (/^Not.A.Brand$/.test(brand)) return true;
+  if (_KNOWN_REAL_BRANDS.has(brand)) return false;
+  return Boolean(version) && version !== major;
+}
+
+function highEntropyClientHints(ua, extra, secChUa) {
   const m = String(ua || "").match(/(?:Chrome|CriOS)\/(\d+(?:\.\d+)*)/);
   if (!m) return {};
   const build = m[1];
-  // 参考 HAR：/backend-api/sentinel/req 与主站请求一样带全套高熵 Client Hints，
-  // 缺 arch / bitness / platform-version 时同一出口下会出现「主站有、哨兵没有」
-  // 的请求族差异，是最容易被上游按 origin 聚类的指纹。
+  const major = build.split(".")[0] || "150";
   const hints = Object.assign({}, extra || {});
+  const tokens = parseSecChUaTokens(secChUa);
+  let fullEntries;
+  if (tokens.length) {
+    fullEntries = tokens.map((entry) => {
+      if (isGreaseBrand(entry.brand, entry.version, major)) {
+        const v = String(entry.version || "24");
+        return { brand: entry.brand, version: v.indexOf(".") === -1 ? `${v}.0.0.0` : v };
+      }
+      return { brand: entry.brand, version: build };
+    });
+  } else {
+    fullEntries = chromiumBrandEntries(major).map((entry) => ({
+      brand: entry.brand,
+      version: entry.isGrease ? `${entry.version}.0.0.0` : build,
+    }));
+  }
+  const fullList = fullEntries.map((e) => `"${e.brand}";v="${e.version}"`).join(", ");
   return {
     ...hints,
     "sec-ch-ua-full-version": `"${build}"`,
-    "sec-ch-ua-full-version-list": `"Google Chrome";v="${build}", "Chromium";v="${build}", "Not(A:Brand";v="24.0.0.0"`,
+    "sec-ch-ua-full-version-list": fullList,
     "sec-ch-ua-model": '""',
   };
 }
@@ -286,7 +367,7 @@ function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOr
   // sdk 里的 fetch 桥到 fetchImpl：改写 URL 到 sentinel.openai.com、补头、走代理。
   // 关键：dispatcher 与 fetchImpl 必须来自同一个 undici 版本，否则 Node 内置 fetch
   // 校验外部 dispatcher 的 Request handler 会报 "invalid onRequestStart method"。
-  const extraHints = secChUa ? highEntropyClientHints(ua, clientHints) : {};
+  const extraHints = secChUa ? highEntropyClientHints(ua, clientHints, secChUa) : {};
   return function (url, opts) {
     opts = opts || {};
     let u = String(url);
@@ -299,10 +380,11 @@ function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOr
     } else if (u.charAt(0) === "/") {
       u = sentinelOrigin + u;
     }
+    const method = String(opts.method || "GET").toUpperCase();
+    const hasBody = opts.body != null || (method !== "GET" && method !== "HEAD");
     const headers = Object.assign(
       {
-        "content-type": "text/plain;charset=UTF-8",
-        origin: sentinelOrigin,
+        ...(hasBody ? { "content-type": "text/plain;charset=UTF-8", origin: sentinelOrigin } : {}),
         referer: frameUrl,
         "user-agent": ua,
         accept: "*/*",
@@ -318,7 +400,7 @@ function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOr
       },
       opts.headers || {}
     );
-    const fopts = { method: opts.method || "GET", headers };
+    const fopts = { method, headers };
     if (opts.body != null) fopts.body = opts.body;
     if (dispatcher) fopts.dispatcher = dispatcher;
     return fetchImpl(u, fopts);
@@ -540,7 +622,9 @@ async function handleRequest(raw) {
   }
 
   const ua = args.ua || "";
-  const cores = args.cores || 16;
+  // 与 Python 侧 sentinel_profile.cores 同源（此前桥接默认 16、调用方 8，PoW 与
+  // sdk 沙箱在 cores 字段上会分裂）。
+  const cores = args.cores || 8;
   const deviceId = args.deviceId || "";
   const flow = args.flow || "oauth_create_account";
   const proxy = args.proxy || "";
@@ -551,11 +635,24 @@ async function handleRequest(raw) {
   const cookieHeader = args.cookieHeader || "";
   const sentinelOrigin = args.sentinelOrigin || "https://chatgpt.com";
   const impersonate = String(args.impersonate || "").trim() || "chrome150";
-  const secChUa = String(args.secChUa || "").trim();
-  const secChUaPlatform = String(args.secChUaPlatform || "").trim();
+  const secChUaRaw = String(args.secChUa || "").trim();
+  const uaChromeMatch = String(ua || "").match(/(?:Chrome|CriOS)\/(\d+(?:\.\d+)*)/);
+  const platformLabel = args.platformLabel || "Windows";
+  // 调用方省略 secChUa 但 UA 为 Chromium/Chrome 时，用同一 Chromium GREASE 规则兜底，
+  // 确保 /sentinel/req 请求头与沙箱 navigator.userAgentData.brands 永不分裂。
+  const secChUa = secChUaRaw || (
+    uaChromeMatch
+      ? chromiumBrandEntries(uaChromeMatch[1].split(".")[0])
+          .map((e) => `"${e.brand}";v="${e.version}"`)
+          .join(", ")
+      : ""
+  );
+  const rawPlat = String(args.secChUaPlatform || "").trim().replace(/^"+|"+$/g, "");
+  const secChUaPlatform = rawPlat
+    ? `"${rawPlat}"`
+    : (secChUa && platformLabel ? `"${platformLabel}"` : "");
   // 高熵 Client Hints：参考 HAR 上 sec-ch-ua-arch/bitness/platform-version 与主站请求同源。
   // 调用方没给时按平台给默认值，避免 Windows 档案发出 macOS 的 arm/27.0.1。
-  const platformLabel = args.platformLabel || "Windows";
   const defaultHints = platformLabel === "macOS"
     ? { arch: '"arm"', bitness: '"64"', platformVersion: '"14.6.1"' }
     : platformLabel === "Linux"
@@ -587,24 +684,23 @@ async function handleRequest(raw) {
   // 避免同一出口 IP 下出现 Node TLS vs Chrome TLS 分裂。
   // 仅当显式设置 SENTINEL_HTTP_TRANSPORT=undici 时退回 Node undici ProxyAgent。
   const forceUndici = String(process.env.SENTINEL_HTTP_TRANSPORT || "").trim().toLowerCase() === "undici";
+  const curlHelperExists = fs.existsSync(path.join(__dirname, "sentinel_curl_fetch.py"));
   let dispatcher = null;
   let fetchImpl = undici && undici.fetch ? undici.fetch : fetch;
-  if (proxy) {
-    if (forceUndici && undici && /^https?:/i.test(proxy)) {
-      try {
-        const pu = new URL(proxy);
-        const opts = { uri: pu.origin }; // http://host:port（去掉 userinfo）
-        if (pu.username || pu.password) {
-          const auth = decodeURIComponent(pu.username) + ":" + decodeURIComponent(pu.password);
-          opts.token = "Basic " + Buffer.from(auth, "utf8").toString("base64");
-        }
-        dispatcher = new undici.ProxyAgent(opts);
-      } catch (e) {
-        return JSON.stringify({ error: "ProxyAgent 构造失败：" + ((e && e.message) || e) });
+  if (proxy && forceUndici && undici && /^https?:/i.test(proxy)) {
+    try {
+      const pu = new URL(proxy);
+      const opts = { uri: pu.origin }; // http://host:port（去掉 userinfo）
+      if (pu.username || pu.password) {
+        const auth = decodeURIComponent(pu.username) + ":" + decodeURIComponent(pu.password);
+        opts.token = "Basic " + Buffer.from(auth, "utf8").toString("base64");
       }
-    } else {
-      fetchImpl = makePythonCurlFetch(proxy, impersonate);
+      dispatcher = new undici.ProxyAgent(opts);
+    } catch (e) {
+      return JSON.stringify({ error: "ProxyAgent 构造失败：" + ((e && e.message) || e) });
     }
+  } else if (!forceUndici && (proxy || curlHelperExists)) {
+    fetchImpl = makePythonCurlFetch(proxy, impersonate);
   }
 
   const assetsDir = __dirname;
@@ -613,6 +709,7 @@ async function handleRequest(raw) {
 
   // Node 的 crypto/navigator/performance/self 是只读全局，会和 bootstrap 的赋值冲突。
   // 用独立 vm 沙箱（全新 global），只注入 sdk 实际需要的 host 能力。
+  const { performance: hostPerformance } = require("perf_hooks");
   const capture = { reqBody: "" };
   const sdkUrl = `${sentinelOrigin}/sentinel/${version}/sdk.js`;
   const sandbox = {
@@ -622,6 +719,7 @@ async function handleRequest(raw) {
     setInterval,
     clearInterval,
     queueMicrotask,
+    __HOST_NOW__: () => hostPerformance.now(),
     fetch: makeFetch(
       ua,
       language,
@@ -659,6 +757,18 @@ async function handleRequest(raw) {
     __SCREEN_H__: screenH,
     __AVAIL_H__: availH,
     __MAX_TOUCH__: maxTouch,
+    // UA-CH 单一来源：JS 侧 navigator.userAgentData.brands / getHighEntropyValues
+    // 必须与本次请求发出去的 sec-ch-ua* 头逐字一致（含 GREASE 品牌），否则
+    // 同一份会话会同时呈现两套 Client Hints。
+    __SEC_CH_UA__: secChUa,
+    __SEC_CH_UA_FULL_LIST__: secChUa
+      ? highEntropyClientHints(ua, clientHints, secChUa)["sec-ch-ua-full-version-list"]
+      : "",
+    __CH_ARCH__: String(clientHints["sec-ch-ua-arch"] || "").replace(/"/g, ""),
+    __CH_BITNESS__: String(clientHints["sec-ch-ua-bitness"] || "").replace(/"/g, ""),
+    __CH_PLATFORM_VERSION__: String(
+      clientHints["sec-ch-ua-platform-version"] || ""
+    ).replace(/"/g, ""),
   };
   vm.createContext(sandbox);
 
@@ -712,6 +822,7 @@ async function handleRequest(raw) {
     initialPerformance: sandbox.__SENTINEL_PERF__,
     heapLimit: sandbox.__SENTINEL_HEAP_LIMIT__,
     sdkUrl: sandbox.__SDK_URL__,
+    pageUrl,
   });
   // sdk.js 自己发到 /sentinel/req 的指纹数组是同一 flow 的第一份自述；
   // 能解出来就直接复用，保证 p 与它逐字段一致。

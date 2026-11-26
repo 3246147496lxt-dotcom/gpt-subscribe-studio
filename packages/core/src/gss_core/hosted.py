@@ -53,8 +53,14 @@ class TeamHostedClient:
                 raise DomainError(ErrorCode.SESSION_EXPIRED, "付款凭证已过期，停止后续请求")
             started = time.monotonic()
             try:
-                response = getattr(self.http, method.lower())("https://api.stripe.com/v1/" + path,
-                                                              timeout=self.client.timeout, **kwargs)
+                if method.upper() == "GET":
+                    from .chatgpt import _without_session_headers
+                    with _without_session_headers(self.http, {"content-type"}):
+                        response = self.http.get("https://api.stripe.com/v1/" + path,
+                                                 timeout=self.client.timeout, **kwargs)
+                else:
+                    response = getattr(self.http, method.lower())("https://api.stripe.com/v1/" + path,
+                                                                  timeout=self.client.timeout, **kwargs)
             except Exception as exc:
                 code = getattr(exc, "code", None)
                 logger.warning("hosted_transport_failed stage=%s method=%s error=%s code=%s elapsed=%.2f attempt=%s confirm_submitted=%s",

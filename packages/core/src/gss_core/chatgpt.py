@@ -10,13 +10,16 @@ import random
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal
 from http.cookiejar import CookieJar
 from typing import Any, Callable, Dict, NoReturn, Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from gss_contracts.errors import DomainError, ErrorCode
+
+from . import ua_ch
 from gss_core.verified_payer import checkout_address, check_observed_billing
 from gss_core.checkout_diagnostics import safe_checkout_diagnostics
 from gss_core.failure_trace import build_redacted_http_trace
@@ -210,7 +213,8 @@ def _ua_mac(build: str) -> str:
 
 
 _CHROME = _PROFILES["linux"]["ua"].format(build=_PROFILES["linux"]["builds"][0])
-_SEC_CH_UA = '"Google Chrome";v="150", "Chromium";v="150", "Not(A:Brand";v="24"'
+_SEC_CH_UA = ua_ch.sec_ch_ua("150")
+# GREASE 品牌轮换表已收敛到 gss_core.ua_ch（低熵/高熵/JS 侧共用同一来源）。
 
 STRIPE_API_VERSION = "2025-03-31.basil"
 STRIPE_CHECKOUT_API_VERSION = (
@@ -393,11 +397,67 @@ _DOC_NAV_OMIT_HEADERS = (
     "referer",
 )
 
+# 高熵 UA-CH：冷导航（sec-fetch-site: none）上真 Chrome 不会发送，只有站点通过
+# Accept-CH 持久化策略后才会在后续导航里补上。
+_DOC_NAV_HIGH_ENTROPY_HINTS = (
+    "sec-ch-ua-full-version",
+    "sec-ch-ua-full-version-list",
+    "sec-ch-ua-arch",
+    "sec-ch-ua-bitness",
+    "sec-ch-ua-platform-version",
+    "sec-ch-ua-model",
+)
+
 _PLATFORM_CH_DEFAULTS = {
     "macOS": ('"arm"', '"64"', '"14.6.1"'),
     "Windows": ('"x86"', '"64"', '"10.0.0"'),
     "Linux": ('"x86"', '"64"', '""'),
 }
+
+_TASKBAR_PX = {
+    "macOS": 25,
+    "Windows": 40,
+    "Linux": 24,
+}
+
+
+def _merge_headers_ci(base: Dict[str, str], extra: Dict[str, str]) -> None:
+    """Case-insensitive header update so mixed-case dicts never emit duplicate wire headers."""
+    if not extra:
+        return
+    index = {k.lower(): k for k in base}
+    for key, value in extra.items():
+        low = key.lower()
+        existing = index.get(low)
+        if existing is not None and existing != key:
+            base.pop(existing, None)
+        base[key] = value
+        index[low] = key
+
+
+@contextmanager
+def _without_session_headers(http: Any, omit_lower: set[str], *, prefix_oai: bool = False):
+    http_headers = getattr(http, "headers", None)
+    if http_headers is None:
+        inner = getattr(http, "_inner", None)
+        http_headers = getattr(inner, "headers", None) if inner is not None else None
+    saved: list[tuple[str, Any]] = []
+    if http_headers is not None and hasattr(http_headers, "pop"):
+        for key in list(http_headers.keys()):
+            low_key = str(key).lower()
+            if low_key in omit_lower or (prefix_oai and low_key.startswith("oai-")):
+                old = http_headers.pop(key, None)
+                if old is not None:
+                    saved.append((key, old))
+    try:
+        yield
+    finally:
+        if http_headers is not None and saved:
+            for key, old in saved:
+                try:
+                    http_headers[key] = old
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def _account_check_item(payload: Dict[str, Any], account_id: str = "") -> tuple[Dict[str, Any], str]:
@@ -629,6 +689,18 @@ class ChatGPTClient:
     _strip_ambient: bool = field(default=False, repr=False)
     _last_refresh_transport_error: Optional[tuple[str, Optional[int]]] = field(default=None, repr=False)
 
+    def __post_init__(self) -> None:
+        ctx = self.browser_context
+        if ctx is not None:
+            if getattr(ctx, "user_agent", ""):
+                self.user_agent = str(ctx.user_agent)
+            if getattr(ctx, "sec_ch_ua", ""):
+                self._sec_ch_ua_override = str(ctx.sec_ch_ua)
+            if self.language == "en-US" and getattr(ctx, "locale", ""):
+                self.language = str(ctx.locale)
+            if self.timezone == "America/New_York" and getattr(ctx, "timezone_id", ""):
+                self.timezone = str(ctx.timezone_id)
+
     @classmethod
     def from_raw_session(
         cls, raw: str, proxy: Optional[str] = None, *, strip_ambient: bool = False
@@ -826,13 +898,17 @@ class ChatGPTClient:
     def impersonate(self) -> str:
         return impersonate_for_major(self.chrome_major)
 
+    def _grease_brand(self) -> tuple[str, str]:
+        """本档案的 GREASE 品牌与版本（低熵/高熵 UA-CH 共用同一来源）。"""
+        return ua_ch.grease_brand(self.chrome_major, self._sec_ch_ua_override)
+
     @property
     def sec_ch_ua(self) -> str:
-        if self._sec_ch_ua_override:
-            return self._sec_ch_ua_override
-        major = self.chrome_major
-        return ('"Google Chrome";v="' + major + '", "Chromium";v="' + major
-                + '", "Not(A:Brand";v="24"')
+        return ua_ch.sec_ch_ua(self.chrome_major, self._sec_ch_ua_override)
+
+    @property
+    def sec_ch_ua_full_list(self) -> str:
+        return ua_ch.sec_ch_ua_full_version_list(self.chrome_build, self._sec_ch_ua_override)
 
     @property
     def ua(self) -> str:
@@ -840,10 +916,24 @@ class ChatGPTClient:
             return self.user_agent
         return self.profile["ua"].format(build=self.chrome_build)
 
+    def _effective_hints(self) -> Dict[str, str]:
+        hints = dict(self.profile.get("hints") or {})
+        context = self.browser_context
+        if context is not None:
+            platform = str(getattr(context, "sec_ch_ua_platform", "") or "").strip('"')
+            if platform in _PLATFORM_CH_DEFAULTS:
+                ctx_headers = {k.lower(): str(v) for k, v in (context.headers() or {}).items()}
+                def_arch, def_bits, def_ver = _PLATFORM_CH_DEFAULTS[platform]
+                hints["sec-ch-ua-platform"] = f'"{platform}"'
+                hints["sec-ch-ua-arch"] = ctx_headers.get("sec-ch-ua-arch") or def_arch
+                hints["sec-ch-ua-bitness"] = ctx_headers.get("sec-ch-ua-bitness") or def_bits
+                hints["sec-ch-ua-platform-version"] = ctx_headers.get("sec-ch-ua-platform-version") or def_ver
+        return hints
+
     @property
     def sentinel_profile(self) -> dict:
         p = self.profile
-        hints = p.get("hints") or {}
+        hints = self._effective_hints()
         profile = {"platform": p["platform"], "platform_label": p["label"],
                    "screen_w": p["screen"][0], "screen_h": p["screen"][1],
                    "avail_h": p["screen"][2], "cores": 8,
@@ -858,18 +948,14 @@ class ChatGPTClient:
                        "Linux": ("Linux x86_64", "Linux")}
             if platform in mapping:
                 profile["platform"], profile["platform_label"] = mapping[platform]
-                ctx_headers = {k.lower(): str(v) for k, v in (context.headers() or {}).items()}
-                def_arch, def_bits, def_ver = _PLATFORM_CH_DEFAULTS.get(platform, ('"x86"', '"64"', '"10.0.0"'))
-                profile["sec_ch_ua_arch"] = ctx_headers.get("sec-ch-ua-arch") or def_arch
-                profile["sec_ch_ua_bitness"] = ctx_headers.get("sec-ch-ua-bitness") or def_bits
-                profile["sec_ch_ua_platform_version"] = ctx_headers.get("sec-ch-ua-platform-version") or def_ver
             width = int(getattr(context, "viewport_width", 0) or 0)
             height = int(getattr(context, "viewport_height", 0) or 0)
             if width >= 800:
                 profile["screen_w"] = width
             if height >= 600:
+                taskbar = _TASKBAR_PX.get(profile["platform_label"], 40)
                 profile["screen_h"] = height
-                profile["avail_h"] = max(1, height - 80)
+                profile["avail_h"] = max(1, height - taskbar)
         return profile
 
     def apply_browser_context(self, context: Any) -> None:
@@ -892,6 +978,8 @@ class ChatGPTClient:
         # Anonymous browser attestations are not credentials for this session.
         if self._http is not None:
             self._http.headers.update(self._identity_headers())
+        if self._stripe_http is not None:
+            self._stripe_http.headers.update(self._stripe_headers())
 
     def _document_nav_headers(self) -> Dict[str, str]:
         """顶层文档导航（`GET /`）的头集合：真 Chrome 的冷导航形状。
@@ -901,7 +989,6 @@ class ChatGPTClient:
         把 API 头混进文档导航，等于在同一条会话上同时宣告「脚本 API 调用」与
         「用户在地址栏输入 URL」两种互斥的发起方式。
         """
-        build = self.chrome_build
         headers: Dict[str, str] = {
             "User-Agent": self.ua,
             "Accept": (
@@ -916,32 +1003,75 @@ class ChatGPTClient:
             "sec-fetch-site": "none",
             "sec-fetch-user": "?1",
             "upgrade-insecure-requests": "1",
+            # 冷导航（sec-fetch-site: none）只发低熵 UA-CH：真 Chrome 的高熵 hints
+            # 只在站点通过 Accept-CH 持久化策略之后才上送，首次顶层导航就带
+            # full-version / arch / bitness / platform-version 是自相矛盾的。
             "sec-ch-ua": self.sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-full-version": f'"{build}"',
-            "sec-ch-ua-full-version-list": (
-                f'"Google Chrome";v="{build}", "Chromium";v="{build}", '
-                f'"Not(A:Brand";v="24.0.0.0"'
-            ),
-            "sec-ch-ua-model": '""',
-            **self.profile["hints"],
+            "sec-ch-ua-platform": self._effective_hints().get("sec-ch-ua-platform", '""'),
             "Cookie": self._cookie_header(),
         }
         if not headers.get("Cookie"):
             headers.pop("Cookie", None)
         if self.browser_context is not None:
-            omit_lower = set(_DOC_NAV_OMIT_HEADERS)
+            omit_lower = set(_DOC_NAV_OMIT_HEADERS) | set(_DOC_NAV_HIGH_ENTROPY_HINTS)
             context_headers = {
                 k: v for k, v in (self.browser_context.headers() or {}).items()
                 if k.lower() not in omit_lower and not k.lower().startswith("oai-")
             }
-            headers.update(context_headers)
+            _merge_headers_ci(headers, context_headers)
         # 防御：任何 oai-* / Referer / Authorization / Origin / Content-Type 键都不该出现在冷导航上。
         omit_final = {"referer", "authorization", "origin", "content-type", "chatgpt-account-id"}
         return {
             k: v for k, v in headers.items()
             if k.lower() not in omit_final and not k.lower().startswith("oai-")
         }
+
+    def _get_headers(self) -> Dict[str, str]:
+        """同源无 body 的 GET 头：去掉 `Origin` 与 `Content-Type`。
+
+        真 Chrome 只在带 body 或跨源请求上发 `Origin` / `Content-Type`；
+        同源 GET 同时带这两个头是「脚本直接构造请求」的痕迹（Fetch 规范里
+        只有 CORS/POST 才会附加它们）。
+        """
+        headers = self._identity_headers()
+        headers.pop("Origin", None)
+        headers.pop("Content-Type", None)
+        headers.pop("origin", None)
+        headers.pop("content-type", None)
+        return headers
+
+    def _http_get(
+        self,
+        route: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+        page_url: str = "",
+        timeout: Optional[float] = None,
+    ):
+        url = route if route.startswith("http") else f"{APP_BASE}{route}"
+        route_path = urlsplit(url).path or route
+        route_headers = (
+            self._route_headers(route_path, page_url=page_url)
+            if page_url
+            else self._route_headers(route_path)
+        )
+        if hasattr(self, "extra_cookies") and hasattr(self, "language"):
+            headers = self._get_headers()
+            headers.update(route_headers)
+        else:
+            headers = dict(route_headers)
+        for key in ("Origin", "origin", "Content-Type", "content-type"):
+            headers.pop(key, None)
+        kwargs: Dict[str, Any] = {
+            "headers": headers,
+            "timeout": self.timeout if timeout is None else timeout,
+        }
+        if params is not None:
+            kwargs["params"] = params
+        http = self.http
+        with _without_session_headers(http, {"origin", "content-type"}):
+            return http.get(url, **kwargs)
 
     def _identity_headers(self) -> Dict[str, str]:
         build = self.chrome_build
@@ -966,12 +1096,10 @@ class ChatGPTClient:
             "sec-ch-ua-mobile": "?0",
             # 高熵 Client Hints：真实 Chrome 在 chatgpt.com 的 API 请求上全部发送。
             "sec-ch-ua-full-version": f'"{build}"',
-            "sec-ch-ua-full-version-list": (
-                f'"Google Chrome";v="{build}", "Chromium";v="{build}", '
-                f'"Not(A:Brand";v="24.0.0.0"'
-            ),
+            # 与低熵 sec-ch-ua 共用同一个 GREASE 品牌（见 _grease_brand）
+            "sec-ch-ua-full-version-list": self.sec_ch_ua_full_list,
             "sec-ch-ua-model": '""',
-            **self.profile["hints"],
+            **self._effective_hints(),
             "Cookie": self._cookie_header(),
         }
         # 只在 warmup 真从页面解析到构建号时才发，避免把过期版本写死在指纹里。
@@ -985,7 +1113,7 @@ class ChatGPTClient:
         if self.account_id:
             headers["chatgpt-account-id"] = self.account_id
         if self.browser_context is not None:
-            headers.update(self.browser_context.headers())
+            _merge_headers_ci(headers, self.browser_context.headers() or {})
         return headers
 
     def _route_headers(self, route: str, *, page_url: str = "") -> Dict[str, str]:
@@ -1281,7 +1409,7 @@ class ChatGPTClient:
         # keys must be temporarily popped from session.headers during document GET.
         http_headers = getattr(self.http, "headers", None)
         saved_headers: list[tuple[str, Any]] = []
-        omit_lower = set(_DOC_NAV_OMIT_HEADERS)
+        omit_lower = set(_DOC_NAV_OMIT_HEADERS) | set(_DOC_NAV_HIGH_ENTROPY_HINTS)
         if anonymous:
             omit_lower.add("cookie")
         if http_headers is not None and hasattr(http_headers, "pop"):
@@ -1354,14 +1482,7 @@ class ChatGPTClient:
                 # cross-country refresh they can still hold the previous
                 # Bearer/Cookie. Build the account request from the live
                 # client fields so /me always uses the just-issued credentials.
-                headers = self._route_headers(path)
-                headers.update(self._identity_headers())
-                response = self.http.get(
-                    f"{APP_BASE}{path}",
-                    params=params,
-                    headers=headers,
-                    timeout=self.timeout,
-                )
+                response = self._http_get(path, params=params)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("warmup request failed path=%s error=%s", path, type(exc).__name__)
                 continue
@@ -1418,11 +1539,8 @@ class ChatGPTClient:
 
     def _warm_probe(self, path: str, params: Optional[Dict[str, str]], *,
                     stage: str) -> Dict[str, Any]:
-        headers = self._route_headers(path)
-        headers.update(self._identity_headers())
         try:
-            response = self.http.get(f"{APP_BASE}{path}", params=params, headers=headers,
-                                     timeout=self.timeout)
+            response = self._http_get(path, params=params)
         except Exception as exc:  # noqa: BLE001
             raise DomainError(
                 ErrorCode.CHECKOUT_UPSTREAM_ERROR,
@@ -1463,11 +1581,7 @@ class ChatGPTClient:
             timeout_s=max(5.0, min(self.timeout, float(os.environ.get("GSS_SENTINEL_TIMEOUT", "15") or 15), 90.0)),
             impersonate=self.impersonate,
             sec_ch_ua=self.sec_ch_ua,
-            sec_ch_ua_platform=str(
-                getattr(self.browser_context, "sec_ch_ua_platform", "")
-                or self.profile.get("hints", {}).get("sec-ch-ua-platform")
-                or ""
-            ),
+            sec_ch_ua_platform=self._effective_hints().get("sec-ch-ua-platform", ""),
             version=self.sentinel_version,
             **self.sentinel_profile,
         )
@@ -1572,30 +1686,34 @@ class ChatGPTClient:
             self._http.headers.update(self._identity_headers())
         return self._http
 
+    def _stripe_headers(self) -> Dict[str, str]:
+        stripe_headers = {
+            "User-Agent": self.ua,
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": _accept_language(self.language),
+            "Origin": "https://js.stripe.com",
+            "Referer": "https://js.stripe.com/",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "priority": "u=1, i",
+            "sec-ch-ua": self.sec_ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+            "sec-fetch-storage-access": "active",
+        }
+        platform_hint = self._effective_hints().get("sec-ch-ua-platform")
+        if platform_hint:
+            stripe_headers["sec-ch-ua-platform"] = platform_hint
+        return stripe_headers
+
     @property
     def stripe_http(self):
         self._check_credentials()
         if self._stripe_http is None:
             self._stripe_http = _new_session(proxy=self.proxy, timeout=self.timeout, impersonate=self.impersonate)
-            stripe_headers = {
-                "User-Agent": self.ua,
-                "Accept": "application/json",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
-                "Accept-Language": _accept_language(self.language),
-                "Origin": "https://js.stripe.com",
-                "Referer": "https://js.stripe.com/",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "priority": "u=1, i",
-                "sec-ch-ua": self.sec_ch_ua,
-                "sec-ch-ua-mobile": "?0",
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-site",
-            }
-            platform_hint = self.profile.get("hints", {}).get("sec-ch-ua-platform")
-            if platform_hint:
-                stripe_headers["sec-ch-ua-platform"] = platform_hint
-            self._stripe_http.headers.update(stripe_headers)
+            self._stripe_http.headers.update(self._stripe_headers())
         return self._stripe_http
 
     def close(self) -> None:
@@ -1819,21 +1937,12 @@ class ChatGPTClient:
             self.account_id = jwt_account_id(self.access_token)
         if self.account_id:
             return
-        me = self.http.get(
-            f"{APP_BASE}/backend-api/me",
-            headers=self._route_headers("/backend-api/me"),
-            timeout=self.timeout,
-        )
+        me = self._http_get("/backend-api/me")
         if int(getattr(me, "status_code", 0) or 0) == 401:
             self._reject_unauthorized(me)
         if int(getattr(me, "status_code", 0) or 0) >= 400:
             logger.warning("account lookup unsuccessful status=%s", int(me.status_code))
-            check = self.http.get(
-                f"{APP_BASE}{ACCOUNTS_CHECK_PATH}",
-                params={"timezone_offset_min": "0"},
-                headers=self._route_headers(ACCOUNTS_CHECK_PATH),
-                timeout=self.timeout,
-            )
+            check = self._http_get(ACCOUNTS_CHECK_PATH, params={"timezone_offset_min": "0"})
             if int(getattr(check, "status_code", 0) or 0) == 401:
                 self._reject_unauthorized(check)
             if int(getattr(check, "status_code", 0) or 0) >= 400:
@@ -1850,11 +1959,9 @@ class ChatGPTClient:
         """读取 v4 账号检查并返回可安全展示/复用的活动摘要。"""
         if not self.account_id:
             self.hydrate()
-        response = self.http.get(
-            f"{APP_BASE}{ACCOUNTS_CHECK_PATH}",
+        response = self._http_get(
+            ACCOUNTS_CHECK_PATH,
             params={"timezone_offset_min": str(int(timezone_offset_min))},
-            headers=self._route_headers(ACCOUNTS_CHECK_PATH),
-            timeout=self.timeout,
         )
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 401:
@@ -2040,11 +2147,9 @@ class ChatGPTClient:
         )
 
     def _publishable_key(self) -> str:
-        response = self.http.get(
-            f"{APP_BASE}/backend-api/payments/stripe_client_bootstrap",
+        response = self._http_get(
+            "/backend-api/payments/stripe_client_bootstrap",
             params={"account_id": self.account_id},
-            headers=self._route_headers("/backend-api/payments/stripe_client_bootstrap"),
-            timeout=self.timeout,
         )
         if int(getattr(response, "status_code", 0) or 0) >= 400:
             self._raise(ErrorCode.CHECKOUT_UPSTREAM_ERROR, response, "读取 Stripe 公钥")
@@ -2065,11 +2170,7 @@ class ChatGPTClient:
         routes.append(f"/backend-api/payments/checkout/{checkout_id}")
         for route in routes:
             try:
-                response = self.http.get(
-                    f"{APP_BASE}{route}",
-                    headers=self._route_headers(route, page_url=page_url),
-                    timeout=self.timeout,
-                )
+                response = self._http_get(route, page_url=page_url)
             except Exception:
                 continue
             if int(getattr(response, "status_code", 0) or 0) >= 400:
@@ -2672,6 +2773,24 @@ class ChatGPTClient:
             body,
         )
 
+    def _stripe_get(
+        self,
+        url: str,
+        *,
+        params: Optional[Dict[str, str]] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        http = self.stripe_http
+        getter = getattr(http, "get", None)
+        if not callable(getter):
+            return None
+        with _without_session_headers(http, {"content-type"}):
+            return getter(
+                url,
+                params=params,
+                timeout=self.timeout if timeout is None else timeout,
+            )
+
     def _fetch_elements_session(
         self,
         *,
@@ -2681,8 +2800,7 @@ class ChatGPTClient:
         currency: str,
         stripe_js_id: str,
     ) -> Dict[str, Any]:
-        getter = getattr(self.stripe_http, "get", None)
-        if not callable(getter):
+        if not callable(getattr(self.stripe_http, "get", None)):
             return {}
         params = {
             "type": "deferred_intent",
@@ -2701,14 +2819,13 @@ class ChatGPTClient:
             "locale": str((self.language or "en-US").split("-")[0] or "en"),
         }
         try:
-            response = getter(
+            response = self._stripe_get(
                 f"{STRIPE_BASE}/v1/elements/sessions",
                 params=params,
-                timeout=self.timeout,
             )
         except Exception:
             return {}
-        if int(getattr(response, "status_code", 0) or 0) >= 400:
+        if response is None or int(getattr(response, "status_code", 0) or 0) >= 400:
             return {}
         return _json(response)
 
@@ -2777,8 +2894,7 @@ class ChatGPTClient:
         client_secret: str = "",
         publishable_key: str,
     ) -> Dict[str, Any]:
-        getter = getattr(self.stripe_http, "get", None)
-        if not callable(getter) or not intent_id:
+        if not callable(getattr(self.stripe_http, "get", None)) or not intent_id:
             return {}
         kind = "payment_intents" if intent_id.startswith("pi_") else "setup_intents"
         params = {
@@ -2788,15 +2904,15 @@ class ChatGPTClient:
         if client_secret:
             params["client_secret"] = client_secret
         try:
-            response = getter(
+            response = self._stripe_get(
                 f"{STRIPE_BASE}/v1/{kind}/{intent_id}",
                 params=params,
-                timeout=self.timeout,
             )
         except Exception:
             return {}
-        if int(getattr(response, "status_code", 0) or 0) >= 400:
-            _log_upstream_failure(f"/v1/{kind}/{intent_id}", response)
+        if response is None or int(getattr(response, "status_code", 0) or 0) >= 400:
+            if response is not None:
+                _log_upstream_failure(f"/v1/{kind}/{intent_id}", response)
             return {}
         return _json(response)
 
@@ -2930,12 +3046,10 @@ class ChatGPTClient:
         if not self.account_id:
             self.hydrate()
         self._check_credentials()  # /me can finish after the Vault lease expires.
-        response = self.http.get(
-            f"{APP_BASE}/backend-api/subscriptions",
+        response = self._http_get(
+            "/backend-api/subscriptions",
             # 上游现已要求显式 account_id，否则 400 "must specify either organization_id or account_id"。
             params={"account_id": self.account_id} if self.account_id else None,
-            headers=self._route_headers("/backend-api/subscriptions"),
-            timeout=self.timeout,
         )
         if int(getattr(response, "status_code", 0) or 0) == 401:
             _log_upstream_failure("/backend-api/subscriptions", response)
