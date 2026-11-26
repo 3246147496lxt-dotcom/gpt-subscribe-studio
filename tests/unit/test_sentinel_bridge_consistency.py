@@ -243,10 +243,14 @@ def test_bridge_pow_reuses_real_sentinel_sdk_req_fingerprint():
     assert seen_reqs, "真实 sentinel_sdk.js 未发出 /sentinel/req"
 
     req_hdrs, raw_body = seen_reqs[0]
-    # 对齐 HAR：/sentinel/req 带高熵 Client Hints。
+    # 对齐 HAR：/sentinel/req 带全套高熵 Client Hints（含 arch / bitness / platform-version）。
+    # 缺后三项时同一出口下会出现「主站有、哨兵没有」的请求族差异。
     assert req_hdrs.get("sec-ch-ua-full-version") == f'"{build}"'
     assert req_hdrs.get("sec-ch-ua-model") == '""'
     assert f'"Google Chrome";v="{build}"' in req_hdrs.get("sec-ch-ua-full-version-list", "")
+    assert req_hdrs.get("sec-ch-ua-arch") == '"x86"'
+    assert req_hdrs.get("sec-ch-ua-bitness") == '"64"'
+    assert req_hdrs.get("sec-ch-ua-platform-version") == '"10.0.0"'
 
     req_payload = json.loads(raw_body.decode("utf-8"))
     assert req_payload["p"].startswith("gAAAAAC"), "真实 sdk.js 前缀应为 gAAAAAC"

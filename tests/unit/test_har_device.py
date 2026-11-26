@@ -65,11 +65,13 @@ def test_stripe_ids_match_capture_shape():
 def test_headers_match_capture_surface():
     d = DeviceProfile.random(country="JP")
     web = d.web_headers(referer="https://chatgpt.com/")
-    for name in ("originator", "x-openai-checkout-source", "x-openai-codex-window-type",
-                 "x-openai-web-frontend", "sec-ch-ua-full-version-list", "sec-ch-ua-model",
+    for name in ("x-openai-checkout-source", "x-openai-rate-limit-join-workspace",
+                 "sec-ch-ua-full-version-list", "sec-ch-ua-model",
                  "user-agent", "priority"):
         assert name in web
-    assert web["originator"] == "Codex Browser"
+    # 与 ChatGPTClient 保持同一套 Web 客户端身份，不混发 macOS Codex WebView 专有头。
+    for forbidden in ("originator", "x-openai-codex-window-type", "x-openai-web-frontend"):
+        assert forbidden not in web
     assert web["x-openai-checkout-source"] == "chatgpt_web_merged"
     assert web["sec-ch-ua-model"] == '""'
 
@@ -80,6 +82,25 @@ def test_headers_match_capture_surface():
     fp = d.fingerprint_headers()
     assert fp["origin"] == "https://m.stripe.network"
     assert fp["cookie"] == f"m={d.guid}"
+
+
+def test_plus_har_inherits_client_ua_when_raw_user_agent_is_blank(tmp_path, monkeypatch):
+    from gss_core.chatgpt import ChatGPTClient
+    from gss_core.plus_har_protocol import PlusHarProtocol
+
+    monkeypatch.setenv("GSS_DEVICE_STORE", str(tmp_path / "devices.json"))
+    # 即使宿主机是 macOS 或环境变量偏置为 macOS，PlusHarProtocol 也必须对齐
+    # 同一笔订单 ChatGPTClient.ua（Windows Chrome），避免建单与支付两阶段 OS/TLS 分裂。
+    monkeypatch.setenv("GSS_DEVICE_OS", "macos")
+    client = ChatGPTClient(access_token="tok", device_id="did-win-align")
+    assert client.user_agent == ""
+    assert "Windows NT" in client.ua
+
+    engine = PlusHarProtocol(client=client, session="", exit_country="PH", currency="PHP")
+    assert engine.device.os_key == "windows"
+    assert engine.device.ua == client.ua
+    assert engine.device.ch_platform == '"Windows"'
+    assert engine.device.impersonate == client.impersonate
 
 
 def test_profile_roundtrip_and_cookie():

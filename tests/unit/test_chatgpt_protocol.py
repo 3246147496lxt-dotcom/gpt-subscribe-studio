@@ -948,7 +948,7 @@ def test_payment_intent_from_payment_page_ignores_cs_id() -> None:
     assert "checkout/verify" in return_url
 
 
-def test_payment_checkout_body_matches_har_and_headers_carry_codex_identity() -> None:
+def test_payment_checkout_body_matches_har_and_headers_stay_web_identity() -> None:
     from gss_core.chatgpt import ChatGPTClient, _checkout_body
 
     body = _checkout_body(plan="pro_lite", country="US", currency="USD")
@@ -957,8 +957,13 @@ def test_payment_checkout_body_matches_har_and_headers_carry_codex_identity() ->
 
     client = ChatGPTClient(access_token="t")
     headers = client._route_headers("/backend-api/payments/checkout")
-    assert headers["originator"] == "Codex Browser"
-    assert headers["x-openai-web-frontend"] == "codex_webview"
+    # 本客户端伪装的是 Windows Chrome 的 ChatGPT Web：不能混发 macOS Codex WebView
+    # 的客户端身份头（参考 HAR 出自 Codex Browser，混发会让同一会话出现两种客户端）。
+    assert "originator" not in headers
+    assert "x-openai-web-frontend" not in headers
+    assert "x-openai-codex-window-type" not in headers
+    # 与客户端身份无关、Web 侧同样存在的两项保留。
+    assert headers["x-openai-checkout-source"] == "chatgpt_web_merged"
     assert headers["x-openai-rate-limit-join-workspace"] == "1"
     # HAR 的 payments/* 上没有这两个头，多发即是多余指纹。
     assert "x-oai-mcp-form-version" not in headers
@@ -1249,3 +1254,81 @@ def test_mint_forwards_learned_sv_or_bridge_default(monkeypatch, version, expect
 
 def test_client_without_learned_version_leaves_it_empty() -> None:
     assert ChatGPTClient(access_token="tok").sentinel_version == ""
+
+
+def test_sentinel_profile_and_mint_stay_consistent_under_macos_browser_context(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    captured: dict = {}
+
+    def fake_mint(**kwargs):
+        captured.update(kwargs)
+        return {"p": "pow", "c": "chal"}
+
+    monkeypatch.setattr("gss_core.chatgpt.mint", fake_mint)
+    ctx = SimpleNamespace(
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.180 Safari/537.36",
+        sec_ch_ua='"Google Chrome";v="146", "Chromium";v="146", "Not(A:Brand";v="24"',
+        sec_ch_ua_platform='"macOS"',
+        locale="en-US",
+        timezone_id="America/New_York",
+        viewport_width=1440,
+        viewport_height=900,
+        cookies={},
+        headers=lambda: {"sec-ch-ua-platform": '"macOS"', "Referer": "https://chatgpt.com/"},
+    )
+    client = ChatGPTClient(access_token="tok", device_id="did-mac-ctx")
+    client.apply_browser_context(ctx)
+    client.mint_sentinel(flow="chatgpt_checkout", ping=False)
+
+    assert captured["platform"] == "MacIntel"
+    assert captured["platform_label"] == "macOS"
+    assert captured["sec_ch_ua_platform"] == '"macOS"'
+    assert captured["sec_ch_ua_arch"] == '"arm"'
+    assert captured["sec_ch_ua_bitness"] == '"64"'
+    assert captured["sec_ch_ua_platform_version"] == '"14.6.1"'
+    # 冷导航头同样必须过滤掉 context.headers() 里的 Referer / Authorization / oai-*
+    nav = client._document_nav_headers()
+    assert all(k.lower() != "referer" for k in nav)
+    assert all(not k.lower().startswith("oai-") for k in nav)
+
+
+def test_refresh_session_and_anonymous_warmup_keep_clean_headers() -> None:
+    seen: list[tuple[str, dict, dict]] = []
+
+    class _Resp:
+        status_code = 200
+        text = ""
+        headers: dict = {}
+
+        def json(self):
+            return {"accessToken": "fresh-tok"}
+
+    class _PlainDictHttp:
+        def __init__(self, initial: dict):
+            self.headers = dict(initial)
+            self.cookies = None
+
+        def get(self, url, headers=None, timeout=None):
+            seen.append((url, dict(self.headers), dict(headers or {})))
+            return _Resp()
+
+    client = ChatGPTClient(access_token="old-tok", session_token="st-val", device_id="", account_id="acct-1")
+    client._http = _PlainDictHttp(client._identity_headers())
+
+    # 1) anonymous warmup 在普通 dict session.headers 上也必须摘掉大写 Referer，且无 cookie 时不发空 Cookie 头
+    client.warmup(anonymous=True)
+    url0, sess0, req0 = seen[0]
+    assert url0 == "https://chatgpt.com/"
+    assert all(k.lower() != "referer" for k in sess0)
+    assert all(k.lower() != "referer" for k in req0)
+    assert "Cookie" not in req0
+
+    # 2) /api/auth/session 不发送 x-openai-target-path/route、Authorization、chatgpt-account-id、oai-*
+    assert client.refresh_session(trust_statsig=False) is True
+    url1, sess1, req1 = seen[1]
+    assert url1.endswith("/api/auth/session")
+    merged1 = {k.lower(): v for k, v in {**sess1, **req1}.items()}
+    for forbidden in ("authorization", "origin", "content-type", "chatgpt-account-id",
+                      "x-openai-target-path", "x-openai-target-route", "oai-did", "oai-device-id"):
+        assert forbidden not in merged1, f"/api/auth/session 泄露头: {forbidden}"

@@ -128,6 +128,9 @@ def mint(
     impersonate: str = "",
     sec_ch_ua: str = "",
     sec_ch_ua_platform: str = "",
+    sec_ch_ua_arch: str = "",
+    sec_ch_ua_bitness: str = "",
+    sec_ch_ua_platform_version: str = "",
     version: str = "",
 ) -> Dict[str, Any]:
     """返回哨兵 JSON；失败返回空 dict，由调用方决定是否中止。"""
@@ -156,6 +159,11 @@ def mint(
             "impersonate": impersonate or "",
             "secChUa": sec_ch_ua or "",
             "secChUaPlatform": sec_ch_ua_platform or "",
+            # 高熵 Client Hints：参考 HAR 的 /sentinel/req 与主站请求同源，
+            # 缺 arch/bitness/platform-version 时哨兵请求会成为同出口下的异常请求族。
+            "secChUaArch": sec_ch_ua_arch or "",
+            "secChUaBitness": sec_ch_ua_bitness or "",
+            "secChUaPlatformVersion": sec_ch_ua_platform_version or "",
         },
         separators=(",", ":"),
     ).encode("utf-8")

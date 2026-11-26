@@ -4,6 +4,43 @@
   "use strict";
   var g = globalThis;
 
+  // ---- 可枚举面卫生 helper ----
+  // sdk 的指纹数组第 11/12 位是 `T(Object.keys(document))` / `T(Object.keys(window))`
+  // 的随机命中结果（T = 从数组里随机取一个）。凡是真浏览器上没有的键，只要可枚举，
+  // 就有机会被当成「document / window 的某个键」上报给上游 —— 这是最直接的脚本指纹。
+  // 因此：
+  //   1) 桥接注入的构建参数（__UA__/__FLOW__/…）和本文件自造的运行时状态
+  //      （__SENTINEL_*/__LOAD_TS__ 等）全部做成不可枚举；
+  //   2) 模拟的 DOM 接口对象（document/navigator/screen/performance）按真 Chrome
+  //      的形状收敛成「自有属性为空、方法挂在原型上」，只保留 WebIDL 上真正
+  //      自有且可枚举的键（document.location 是唯一一个）。
+  // 注意 __oai_so_* 必须保持可枚举：真页面的 collector 就是普通赋值写进去的，
+  // 真 Chrome 的 window 上它们同样可枚举。
+  function concealOwn(obj, key) {
+    if (!obj) return;
+    try {
+      var desc = Object.getOwnPropertyDescriptor(obj, key);
+      if (!desc || desc.enumerable === false) return;
+      desc.enumerable = false;
+      Object.defineProperty(obj, key, desc);
+    } catch (e) {}
+  }
+  function concealAllOwn(obj) {
+    if (!obj) return;
+    var keys;
+    try { keys = Object.keys(obj); } catch (e) { return; }
+    for (var i = 0; i < keys.length; i++) concealOwn(obj, keys[i]);
+  }
+
+  // 桥接层用 __XXX__ 命名的构建参数：先记下值，再改成不可枚举。
+  var _BRIDGE_INPUTS = [
+    "__UA__", "__CORES__", "__FLOW__", "__SENTINEL_FLOW__", "__SDK_URL__",
+    "__SEED_DID_KEY__", "__SEED_DID_VAL__", "__PAGE_URL__", "__LANGUAGE__",
+    "__LANGUAGES__", "__TIMEZONE__", "__COOKIE_HEADER__", "__PLATFORM__",
+    "__PLATFORM_LABEL__", "__SCREEN_W__", "__SCREEN_H__", "__AVAIL_H__", "__MAX_TOUCH__"
+  ];
+  for (var _bi = 0; _bi < _BRIDGE_INPUTS.length; _bi++) concealOwn(g, _BRIDGE_INPUTS[_bi]);
+
   // sdk 里的“自我防篡改”陷阱会对函数源码跑灾难性回溯正则 (((.+)+)+)+$。
   // 真浏览器 V8 上瞬间命中；goja/regexp2 会指数级卡死。这里对该固定模式短路，
   // 返回与真浏览器一致的结果（非空串必命中→返回 0），不影响 token 计算。
@@ -227,7 +264,29 @@
   // ---- performance ----
   // collector 会读导航性能条目的 name（= 当前页 URL）作为指纹熵，真实页在此产出
   // "https://auth.openai.com/about-you"。缺 getEntriesByType 时该测点为空 → 少一项。
+  //
+  // 时基：真页面的 sentinel 是在「用户已经停留并交互了几秒」之后才被采集的
+  //   · chatgpt_checkout：打开定价弹窗 → 浏览套餐 → 点「升级」，约 6.5s
+  //   · oauth_create_account：填姓名 + 生日 → 提交，约 8s
+  // 旧实现把 timeOrigin 钉在沙箱启动瞬间，`performance.now()` 从 0 开始，
+  // 于是 p[13] 只有个位数毫秒（=页面刚打开 4ms 就提交建单），且按
+  // `t0 = now - dwell` 反推的行为起点全部变成负数 —— 这是最硬的脚本指纹。
+  // 现在时基由 flow 的停留时长反推：采集点 ≈ dwell + (180~900)ms。
+  var _flowName = String((typeof g.__FLOW__ !== "undefined" && g.__FLOW__) ||
+    (typeof g.__SENTINEL_FLOW__ !== "undefined" && g.__SENTINEL_FLOW__) || "oauth_create_account");
+  var _isCheckoutFlow = /checkout|payment|approval|billing/i.test(_flowName);
+  // 每次会话带自然随机抖动（不把 dwell 写死成同一个常量，避免跨订单聚类）
+  var _dwell = _isCheckoutFlow
+    ? Math.round((5200 + Math.random() * 2800) * 10) / 10
+    : Math.round((6800 + Math.random() * 2800) * 10) / 10;
   var _t0 = Date.now();
+  // 采集点 = 进页 + dwell；再留 180~900ms 给「点完按钮到 SDK 真正发出请求」。
+  // 取整：timeOrigin / __LOAD_TS__ 是 epoch 毫秒，亚毫秒抖动只出现在 now() 上。
+  var _perfBase = (typeof g.__SENTINEL_PERF__ === "number" && g.__SENTINEL_PERF__ > _dwell + 40)
+    ? g.__SENTINEL_PERF__
+    : Math.round(_dwell + 180 + Math.random() * 720);
+  var _perfTick = 0;
+  var _lastPerfNow = _perfBase;
   var _navEntry = {
     name: _pageUrl, entryType: "navigation", startTime: 0, duration: 420.5, type: "navigate",
     initiatorType: "navigation", nextHopProtocol: "h2", redirectCount: 0,
@@ -237,8 +296,16 @@
     domainLookupStart: 10.1, secureConnectionStart: 25.6, transferSize: 18240, encodedBodySize: 17010, decodedBodySize: 61200
   };
   g.performance = {
-    timeOrigin: _t0,
-    now: function () { return (Date.now() - _t0) + Math.random(); },
+    // timeOrigin = 导航起点（wall clock）：与 now() 严格互补，Date.now()-timeOrigin ≈ now()
+    timeOrigin: _t0 - _perfBase,
+    // 严格单调递增、亚毫秒分辨率（即使单毫秒内高频调用超过 1000 次也不会回绕倒退）
+    now: function () {
+      _perfTick += 1;
+      var candidate = _perfBase + (Date.now() - _t0) + (_perfTick % 1000) / 1000;
+      if (candidate <= _lastPerfNow) candidate = _lastPerfNow + 0.001;
+      _lastPerfNow = candidate;
+      return candidate;
+    },
     memory: { jsHeapSizeLimit: 4294705152, totalJSHeapSize: 35000000, usedJSHeapSize: 22000000 },
     getEntries: function () { return [_navEntry]; },
     getEntriesByType: function (t) { return t === "navigation" ? [_navEntry] : []; },
@@ -246,6 +313,7 @@
     mark: function () {}, measure: function () {}, clearMarks: function () {}, clearMeasures: function () {},
     clearResourceTimings: function () {}, setResourceTimingBufferSize: function () {}
   };
+  concealAllOwn(g.performance);
 
   // ---- 与 sentinel_bridge.js 的 PoW 生成器共享同一份会话标识与启动基准 ----
   // 若 sdk.js 与 PoW 各自新建 sid / loadTs，服务端会同时看到两条互相矛盾
@@ -255,13 +323,19 @@
       ? g.crypto.randomUUID()
       : "00000000-0000-4000-8000-000000000000";
   }
-  if (typeof g.__SENTINEL_PERF__ !== "number") {
-    g.__SENTINEL_PERF__ = 350.0 + Math.random() * 2200.0;
+  if (typeof g.__SENTINEL_PERF__ !== "number" || g.__SENTINEL_PERF__ < _dwell + 40) {
+    g.__SENTINEL_PERF__ = _perfBase;
   }
   if (typeof g.__LOAD_TS__ !== "number") {
-    g.__LOAD_TS__ = _t0 - g.__SENTINEL_PERF__;
+    g.__LOAD_TS__ = _t0 - _perfBase;
   }
   g.__SENTINEL_HEAP_LIMIT__ = 4294705152;
+  // 运行时状态同样不可枚举：真 Chrome 的 window 上没有这些键。
+  concealOwn(g, "__SENTINEL_SID__");
+  concealOwn(g, "__SENTINEL_PERF__");
+  concealOwn(g, "__LOAD_TS__");
+  concealOwn(g, "__SENTINEL_HEAP_LIMIT__");
+  concealOwn(g, "__TZ_DISPLAY_NAME__");
 
   // ---- localStorage ----
   // collector_dx 会枚举 Object.keys(localStorage) 作为指纹熵。真实 auth 页在
@@ -385,6 +459,29 @@
     get cookie() { return _cookie; },
     set cookie(v) { _cookie = "" + v; }
   };
+  // 真 Chrome 上 document 的方法/属性都挂在 HTMLDocument.prototype 上，
+  // `Object.keys(document)` 只会剩下一个自有且可枚举的 `location`
+  // （WebIDL [LegacyUnforgeable]），sdk 的 p[11] 因此恒为 "location"。
+  // 旧实现把全部方法都做成可枚举自有属性，p[11] 会随机报出
+  // "createTextNode" / "scripts" / "body" 这类真浏览器上不存在的键。
+  (function () {
+    var docOwn = [
+      "scripts", "documentElement", "body", "head", "getElementsByTagName", "getElementById",
+      "querySelector", "querySelectorAll", "createElement", "createTextNode", "referrer",
+      "URL", "documentURI", "baseURI", "title", "readyState", "hidden", "visibilityState",
+      "characterSet", "contentType", "cookie"
+    ];
+    for (var i = 0; i < docOwn.length; i++) concealOwn(g.document, docOwn[i]);
+    try {
+      Object.defineProperty(g.document, "location", {
+        value: g.location, enumerable: true, writable: true, configurable: true
+      });
+    } catch (e) {}
+  })();
+  // `Object.keys(navigator)` / `Object.keys(screen)` 在真 Chrome 里同样是空的
+  // （属性全在各自的原型链上）；这里只收掉可枚举性，按名读取不受影响。
+  concealAllOwn(navigator);
+  concealAllOwn(g.screen);
 
   // ---- __reactRouterContext ----
   // collector 会 try-读 ctx.state.loaderData.root.clientBootstrap 的地理字段。
@@ -458,51 +555,88 @@
   //     移动鼠标 → 点击升级按钮，全程没有任何键盘输入（keydown 必须为空）。
   // 结账流套用注册流的 12 次姓名按键会与真实结账页行为直接矛盾。
   (function () {
-    var nowP = (g.performance && g.performance.now) ? g.performance.now() : 1500;
-    var flow = String(g.__FLOW__ || g.__SENTINEL_FLOW__ || "oauth_create_account");
-    var isCheckout = /checkout|payment|approval|billing/i.test(flow);
+    var nowP = (g.performance && g.performance.now) ? g.performance.now() : _perfBase;
+    var flow = _flowName;
+    var isCheckout = _isCheckoutFlow;
     // 进页到采集的停留时间：注册流 ~8 秒；结账流（浏览定价 → 点击升级）~6.5 秒。
-    var dwell = isCheckout ? 6480.5 : 8085.5;
+    // 与上面的 performance 时基同源，因此 t0 恒为正数。
+    var dwell = _dwell;
     var t0 = nowP - dwell;
+    // 采集点紧跟在最后一次交互之后（点完「升级」/「继续」SDK 立刻发请求）。
+    var end = nowP - (40 + Math.random() * 160);
 
     var kd = [];
+    var kdSpan = 0;
     if (!isCheckout) {
       // 注册流：输入姓名 "Anna Wilson2"（12 次按键）。
       var keys = ["A", "n", "n", "a", " ", "W", "i", "l", "s", "o", "n", "2"];
-      var kt = t0 + 1200;
+      var kdDeltas = [];
+      for (var k = 0; k < keys.length; k++) {
+        var kdGap = 140 + Math.random() * 90;
+        kdDeltas.push(kdGap);
+        kdSpan += kdGap;
+      }
+      // 打字结束在采集点前 ~200ms（提交按钮点击）。
+      var kt = end - 200 - kdSpan;
       for (var i = 0; i < keys.length; i++) {
-        kt += 140 + Math.random() * 90;
+        kt += kdDeltas[i];
         kd.push({ ctrlKey: false, metaKey: false, altKey: false, shiftKey: (i === 0 || i === 5), key: keys[i], type: "keydown", t: kt });
       }
     }
 
     // pointermove 事件序列（鼠标移动，累计路径长度）。
-    // 结账流起点在定价弹窗右上角，终点落在升级按钮上（两次点击之间不离开按钮）。
+    // 坐标按当前视口尺寸 (_sw × _ah) 等比生成并严格钳制在视口内，避免 1366/1440 小屏
+    // 出现点击坐标越界；同时对步数、滚动量做自然随机扰动，避免跨订单常量聚类。
+    var clamp = function (v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); };
     var pm = [];
-    var px = isCheckout ? 1184 : 640;
-    var py = isCheckout ? 232 : 360;
-    var pt = t0 + (isCheckout ? 420 : 300);
+    var sx0 = isCheckout
+      ? Math.round(_sw * (0.48 + Math.random() * 0.14))
+      : Math.round(_sw * (0.30 + Math.random() * 0.14));
+    var sy0 = isCheckout
+      ? Math.round(_ah * (0.18 + Math.random() * 0.10))
+      : Math.round(_ah * (0.28 + Math.random() * 0.12));
+    var tx = isCheckout
+      ? Math.round(_sw * (0.62 + Math.random() * 0.14))
+      : Math.round(_sw * (0.42 + Math.random() * 0.16));
+    var ty = isCheckout
+      ? Math.round(_ah * (0.42 + Math.random() * 0.18))
+      : Math.round(_ah * (0.40 + Math.random() * 0.16));
+    var px = sx0;
+    var py = sy0;
     var htot = 0, pcnt = 0;
-    var steps = isCheckout ? 24 : 30;
+    var steps = isCheckout ? (18 + Math.floor(Math.random() * 10)) : (24 + Math.floor(Math.random() * 10));
+    var gaps = [];
+    var gapSum = 0;
+    for (var a = 0; a < steps; a++) {
+      // 第一步是「从静止到移动」的迟疑，后续是稳定的手部单步间隔。
+      var gap = a === 0 ? 120 + Math.random() * 220 : 55 + Math.random() * 85;
+      gaps.push(gap);
+      gapSum += gap;
+    }
+    // 结账流：鼠标轨迹直接结束于点击；注册流：鼠标先落在姓名输入框，之后才打字。
+    var pointerEnd = isCheckout ? end : (end - 200 - kdSpan - (300 + Math.random() * 300));
+    var pt = pointerEnd - gapSum;
+    var stepDx = (tx - sx0) / steps;
+    var stepDy = (ty - sy0) / steps;
     for (var j = 0; j < steps; j++) {
-      var dx, dy;
-      if (isCheckout) {
-        // 单调向按钮滑动 + 少量抖动，模拟真实手部轨迹。
-        dx = 12 + (Math.random() - 0.5) * 14;
-        dy = 9 + (Math.random() - 0.5) * 12;
-      } else {
-        dx = (Math.random() - 0.5) * 40;
-        dy = (Math.random() - 0.5) * 30;
-      }
-      px += dx; py += dy; pt += 60 + Math.random() * 80;
-      htot += Math.hypot(dx, dy); pcnt++;
+      var prevX = px, prevY = py;
+      var nx = isCheckout
+        ? (px + stepDx + (Math.random() - 0.5) * 14)
+        : (px + stepDx + (Math.random() - 0.5) * 32);
+      var ny = isCheckout
+        ? (py + stepDy + (Math.random() - 0.5) * 12)
+        : (py + stepDy + (Math.random() - 0.5) * 24);
+      px = clamp(nx, 32, _sw - 32);
+      py = clamp(ny, 32, _ah - 32);
+      pt += gaps[j];
+      htot += Math.hypot(px - prevX, py - prevY); pcnt++;
       pm.push({ clientX: Math.round(px), clientY: Math.round(py), type: "pointermove", t: pt });
     }
 
-    // scroll 序列：结账流滚动定价弹窗查看全部套餐（4 次），注册流为 0。
-    var scrollSum = isCheckout ? 1180 : 0;
-    var scrollCount = isCheckout ? 4 : 0;
-    var scrollTop = isCheckout ? 640 : 0;
+    // scroll 序列：结账流滚动定价弹窗查看全部套餐（3~6 次随机），注册流为 0。
+    var scrollCount = isCheckout ? (3 + Math.floor(Math.random() * 4)) : 0;
+    var scrollSum = isCheckout ? Math.round(820 + Math.random() * 680) : 0;
+    var scrollTop = isCheckout ? Math.round(420 + Math.random() * 340) : 0;
     // click 序列：结账流点击「升级」按钮 2 次（打开弹窗 + 确认套餐），注册流为提交按钮。
     var clickCount = 2;
 
@@ -536,12 +670,38 @@
     g.__oai_so_cs2 = g.__oai_so_cs;
     g.__oai_so_cn = clickCount; // click 计数
     g.__oai_so_st = scrollTop;  // scrollTop
-    g.__oai_so_sw = 1440;
+    // 视口宽度必须与 screen.width 同源：写死 1440 会和 1920 的屏幕档案直接矛盾。
+    g.__oai_so_sw = _sw;
     g.__oai_so_sp = 0;
     g.__oai_so_spt = 0;
-    g.__oai_so_sx0 = isCheckout ? 1184 : 640;
-    g.__oai_so_sy0 = isCheckout ? 232 : 360;
+    g.__oai_so_sx0 = sx0;
+    g.__oai_so_sy0 = sy0;
     g.__oai_so_lx = Math.round(px);
     g.__oai_so_ly = Math.round(py);
+
+    // __FLOW_EFFECTIVE 是我们自造的键（真页面没有），不可枚举。
+    concealOwn(g, "__FLOW_EFFECTIVE");
+  })();
+
+  // ---- window 可枚举面收尾 ----
+  // 真 Chrome 的 window 上有一整批事件处理器属性（onbeforeunload/onmousemove/…），
+  // sdk 的 p[12] 正是从 `Object.keys(window)` 里随机取一个上报。补齐这些键，
+  // 让随机命中落回真浏览器也存在的名字上。
+  (function () {
+    var handlers = [
+      "onbeforeunload", "onunload", "onload", "onblur", "onfocus", "onfocusin", "onfocusout",
+      "onchange", "oninput", "onsubmit", "onreset", "onclick", "ondblclick", "onauxclick",
+      "oncontextmenu", "onmousedown", "onmouseup", "onmousemove", "onmouseover", "onmouseout",
+      "onmouseenter", "onmouseleave", "onpointerdown", "onpointerup", "onpointermove",
+      "onpointerover", "onpointerout", "onkeydown", "onkeyup", "onkeypress", "onwheel",
+      "onscroll", "onresize", "onerror", "onmessage", "onhashchange", "onpopstate",
+      "onselect", "ontouchstart", "ontouchend", "ontouchmove", "ondragstart", "ondragend"
+    ];
+    for (var i = 0; i < handlers.length; i++) {
+      if (!(handlers[i] in g)) {
+        try { g[handlers[i]] = null; } catch (e) {}
+      }
+    }
   })();
 })();
+

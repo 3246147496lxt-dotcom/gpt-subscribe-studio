@@ -105,6 +105,16 @@ def test_chatgpt_client_wire_headers_and_single_cookie_after_warmup():
     assert "authorization" not in warmup_map
     assert "origin" not in warmup_map
     assert "content-type" not in warmup_map
+    # 顶层文档导航：真 Chrome 不发 API 专有头，`sec-fetch-site: none` 时不带 Referer。
+    nav_leaks = sorted(k for k in warmup_map if k.startswith("oai-") or k == "chatgpt-account-id")
+    assert nav_leaks == [], f"文档导航混入 API 头: {nav_leaks}"
+    assert "referer" not in warmup_map
+    assert warmup_map["sec-fetch-site"] == "none"
+    assert warmup_map["sec-fetch-user"] == "?1"
+    # curl_cffi/libcurl 不把 `priority` 写到线上（HTTP/2 下由协议层处理），
+    # 这里只校验我们声明的取值，避免把传输层行为当成回归。
+    assert warmup_map.get("priority", "u=0, i") == "u=0, i"
+    assert "text/html" in warmup_map["accept"]
 
     _, _, post_hdrs = captured[1]
     lower_names = [k.lower() for k, _ in post_hdrs]

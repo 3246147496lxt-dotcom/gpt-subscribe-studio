@@ -251,9 +251,13 @@ class PlusHarProtocol:
             merged = dict(self.device.to_dict())
             merged.update({k: v for k, v in profile.items() if k in merged})
             self.device = DeviceProfile.from_dict(merged)
-        # Session 的真实 UA 优先于随机设备档案。
-        if user_agent:
-            self.device = apply_user_agent(self.device, user_agent)
+        # 始终优先对齐同一笔订单 ChatGPTClient 的真实 UA（含重签发生成的 Windows Chrome UA），
+        # 避免建单与支付两阶段在同一个 checkout_session_id / proxy SID 上发生 OS/TLS 分裂。
+        resolved_ua = str(user_agent or "").strip()
+        if not resolved_ua and client is not None:
+            resolved_ua = str(getattr(client, "ua", "") or getattr(client, "user_agent", "") or "").strip()
+        if resolved_ua:
+            self.device = apply_user_agent(self.device, resolved_ua)
 
         from gss_core import runtime_flags
 
@@ -1873,7 +1877,7 @@ def run_har_context(
         confirm_return_url=str(spec.get("confirm_return_url") or ""),
         device=device,
         read_only=read_only,
-        user_agent=str(getattr(client, "user_agent", "") or ""),
+        user_agent=str(getattr(client, "ua", "") or getattr(client, "user_agent", "") or ""),
         device_id=str(getattr(client, "device_id", "") or ""),
         hcaptcha_token=str(context.get("hcaptcha_token") or ""),
         browser_context=browser_context or context.get("browser_context"),

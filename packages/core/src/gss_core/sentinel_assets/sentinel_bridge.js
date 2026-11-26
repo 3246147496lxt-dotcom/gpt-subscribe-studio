@@ -266,22 +266,27 @@ function solvePoW(g, seed, difficulty, captured) {
 }
 
 
-function highEntropyClientHints(ua) {
+function highEntropyClientHints(ua, extra) {
   const m = String(ua || "").match(/(?:Chrome|CriOS)\/(\d+(?:\.\d+)*)/);
   if (!m) return {};
   const build = m[1];
+  // 参考 HAR：/backend-api/sentinel/req 与主站请求一样带全套高熵 Client Hints，
+  // 缺 arch / bitness / platform-version 时同一出口下会出现「主站有、哨兵没有」
+  // 的请求族差异，是最容易被上游按 origin 聚类的指纹。
+  const hints = Object.assign({}, extra || {});
   return {
+    ...hints,
     "sec-ch-ua-full-version": `"${build}"`,
     "sec-ch-ua-full-version-list": `"Google Chrome";v="${build}", "Chromium";v="${build}", "Not(A:Brand";v="24.0.0.0"`,
     "sec-ch-ua-model": '""',
   };
 }
 
-function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOrigin, frameUrl, secChUa, secChUaPlatform, capture) {
+function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOrigin, frameUrl, secChUa, secChUaPlatform, capture, clientHints) {
   // sdk 里的 fetch 桥到 fetchImpl：改写 URL 到 sentinel.openai.com、补头、走代理。
   // 关键：dispatcher 与 fetchImpl 必须来自同一个 undici 版本，否则 Node 内置 fetch
   // 校验外部 dispatcher 的 Request handler 会报 "invalid onRequestStart method"。
-  const extraHints = secChUa ? highEntropyClientHints(ua) : {};
+  const extraHints = secChUa ? highEntropyClientHints(ua, clientHints) : {};
   return function (url, opts) {
     opts = opts || {};
     let u = String(url);
@@ -548,9 +553,22 @@ async function handleRequest(raw) {
   const impersonate = String(args.impersonate || "").trim() || "chrome150";
   const secChUa = String(args.secChUa || "").trim();
   const secChUaPlatform = String(args.secChUaPlatform || "").trim();
+  // 高熵 Client Hints：参考 HAR 上 sec-ch-ua-arch/bitness/platform-version 与主站请求同源。
+  // 调用方没给时按平台给默认值，避免 Windows 档案发出 macOS 的 arm/27.0.1。
+  const platformLabel = args.platformLabel || "Windows";
+  const defaultHints = platformLabel === "macOS"
+    ? { arch: '"arm"', bitness: '"64"', platformVersion: '"14.6.1"' }
+    : platformLabel === "Linux"
+      ? { arch: '"x86"', bitness: '"64"', platformVersion: '""' }
+      : { arch: '"x86"', bitness: '"64"', platformVersion: '"10.0.0"' };
+  const clientHints = {
+    "sec-ch-ua-arch": String(args.secChUaArch || "").trim() || defaultHints.arch,
+    "sec-ch-ua-bitness": String(args.secChUaBitness || "").trim() || defaultHints.bitness,
+    "sec-ch-ua-platform-version":
+      String(args.secChUaPlatformVersion || "").trim() || defaultHints.platformVersion,
+  };
   // 指纹档案驱动（与请求 UA/平台/屏幕一致，避免哨兵身份与请求身份打架）
   const platform = args.platform || "Win32";
-  const platformLabel = args.platformLabel || "Windows";
   const screenW = Number(args.screenW) || 1920;
   const screenH = Number(args.screenH) || 1080;
   const availH = Number(args.availH) || (screenH - 48);
@@ -614,7 +632,8 @@ async function handleRequest(raw) {
       frameUrl,
       secChUa,
       secChUaPlatform,
-      capture
+      capture,
+      clientHints
     ),
     TextEncoder,
     TextDecoder,
@@ -649,7 +668,15 @@ async function handleRequest(raw) {
     return JSON.stringify({ error: "bootstrap: " + ((e && e.stack) || e) });
   }
   try {
-    vm.runInContext(sdkSrc + "\n;globalThis.__SENTINEL_SDK__ = SentinelSDK;", sandbox, { filename: "sentinel_sdk.js" });
+    // 注入键必须不可枚举：sdk 的指纹数组会随机取 `Object.keys(window)` 的一个键上报，
+    // 可枚举的话会把自己桥接层用的 __SENTINEL_SDK__ 暴露成「window 的某个键」。
+    vm.runInContext(
+      sdkSrc +
+        "\n;Object.defineProperty(globalThis,'__SENTINEL_SDK__'," +
+        "{value:SentinelSDK,enumerable:false,writable:true,configurable:true});",
+      sandbox,
+      { filename: "sentinel_sdk.js" }
+    );
   } catch (e) {
     return JSON.stringify({ error: "sdk: " + ((e && e.stack) || e) });
   }

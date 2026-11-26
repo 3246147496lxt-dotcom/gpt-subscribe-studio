@@ -362,15 +362,41 @@ def hosted_checkout_url(url: str = "", session_id: str = "") -> str:
     return value
 
 
-# 浏览器抓包里 payments/checkout 与 checkout/confirm 请求都带这组前端标识。
-# 真实 HAR 里 payments/* 上不存在 `x-oai-mcp-form-version` 与
-# `x-openai-target-path/route`，多发自定义头本身就是指纹偏差。
-_CODEX_WEB_HEADERS = {
-    "originator": "Codex Browser",
-    "x-openai-web-frontend": "codex_webview",
-    "x-openai-codex-window-type": "browser",
+# 参考 HAR 的 payments/* 请求里带一批前端标识。其中三项是 macOS Codex WebView
+# 特有的客户端身份（originator: Codex Browser / x-openai-web-frontend: codex_webview /
+# x-openai-codex-window-type: browser）：本客户端伪装的是 Windows Chrome 的 ChatGPT Web，
+# 混发这组头会让同一条会话在服务端同时呈现「Windows Chrome Web」与「macOS Codex
+# WebView」两种客户端身份，是最容易被按 origin 聚类的矛盾。
+# 因此只保留与客户端身份无关、且在 Web 侧同样存在的两项。
+_WEB_CHECKOUT_HEADERS = {
     "x-openai-checkout-source": "chatgpt_web_merged",
     "x-openai-rate-limit-join-workspace": "1",
+}
+
+# 顶层文档导航（GET /）上真 Chrome 不会发送的 API 专有头。
+# 旧实现把 _identity_headers() 直接复用到文档导航上，于是 oai-did / oai-device-id /
+# oai-language / oai-session-id / oai-client-version / chatgpt-account-id 出现在
+# `sec-fetch-dest: document` 的请求里，同时 `sec-fetch-site: none` 还带着 Referer
+# —— 真浏览器在没有 initiator 的导航里绝不带 Referer。
+_DOC_NAV_OMIT_HEADERS = (
+    "authorization",
+    "origin",
+    "content-type",
+    "oai-did",
+    "oai-device-id",
+    "oai-language",
+    "oai-session-id",
+    "oai-client-version",
+    "oai-client-build-number",
+    "chatgpt-account-id",
+    "priority",
+    "referer",
+)
+
+_PLATFORM_CH_DEFAULTS = {
+    "macOS": ('"arm"', '"64"', '"14.6.1"'),
+    "Windows": ('"x86"', '"64"', '"10.0.0"'),
+    "Linux": ('"x86"', '"64"', '""'),
 }
 
 
@@ -817,9 +843,14 @@ class ChatGPTClient:
     @property
     def sentinel_profile(self) -> dict:
         p = self.profile
+        hints = p.get("hints") or {}
         profile = {"platform": p["platform"], "platform_label": p["label"],
                    "screen_w": p["screen"][0], "screen_h": p["screen"][1],
-                   "avail_h": p["screen"][2], "cores": 8}
+                   "avail_h": p["screen"][2], "cores": 8,
+                   # 与主站请求同一份高熵 Client Hints，避免哨兵请求缺 arch/bitness/版本
+                   "sec_ch_ua_arch": str(hints.get("sec-ch-ua-arch") or ""),
+                   "sec_ch_ua_bitness": str(hints.get("sec-ch-ua-bitness") or ""),
+                   "sec_ch_ua_platform_version": str(hints.get("sec-ch-ua-platform-version") or "")}
         context = self.browser_context
         if context is not None:
             platform = str(getattr(context, "sec_ch_ua_platform", "") or "").strip('"')
@@ -827,6 +858,11 @@ class ChatGPTClient:
                        "Linux": ("Linux x86_64", "Linux")}
             if platform in mapping:
                 profile["platform"], profile["platform_label"] = mapping[platform]
+                ctx_headers = {k.lower(): str(v) for k, v in (context.headers() or {}).items()}
+                def_arch, def_bits, def_ver = _PLATFORM_CH_DEFAULTS.get(platform, ('"x86"', '"64"', '"10.0.0"'))
+                profile["sec_ch_ua_arch"] = ctx_headers.get("sec-ch-ua-arch") or def_arch
+                profile["sec_ch_ua_bitness"] = ctx_headers.get("sec-ch-ua-bitness") or def_bits
+                profile["sec_ch_ua_platform_version"] = ctx_headers.get("sec-ch-ua-platform-version") or def_ver
             width = int(getattr(context, "viewport_width", 0) or 0)
             height = int(getattr(context, "viewport_height", 0) or 0)
             if width >= 800:
@@ -856,6 +892,56 @@ class ChatGPTClient:
         # Anonymous browser attestations are not credentials for this session.
         if self._http is not None:
             self._http.headers.update(self._identity_headers())
+
+    def _document_nav_headers(self) -> Dict[str, str]:
+        """顶层文档导航（`GET /`）的头集合：真 Chrome 的冷导航形状。
+
+        与 `_identity_headers()`（API 请求）刻意分开：导航请求不携带 Authorization /
+        Origin / oai-* / chatgpt-account-id，`sec-fetch-site: none` 时不带 Referer。
+        把 API 头混进文档导航，等于在同一条会话上同时宣告「脚本 API 调用」与
+        「用户在地址栏输入 URL」两种互斥的发起方式。
+        """
+        build = self.chrome_build
+        headers: Dict[str, str] = {
+            "User-Agent": self.ua,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+                "image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+            ),
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": _accept_language(self.language),
+            "priority": "u=0, i",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+            "sec-ch-ua": self.sec_ch_ua,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-full-version": f'"{build}"',
+            "sec-ch-ua-full-version-list": (
+                f'"Google Chrome";v="{build}", "Chromium";v="{build}", '
+                f'"Not(A:Brand";v="24.0.0.0"'
+            ),
+            "sec-ch-ua-model": '""',
+            **self.profile["hints"],
+            "Cookie": self._cookie_header(),
+        }
+        if not headers.get("Cookie"):
+            headers.pop("Cookie", None)
+        if self.browser_context is not None:
+            omit_lower = set(_DOC_NAV_OMIT_HEADERS)
+            context_headers = {
+                k: v for k, v in (self.browser_context.headers() or {}).items()
+                if k.lower() not in omit_lower and not k.lower().startswith("oai-")
+            }
+            headers.update(context_headers)
+        # 防御：任何 oai-* / Referer / Authorization / Origin / Content-Type 键都不该出现在冷导航上。
+        omit_final = {"referer", "authorization", "origin", "content-type", "chatgpt-account-id"}
+        return {
+            k: v for k, v in headers.items()
+            if k.lower() not in omit_final and not k.lower().startswith("oai-")
+        }
 
     def _identity_headers(self) -> Dict[str, str]:
         build = self.chrome_build
@@ -910,7 +996,7 @@ class ChatGPTClient:
             headers["x-openai-target-path"] = route
             headers["x-openai-target-route"] = route
         if route.startswith("/backend-api/payments/"):
-            headers.update(_CODEX_WEB_HEADERS)
+            headers.update(_WEB_CHECKOUT_HEADERS)
         if route == "/backend-api/payments/checkout":
             headers["oai-telemetry"] = "[1,null]"
         if route.startswith("/backend-api/payments/") and self.attestation:
@@ -1022,14 +1108,22 @@ class ChatGPTClient:
         if not self.session_token:
             return False
         # NextAuth /api/auth/session 仅凭 sessionToken Cookie 鉴权；
-        # 绝不携带旧/可能已被吊销的 Authorization Bearer，也不在 GET 请求上发送 Origin/Content-Type。
+        # 绝不携带旧/可能已被吊销的 Authorization Bearer，也不在 GET 请求上发送
+        # Origin / Content-Type / chatgpt-account-id / oai-* / x-openai-target-*。
         http_headers = getattr(self.http, "headers", None)
         prior_auth: list[tuple[str, Any]] = []
+        auth_omit_lower = {
+            "authorization", "origin", "content-type", "chatgpt-account-id",
+            "oai-did", "oai-device-id", "oai-language", "oai-session-id",
+            "oai-client-version", "oai-client-build-number",
+        }
         if http_headers is not None and hasattr(http_headers, "pop"):
-            for auth_key in ("Authorization", "authorization", "Origin", "origin", "Content-Type", "content-type"):
-                old_val = http_headers.pop(auth_key, None)
-                if old_val is not None:
-                    prior_auth.append((auth_key, old_val))
+            for existing_key in list(http_headers.keys()):
+                low_key = str(existing_key).lower()
+                if low_key in auth_omit_lower or low_key.startswith("oai-"):
+                    old_val = http_headers.pop(existing_key, None)
+                    if old_val is not None:
+                        prior_auth.append((existing_key, old_val))
 
         def _restore_auth() -> None:
             if http_headers is not None and prior_auth:
@@ -1043,7 +1137,7 @@ class ChatGPTClient:
             previous_names = self._app_cookie_names()
             response = self.http.get(
                 f"{APP_BASE}/api/auth/session",
-                headers=self._route_headers("/api/auth/session"),
+                headers={"Referer": f"{APP_BASE}/"},
                 timeout=self.timeout,
             )
         except Exception as exc:
@@ -1176,31 +1270,27 @@ class ChatGPTClient:
         raise_on_transport_error: bool = False,
     ) -> None:
         url = page_url or f"{APP_BASE}/"
-        headers = self._identity_headers()
+        headers = self._document_nav_headers()
         if anonymous:
-            headers["Cookie"] = self._cookie_header(include_session_token=False)
-        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        headers["Referer"] = url
-        headers["sec-fetch-site"] = "none"
-        headers["sec-fetch-dest"] = "document"
-        headers["sec-fetch-mode"] = "navigate"
-        headers["sec-fetch-user"] = "?1"
-        headers["upgrade-insecure-requests"] = "1"
-        headers.pop("Content-Type", None)
-        headers.pop("Origin", None)
-        headers.pop("Authorization", None)
+            anon_cookie = self._cookie_header(include_session_token=False)
+            if anon_cookie:
+                headers["Cookie"] = anon_cookie
+            else:
+                headers.pop("Cookie", None)
         # curl_cffi merges per-request headers onto session.headers, so omit-only
         # keys must be temporarily popped from session.headers during document GET.
         http_headers = getattr(self.http, "headers", None)
         saved_headers: list[tuple[str, Any]] = []
-        pop_keys: tuple[str, ...] = ("Authorization", "authorization", "Origin", "origin", "Content-Type", "content-type")
+        omit_lower = set(_DOC_NAV_OMIT_HEADERS)
         if anonymous:
-            pop_keys = pop_keys + ("Cookie", "cookie")
+            omit_lower.add("cookie")
         if http_headers is not None and hasattr(http_headers, "pop"):
-            for key in pop_keys:
-                old = http_headers.pop(key, None)
-                if old is not None:
-                    saved_headers.append((key, old))
+            for key in list(http_headers.keys()):
+                low_key = str(key).lower()
+                if low_key in omit_lower or low_key.startswith("oai-"):
+                    old = http_headers.pop(key, None)
+                    if old is not None:
+                        saved_headers.append((key, old))
         try:
             home = self.http.get(url, headers=headers, timeout=self.timeout)
         except Exception as exc:
@@ -1373,7 +1463,11 @@ class ChatGPTClient:
             timeout_s=max(5.0, min(self.timeout, float(os.environ.get("GSS_SENTINEL_TIMEOUT", "15") or 15), 90.0)),
             impersonate=self.impersonate,
             sec_ch_ua=self.sec_ch_ua,
-            sec_ch_ua_platform=str(self.profile.get("hints", {}).get("sec-ch-ua-platform") or ""),
+            sec_ch_ua_platform=str(
+                getattr(self.browser_context, "sec_ch_ua_platform", "")
+                or self.profile.get("hints", {}).get("sec-ch-ua-platform")
+                or ""
+            ),
             version=self.sentinel_version,
             **self.sentinel_profile,
         )

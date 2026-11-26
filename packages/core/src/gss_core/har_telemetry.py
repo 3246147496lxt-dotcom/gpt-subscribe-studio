@@ -530,6 +530,8 @@ def sentinel_ping(http: Any, device: DeviceProfile, *, timeout: float = 10.0) ->
         "cache-control": "no-cache",
         "pragma": "no-cache",
     }
+    headers.pop("x-openai-checkout-source", None)
+    headers.pop("x-openai-rate-limit-join-workspace", None)
     try:
         http.post(SENTINEL_PING, content=b"", headers=headers, timeout=timeout)
     except Exception:  # noqa: BLE001

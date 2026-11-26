@@ -379,12 +379,15 @@ class DeviceProfile:
         return value
 
     def web_headers(self, *, referer: str) -> Dict[str, str]:
-        """Headers the capture sends to chatgpt.com (order irrelevant)."""
+        """Headers the capture sends to chatgpt.com (order irrelevant).
+
+        不混发 macOS Codex WebView 专有头（originator / x-openai-web-frontend /
+        x-openai-codex-window-type），与 ChatGPTClient 保持同一套 Web 客户端身份。
+        """
         return {
             "accept": "*/*",
             "accept-language": self.accept_language(),
             "origin": "https://chatgpt.com",
-            "originator": "Codex Browser",
             "priority": "u=1, i",
             "referer": referer,
             **self.client_hint_headers(),
@@ -393,9 +396,7 @@ class DeviceProfile:
             "sec-fetch-site": "same-origin",
             "user-agent": self.ua,
             "x-openai-checkout-source": "chatgpt_web_merged",
-            "x-openai-codex-window-type": "browser",
             "x-openai-rate-limit-join-workspace": "1",
-            "x-openai-web-frontend": "codex_webview",
         }
 
     def stripe_headers(self) -> Dict[str, str]:
