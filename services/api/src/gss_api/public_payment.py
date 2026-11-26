@@ -67,3 +67,58 @@ def saved_view(data):
         public["card"] = {k: card[k] for k, pattern in (("brand", r"[A-Za-z][A-Za-z -]{0,31}"), ("last4", r"[0-9]{4}"))
                           if isinstance(card.get(k), str) and re.fullmatch(pattern, card[k])}
     return public
+
+
+_BRAND_ALIASES = {
+    "visa": "VISA",
+    "mastercard": "Mastercard",
+    "master card": "Mastercard",
+    "mc": "Mastercard",
+    "amex": "Amex",
+    "american express": "Amex",
+    "discover": "Discover",
+    "jcb": "JCB",
+    "unionpay": "UnionPay",
+    "diners": "Diners",
+    "diners club": "Diners",
+    "cartes_bancaires": "Cartes Bancaires",
+    "eftpos_au": "Eftpos",
+}
+
+
+def normalize_card_brand(brand: object) -> str | None:
+    if not isinstance(brand, str):
+        return None
+    cleaned = brand.strip()
+    if not cleaned:
+        return None
+    mapped = _BRAND_ALIASES.get(cleaned.lower())
+    if mapped:
+        return mapped
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9 _-]{0,23}", cleaned):
+        return cleaned
+    return None
+
+
+def detect_card_brand(card_number: object) -> str | None:
+    """Derive only the non-secret card network brand from a card number prefix."""
+    if not isinstance(card_number, str):
+        return None
+    digits = re.sub(r"\D", "", card_number)
+    if len(digits) < 4:
+        return None
+    if digits.startswith("4"):
+        return "VISA"
+    if re.match(r"^(?:5[1-5]|222[1-9]|22[3-9]\d|2[3-6]\d{2}|27[01]\d|2720)", digits):
+        return "Mastercard"
+    if digits.startswith(("34", "37")):
+        return "Amex"
+    if digits.startswith("62"):
+        return "UnionPay"
+    if re.match(r"^(?:6011|65|64[4-9])", digits):
+        return "Discover"
+    if re.match(r"^35(?:2[89]|[3-8]\d)", digits):
+        return "JCB"
+    if re.match(r"^(?:36|38|30[0-5])", digits):
+        return "Diners"
+    return None

@@ -36,7 +36,7 @@ def flow(monkeypatch, verified_payer):
     state = {"calls": [], "violations": [], "account": "account_fixture", "minor": 1363,
              "page_status": "open", "payment_status": "unpaid", "pi_status": "requires_confirmation",
              "after_confirm": "succeeded", "active": True, "closed": 0, "created": 0}
-    body = {"card": {"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2040"},
+    body = {"card": {"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2040"},  # release-check: ignore
             "billing": {"name": "Fixture Holder", "email": "fixture@example.test", "line1": "Fixture Street",
                         "city": "Portland", "state": "OR", "postal_code": "97211", "country": "JP"},
             "expected_amount": "1363", "expected_currency": "JPY"}

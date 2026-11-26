@@ -53,13 +53,14 @@ export const FAILURE_LABEL: Record<string, string> = {
 };
 
 export const TIMING_LABEL: Record<string, string> = {
-  queue_ms: "排队",
+  queue_ms: "排队等待",
   preflight_ms: "前置体检",
-  create_order_ms: "建单",
-  reissue_ms: "重签发",
+  create_order_ms: "建单总计",
+  reissue_ms: "会话重签",
   browser_decode_ms: "浏览器解码",
-  create_checkout_ms: "创建结账单",
-  payment_ms: "支付确认",
+  create_checkout_ms: "建单耗时",
+  payment_ms: "支付耗时",
+  cancel_renew_ms: "关闭续费",
   total_ms: "总耗时",
 };
 

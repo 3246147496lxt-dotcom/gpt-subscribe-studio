@@ -201,7 +201,7 @@ ctoken / confirm / intent confirm 三个 body 的字段、拒卡映射、只读�
 ```bash
 GSS_SESSION_FILE=~/session.txt \
 GSS_CHECKOUT_URL='https://chatgpt.com/checkout/openai_llc/oaics_...' \
-GSS_CARD='{"number":"4242424242424242","exp_month":"12","exp_year":"2030","cvc":"123"}' \
+GSS_CARD='{"number":"<stripe-test-card-number>","exp_month":"12","exp_year":"2030","cvc":"123"}' \
 GSS_BILLING='{"name":"Fixture Holder","email":"a@b.c","line1":"1 Main St","city":"Portland","state":"OR","postal_code":"97211","country":"US"}' \
 .venv/bin/python scripts/plus_har_run.py
 ```

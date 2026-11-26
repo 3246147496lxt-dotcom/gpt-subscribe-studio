@@ -95,19 +95,169 @@ def test_normalize_maps_upstream_fields_to_display_values():
 def test_normalize_empty_account_is_not_subscribed():
     detail = normalize({}, email="free@example.test", account_id="acc-free")
     assert detail["status"] == "未订阅"
-    assert detail["planName"] == "未知套餐"
+    assert detail["planName"] == "免费套餐"
+    assert detail["autoRenew"] == "不适用"
+    assert detail["startTime"] is None
+    assert detail["endTime"] is None
     assert detail["invoices"] == []
     assert detail["remainingDays"] is None
 
 
-def test_normalize_expired_plan_is_marked_expired():
+def test_normalize_expired_plan_normalizes_to_free_while_keeping_history():
+    now = datetime(2026, 11, 26, 0, 0, tzinfo=timezone.utc)
     merged = {
-        "accounts": {"accounts": {"default": {"account": {"plan_type": "plus"}}}},
-        "subscriptions": {"plan_type": "chatgptplusplan", "is_active": False,
-                          "current_period_end": "2026-11-01T00:00:00Z"},
+        "accounts": {"accounts": {"default": {"account": {"plan_type": "free"}}}},
+        "subscriptions": {
+            "plan_type": "chatgptpro",
+            "is_active": False,
+            "is_processor_stripe": True,
+            "current_period_end": "2026-10-21T15:43:00Z",
+            "last_active_subscription": {
+                "subscription_plan": "chatgptpro",
+                "purchase_origin_platform": "chatgpt_web",
+                "will_renew": False,
+            },
+        },
+        "portal_invoices": [{
+            "id": "in_pro_upgrade",
+            "paid_at": int(datetime(2026, 9, 21, 9, 43, tzinfo=timezone.utc).timestamp()),
+            "amount_paid": 793759,
+            "amount_unit": "minor",
+            "currency": "PHP",
+            "status": "paid",
+            "description": "ChatGPT Pro",
+        }],
     }
+    detail = normalize(merged, email="e@example.test", account_id="a", now=now)
+    assert detail["status"] == "未订阅"
+    assert detail["planName"] == "免费套餐"
+    assert detail["startTime"] is None
+    assert detail["endTime"] is None
+    assert detail["remainingDays"] is None
+    assert detail["autoRenew"] == "不适用"
+    assert detail["paymentChannel"] == "网页支付"
+    assert detail["currency"] == "PHP"
+    assert len(detail["invoices"]) == 1
+    assert detail["invoices"][0]["plan"] == "ChatGPT Pro"
+    assert detail["invoices"][0]["amount"] == "7937.59 PHP"
+
+
+def test_expired_stripe_account_still_triggers_portal_invoice_fetch():
+    merged = {
+        "accounts": {"accounts": {"default": {"account": {"plan_type": "free"}}}},
+        "subscriptions": {
+            "plan_type": "free",
+            "is_active": False,
+            "is_processor_stripe": True,
+            "last_active_subscription": {
+                "subscription_plan": "chatgptpro",
+                "purchase_origin_platform": "chatgpt_web",
+            },
+        },
+        "_portal_meta": {"attempted": False, "stage": "deferred", "has_portal": True},
+    }
+    assert account_detail._should_fetch_portal_invoices(merged) is True
     detail = normalize(merged, email="e@example.test", account_id="a")
-    assert detail["status"] == "已过期"
+    assert detail["status"] == "未订阅"
+    assert detail["billingSource"] == "loading"
+
+
+def test_proration_upgrade_invoice_picks_positive_target_plan_not_unused_credit():
+    from gss_api.stripe_portal_invoices import _invoice_list_has_more, extract_invoices_from_json
+
+    payload = {
+        "invoices": {
+            "object": "list",
+            "has_more": True,
+            "data": [
+                {
+                    "id": "in_upgrade_001",
+                    "object": "invoice",
+                    "amount_paid": 793759,
+                    "currency": "php",
+                    "status": "paid",
+                    "description": "Subscription update",
+                    "created": 1789983780,
+                    "lines": {
+                        "data": [
+                            {
+                                "amount": -98214,
+                                "proration": True,
+                                "description": "Unused time on ChatGPT Plus after 21 Sep 2026",
+                                "price": {"product": {"name": "ChatGPT Plus"}},
+                            },
+                            {
+                                "amount": 891964,
+                                "proration": True,
+                                "description": "Remaining time on ChatGPT Pro after 21 Sep 2026",
+                                "price": {"product": {"name": "ChatGPT Pro"}},
+                            },
+                        ]
+                    },
+                }
+            ],
+        }
+    }
+    rows = extract_invoices_from_json(payload)
+    assert len(rows) == 1
+    assert rows[0]["description"] == "ChatGPT Pro"
+    assert _invoice_list_has_more(payload) is True
+
+    detail = normalize({"portal_invoices": rows}, email="e@example.test", account_id="a")
+    assert detail["invoices"][0]["plan"] == "ChatGPT Pro"
+    assert detail["invoices"][0]["amount"] == "7937.59 PHP"
+
+
+def test_void_invoice_uses_total_and_pro_lite_lookup_key_distinguishes_tier():
+    from gss_api.stripe_portal_invoices import extract_invoices_from_json
+
+    payload = {
+        "invoices": {
+            "object": "list",
+            "has_more": False,
+            "data": [
+                {
+                    "id": "in_void_001",
+                    "object": "invoice",
+                    "amount_paid": 0,
+                    "total": 891964,
+                    "currency": "php",
+                    "status": "void",
+                    "created": 1793011260,
+                    "lines": {"data": [{"amount": 891964, "description": "1 × ChatGPT Pro"}]},
+                },
+                {
+                    "id": "in_prolite_001",
+                    "object": "invoice",
+                    "amount_paid": 579464,
+                    "total": 579464,
+                    "currency": "php",
+                    "status": "paid",
+                    "created": 1786006740,
+                    "lines": {
+                        "data": [
+                            {
+                                "amount": 579464,
+                                "description": "1 × ChatGPT Pro",
+                                "price": {
+                                    "lookup_key": "chatgptprolite_php_monthly",
+                                    "product": {"name": "ChatGPT Pro"},
+                                },
+                            }
+                        ]
+                    },
+                },
+            ],
+        }
+    }
+    rows = extract_invoices_from_json(payload)
+    detail = normalize({"portal_invoices": rows}, email="e@example.test", account_id="a")
+    assert detail["invoices"][0]["status"] == "已作废"
+    assert detail["invoices"][0]["amount"] == "8919.64 PHP"
+    assert detail["invoices"][0]["plan"] == "ChatGPT Pro"
+    assert detail["invoices"][1]["status"] == "已支付"
+    assert detail["invoices"][1]["amount"] == "5794.64 PHP"
+    assert detail["invoices"][1]["plan"] == "ChatGPT Pro Lite"
 
 
 @pytest.fixture
@@ -283,11 +433,98 @@ def test_endpoints_are_queried_serially_on_one_client(monkeypatch):
     assert http.paths == [
         "/backend-api/accounts/check/v4-2023-04-27",
         "/backend-api/subscriptions",
+        "/backend-api/payments/transaction-history",
         "/backend-api/payments/invoices",
         "/backend-api/payments/billing_history",
         "/backend-api/payments/receipts",
         "/backend-api/payments/transactions",
     ]
+
+
+def test_transaction_history_returns_void_invoices_and_pro_lite_without_stripe_portal(monkeypatch):
+    import asyncio
+
+    http = FakeHttp({
+        "/backend-api/accounts/check/v4-2023-04-27": [
+            FakeResponse(200, {"accounts": {"default": {"account": {"account_id": "acc-tx", "plan_type": "free"}}}})
+        ],
+        "/backend-api/subscriptions": [
+            FakeResponse(200, {
+                "plan_type": "chatgptpro",
+                "is_active": False,
+                "is_processor_stripe": True,
+                "last_active_subscription": {
+                    "purchase_origin_platform": "chatgpt_web",
+                    "subscription_id": "sub_tx_1",
+                    "will_renew": False,
+                },
+            })
+        ],
+        "/backend-api/payments/transaction-history": [
+            FakeResponse(200, {
+                "transactions": [
+                    {
+                        "type": "invoice",
+                        "id": "in_void_5",
+                        "created_at": "2026-10-26T10:41:52Z",
+                        "amount": 891964,
+                        "currency": "php",
+                        "status": "void",
+                        "invoice_url": "https://invoice.stripe.com/i/acct_1/in_void_5",
+                        "product": {"type": "subscription", "plan": "chatgptpro"},
+                    },
+                    {
+                        "type": "invoice",
+                        "id": "in_paid_4",
+                        "created_at": "2026-09-26T10:41:20Z",
+                        "amount": 891964,
+                        "currency": "php",
+                        "status": "paid",
+                        "invoice_url": "https://invoice.stripe.com/i/acct_1/in_paid_4",
+                        "product": {"type": "subscription", "plan": "chatgptpro"},
+                    },
+                    {
+                        "type": "invoice",
+                        "id": "in_paid_1",
+                        "created_at": "2026-08-06T04:59:37Z",
+                        "amount": 579464,
+                        "currency": "php",
+                        "status": "paid",
+                        "invoice_url": "https://invoice.stripe.com/i/acct_1/in_paid_1",
+                        "product": {"type": "subscription", "plan": "chatgptprolite"},
+                    },
+                ],
+                "next_cursor": None,
+            })
+        ],
+    })
+    _install_client(monkeypatch, http)
+
+    merged = asyncio.run(account_detail.fetch_snapshot("s", "t", account_id="acc-tx", country=""))
+    # Short-circuits legacy 404 probes and never invokes Stripe customer portal.
+    assert http.paths == [
+        "/backend-api/accounts/check/v4-2023-04-27",
+        "/backend-api/subscriptions",
+        "/backend-api/payments/transaction-history",
+    ]
+    detail = normalize(merged, email="tx@example.test", account_id="acc-tx")
+    assert detail["status"] == "未订阅"
+    assert detail["planName"] == "免费套餐"
+    assert detail["autoRenew"] == "不适用"
+    assert detail["currency"] == "PHP"
+    assert detail["billingSource"] == "upstream_api"
+    assert len(detail["invoices"]) == 3
+    assert detail["invoices"][0] == {
+        "plan": "ChatGPT Pro",
+        "paidAt": "2026/10/26 18:41",
+        "status": "已作废",
+        "amount": "8919.64 PHP",
+        "invoiceId": "in_void_5",
+        "invoiceUrl": "https://invoice.stripe.com/i/acct_1/in_void_5",
+    }
+    assert detail["invoices"][2]["plan"] == "ChatGPT Pro Lite"
+    assert detail["invoices"][2]["amount"] == "5794.64 PHP"
+    assert detail["invoices"][2]["paidAt"] == "2026/08/06 12:59"
 
 
 def test_401_exchanges_the_session_cookie_and_retries_once(monkeypatch):

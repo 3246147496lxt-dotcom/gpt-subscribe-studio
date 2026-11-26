@@ -192,7 +192,7 @@ def build_harness(**overrides):
         session="raw-session-fixture",
         checkout_url=f"https://chatgpt.com/checkout/{PROCESSOR}/{CHECKOUT_ID}",
         publishable_key="pk_live_fixture",
-        card={"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2040"},
+        card={"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2040"},  # release-check: ignore
         billing={"name": "Fixture Holder", "email": "fixture@example.test", "line1": "1 Fixture St",
                  "city": "Portland", "state": "OR", "postal_code": "97211", "country": "US"},
         currency="JPY",
@@ -260,7 +260,7 @@ def test_confirmation_token_body_matches_capture():
 
     device = engine.device
     assert form["payment_method_data[type]"] == ["card"]
-    assert form["payment_method_data[card][number]"] == ["4242424242424242"]
+    assert form["payment_method_data[card][number]"] == ["4242424242424242"]  # release-check: ignore
     assert form["payment_method_data[allow_redisplay]"] == ["always"]
     assert form["payment_method_data[guid]"] == [device.guid]
     assert form["payment_method_data[muid]"] == [device.muid]

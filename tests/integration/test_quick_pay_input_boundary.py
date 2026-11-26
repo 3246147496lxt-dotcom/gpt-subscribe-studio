@@ -76,6 +76,19 @@ def test_team_order_validation_does_not_echo_input(api):
     assert SESSION not in response.text
 
 
+@pytest.mark.parametrize("path", [
+    "/api/account/subscription-detail",
+    "/api/account/stripe-portal",
+    "/api/promo/eligibility",
+])
+def test_admin_session_endpoints_do_not_echo_malformed_session(path, api):
+    client, _, _ = api
+    response = client.post(path, json={"session": {"secret": SESSION}})
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "INVALID_ORDER_INPUT"
+    assert SESSION not in response.text
+
+
 def test_conditional_schema_and_validation_errors_do_not_print_secrets():
     schema = QuickPayRequest.model_json_schema()
     assert schema["then"]["not"]["required"] == ["card"]

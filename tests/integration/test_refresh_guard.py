@@ -152,7 +152,11 @@ def test_order_reissue_401_exports_only_safe_response_fields(monkeypatch, caplog
         "upstream_status": 401, "upstream_code": "token_revoked", "cf_ray": ray, "request_id": rid,
         "upstream_code_state": "accepted", "request_id_state": "accepted",
     }
-    transport.get.assert_called_once()
+    # 冷启动先做首页边缘握手（GET / 取 __cf_bm / _cfuvid），再打 /api/auth/session。
+    urls = [call.args[0] for call in transport.get.call_args_list]
+    assert urls[0] == "https://chatgpt.com/"
+    assert urls[-1].endswith("/api/auth/session")
+    assert transport.get.call_count <= 2
     transport.close.assert_called_once()
     assert stages == ["session_refresh" if original_country == "US" else "reissuing"]
     assert secret not in result.text + caplog.text

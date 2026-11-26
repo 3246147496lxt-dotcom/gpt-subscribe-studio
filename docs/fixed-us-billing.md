@@ -49,14 +49,34 @@ export GSS_FIXED_BILLING_FILE="$HOME/.gss/fixed-billing.json"
 非 Team 的 `billing_country` 只是兼容旧客户端的提示：即使传了别的国家，服务端也以
 固定资料为准。要更换账单，只能更换管理员配置文件，不能用请求参数改。
 
-`billing_details` 的实测形态（网页端 HAR）：
+建单请求里 `billing_details` 的实测形态（网页端 HAR，出口 JP）：
 
 ```json
-{"billing_details": {"country": "US", "currency": "JPY"}}
+{"billing_details": {"country": "JP", "currency": "JPY"}}
 ```
 
-即账单国固定 US、币种随出口。税费接口、确认接口、payment method 的 billing
-details 都使用同一份美国地址。
+也就是说**建单那一步上报的是「当前选中地区」= 出口国 + 出口币种**，
+固定美国免税地址不在这一步出现；紧接着的
+`POST /backend-api/payments/checkout/taxes` 才带上真正的美国免税账单：
+
+```json
+{"billing_country": "US",
+ "billing_address": {"line1": "…", "city": "…", "state": "OR", "country": "US", "postal_code": "…"},
+ "currency": "jpy"}
+```
+
+口径分工：
+
+| 阶段 | 上报的国家 | 说明 |
+| --- | --- | --- |
+| `POST /payments/checkout` | 出口国（如 `JP` / `PH`） | 网页端选择地区的回显，不是账单变更 |
+| `POST /payments/checkout/taxes` | 固定 `US` + 免税州地址 | 零税重算，账单核验链看这里 |
+| `POST /payments/checkout/confirm` | 不含国家 | 只提交 `checkout_session_id` / `confirm_token` |
+| Stripe `payment_method_data[billing_details][address][country]` | 固定 `US` | 与固定资料完全一致 |
+
+因此「建单 `billing_details.country` 必须等于 US」是错误写法：它应该等于出口国，
+否则请求本身就与真实浏览器行为不符。`verified_payer` 的
+`alternate_countries=(exit_country,)` 已原生接受这种出口回显。
 
 ## 3. 严格模式（可选）
 

@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import math
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -19,7 +20,14 @@ from urllib.parse import urlsplit
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.chatgpt import ACCOUNTS_CHECK_PATH, APP_BASE, ChatGPTClient, _json
 from gss_core.config import ORDER_HTTP_TIMEOUT_S
-from gss_core.proxies import align_proxy_region, configured_proxy
+from gss_core.countries import locale_for, timezone_for
+from gss_core.proxies import (
+    align_proxy_region,
+    configured_proxy,
+    cooling_sids,
+    fresh_proxy_sid,
+    rewrite_proxy_exit,
+)
 from gss_core.redaction import redact_sensitive
 from gss_core.session_token import parse_session_bundle
 
@@ -29,8 +37,9 @@ logger = logging.getLogger("gss.account_detail")
 
 BEIJING = timezone(timedelta(hours=8))
 # Bump when the normalized shape changes; old cache rows are ignored.
-CACHE_VERSION = 7
+CACHE_VERSION = 9
 SUBSCRIPTIONS_PATH = "/backend-api/subscriptions"
+TRANSACTION_HISTORY_PATH = "/backend-api/payments/transaction-history"
 INVOICES_PATH = "/backend-api/payments/invoices"
 BILLING_HISTORY_PATH = "/backend-api/payments/billing_history"
 RECEIPTS_PATH = "/backend-api/payments/receipts"
@@ -64,6 +73,7 @@ _INVOICE_STATUS = {
     "pending": "待支付",
     "void": "已作废",
     "voided": "已作废",
+    "uncollectible": "无法扣款",
     "refunded": "已退款",
     "failed": "支付失败",
 }
@@ -289,9 +299,55 @@ def _request(client: ChatGPTClient, path: str, params: Optional[dict]):
     return payload, status, response
 
 
+def _detail_read_proxy(country: str) -> Optional[str]:
+    """查详情时用一条与充值出口不强相关的会话 SID。
+
+    查订阅/账单详情若直接复用刚被建单绑定的那条出口 SID，等于把「读详情」
+    和「充值」压在同一身份上；换个 SID 可以避免前序查询给后续建单连带风控。
+    ``GSS_ACCOUNT_DETAIL_SID_ISOLATION=0`` 可关闭。
+    """
+    proxy = configured_proxy("checkout")
+    if not proxy:
+        return None
+    if country:
+        proxy = align_proxy_region(proxy, country)
+    if os.environ.get("GSS_ACCOUNT_DETAIL_SID_ISOLATION", "1").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return proxy
+    try:
+        return rewrite_proxy_exit(proxy, sid=fresh_proxy_sid(exclude=cooling_sids()))
+    except Exception:  # noqa: BLE001
+        return proxy
+
+
+def _detail_read_client(session: str, proxy: Optional[str], *,
+                        timeout: Optional[float] = None,
+                        country: str = "") -> ChatGPTClient:
+    """只读客户端：沿用 Session 自带的 device_id / UA 与地区语言。
+
+    每次随机新 device_id + 随机 OS 会在建单前制造「同账号多台设备短时间跳变」
+    的高危信号，还可能把用户原 AT 顶掉。只在 Session 缺字段时回退伪造档案。
+    """
+    bundle = parse_session_bundle(session)
+    client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
+    if bundle.device_id:
+        client.device_id = bundle.device_id
+        client.extra_cookies["oai-did"] = bundle.device_id
+    if bundle.user_agent:
+        client.user_agent = bundle.user_agent
+    effective_country = str(country or bundle.country or "").strip().upper()
+    if effective_country:
+        client.language = locale_for(effective_country)
+        client.timezone = timezone_for(effective_country)
+    if timeout is not None:
+        client.timeout = timeout
+    return client
+
+
 def _fetch_serial(session: str, access_token: str, calls, *,
                   account_id: str = "", proxy: Optional[str], timeout: float,
-                  include_invoices: bool = True) -> Dict[str, Any]:
+                  include_invoices: bool = True, country: str = "") -> Dict[str, Any]:
     """One client, one exit, one device id, endpoints strictly in order.
 
     A 401 on the first request is retried once after exchanging the session
@@ -301,16 +357,27 @@ def _fetch_serial(session: str, access_token: str, calls, *,
     Customer Portal session (strictly read-only, no ChatGPT credentials sent
     to Stripe).
     """
-    client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
+    client = _detail_read_client(session, proxy, timeout=timeout, country=country)
     client.access_token = access_token
-    client.timeout = timeout
     merged: Dict[str, Any] = {}
     failures: List[str] = []
     refreshed = False
     try:
         for key, path, params in calls:
+            # Skip legacy 404 invoice guesses once the official transaction-history endpoint answered 200.
+            if merged.get("_tx_history_ok") and key in {
+                "invoices", "billing_history", "receipts", "account_billing",
+                "account_invoices", "transactions",
+            }:
+                continue
+            call_params = dict(params) if isinstance(params, dict) else params
+            if key == "transaction_history":
+                resolved_aid = account_id or str(_deep(merged.get("accounts"), ("account_id",)) or "")
+                call_params = {"limit": "20"}
+                if resolved_aid:
+                    call_params["account_id"] = resolved_aid
             try:
-                payload, status, response = _request(client, path, params)
+                payload, status, response = _request(client, path, call_params)
             except DomainError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -325,7 +392,7 @@ def _fetch_serial(session: str, access_token: str, calls, *,
                         trust_statsig=False, reject_unauthorized=False):
                     logger.info("account_detail_token_refreshed path=%s", path)
                     try:
-                        payload, status, response = _request(client, path, params)
+                        payload, status, response = _request(client, path, call_params)
                     except DomainError:
                         raise
                     except Exception as exc:  # noqa: BLE001
@@ -343,7 +410,23 @@ def _fetch_serial(session: str, access_token: str, calls, *,
                 failures.append(f"{path}:{status}")
                 continue
             if payload:
-                merged[key] = payload
+                if key == "transaction_history" and isinstance(payload.get("transactions"), list):
+                    tx_items = list(payload["transactions"])
+                    next_cursor = payload.get("next_cursor")
+                    # Follow at most one cursor page if OpenAI capped page 1 below 20 items.
+                    if isinstance(next_cursor, str) and next_cursor.strip() and len(tx_items) < 20:
+                        page2_params = dict(call_params or {})
+                        page2_params["cursor"] = next_cursor.strip()
+                        try:
+                            p2, s2, _r2 = _request(client, path, page2_params)
+                            if s2 == 200 and isinstance(p2, dict) and isinstance(p2.get("transactions"), list):
+                                tx_items.extend(p2["transactions"])
+                        except Exception:  # noqa: BLE001
+                            pass
+                    merged[key] = {"transactions": tx_items[:20]}
+                    merged["_tx_history_ok"] = True
+                else:
+                    merged[key] = payload
         if failures and not merged:
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                               "订阅接口暂时不可达，请稍后重试。",
@@ -379,12 +462,14 @@ def _fetch_serial(session: str, access_token: str, calls, *,
 
 async def fetch_basic_snapshot(session: str, access_token: str, *, account_id: str,
                                country: str, timeout: float = ORDER_HTTP_TIMEOUT_S) -> Dict[str, Any]:
-    """Fast phase-1 read: only accounts/check + subscriptions (~1-2s), deferring portal invoices."""
-    proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
+    """Fast phase-1 read: accounts/check + subscriptions + payments/transaction-history (~1-2s)."""
+    proxy = _detail_read_proxy(country)
     account_params = {"account_id": account_id} if account_id else None
+    tx_params = {"limit": "20", **({"account_id": account_id} if account_id else {})}
     calls = (
         ("accounts", ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),
         ("subscriptions", SUBSCRIPTIONS_PATH, account_params),
+        ("transaction_history", TRANSACTION_HISTORY_PATH, tx_params),
     )
     return await asyncio.to_thread(
         _fetch_serial,
@@ -395,6 +480,7 @@ async def fetch_basic_snapshot(session: str, access_token: str, *, account_id: s
         proxy=proxy,
         timeout=timeout,
         include_invoices=False,
+        country=country,
     )
 
 
@@ -408,17 +494,62 @@ def _fetch_billing_history_sync(
     fallback_currency: str,
     timeout: float,
 ) -> Dict[str, Any]:
-    proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
-    retry_proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
-    client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
+    proxy = _detail_read_proxy(country)
+    retry_proxy = _detail_read_proxy(country)
+    client = _detail_read_client(session, proxy, timeout=min(float(timeout), 20.0), country=country)
     client.access_token = access_token
-    client.timeout = min(float(timeout), 20.0)
+    portal_url = ""
+    tx_payload: Optional[Dict[str, Any]] = None
     try:
-        portal_url, _source, _attempts = _request_portal_url(
-            client, account_id, min(float(timeout), 20.0), allow_refresh=True,
-        )
+        tx_params = {"limit": "20", **({"account_id": account_id} if account_id else {})}
+        try:
+            payload, status, _resp = _request(client, TRANSACTION_HISTORY_PATH, tx_params)
+            if status == 401 and getattr(client, "session_token", "") and client.refresh_session(
+                trust_statsig=False, reject_unauthorized=False,
+            ):
+                payload, status, _resp = _request(client, TRANSACTION_HISTORY_PATH, tx_params)
+            if status == 200 and isinstance(payload, dict) and isinstance(payload.get("transactions"), list):
+                tx_payload = payload
+        except Exception:  # noqa: BLE001
+            tx_payload = None
+        if tx_payload is None:
+            portal_url, _source, _attempts = _request_portal_url(
+                client, account_id, min(float(timeout), 20.0), allow_refresh=True,
+            )
     finally:
         client.close()
+
+    safe_default_plan = (
+        ""
+        if str(default_plan or "").strip() in {"", "免费套餐", "ChatGPT 免费版", "未知套餐"}
+        else default_plan
+    )
+
+    if tx_payload is not None:
+        records = _invoice_records({"transaction_history": tx_payload}, default_plan=safe_default_plan)
+        currency = _pick_currency(records, {}, {})
+        if currency == "-" and fallback_currency:
+            currency = fallback_currency
+        invoices = [{
+            "plan": row["plan"],
+            "paidAt": to_beijing(row["moment"]) or "-",
+            "status": row["status"],
+            "amount": _amount(
+                row["amount_raw"],
+                row["currency"] or currency,
+                amount_unit=row.get("amount_unit", ""),
+            ),
+            "invoiceId": row.get("invoice_id") or None,
+            "invoiceUrl": row.get("invoice_url"),
+        } for row in records[:20]]
+        return {
+            "invoices": invoices,
+            "billingSource": "upstream_api" if invoices else "none",
+            "billingNote": None if invoices else "当前账号暂无历史账单记录。",
+            "currency": currency,
+            "retryable": False,
+            "verified": True,
+        }
 
     if not portal_url:
         return {
@@ -434,7 +565,7 @@ def _fetch_billing_history_sync(
         portal_url, proxy=proxy, retry_proxy=retry_proxy, timeout=max(float(timeout), 25.0),
     )
     if portal_items:
-        records = _invoice_records({"portal_invoices": portal_items}, default_plan=default_plan)
+        records = _invoice_records({"portal_invoices": portal_items}, default_plan=safe_default_plan)
         currency = _pick_currency(records, {}, {})
         if currency == "-" and fallback_currency:
             currency = fallback_currency
@@ -514,11 +645,13 @@ async def fetch_billing_history(
 async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
                          country: str, timeout: float = ORDER_HTTP_TIMEOUT_S) -> Dict[str, Any]:
     """Serial reads on one exit; parallel tunnels were rejected by the proxy."""
-    proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
+    proxy = _detail_read_proxy(country)
     account_params = {"account_id": account_id} if account_id else None
+    tx_params = {"limit": "20", **({"account_id": account_id} if account_id else {})}
     calls = [
         ("accounts", ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),
         ("subscriptions", SUBSCRIPTIONS_PATH, account_params),
+        ("transaction_history", TRANSACTION_HISTORY_PATH, tx_params),
         ("invoices", INVOICES_PATH, account_params),
         ("billing_history", BILLING_HISTORY_PATH, account_params),
         ("receipts", RECEIPTS_PATH, account_params),
@@ -530,22 +663,34 @@ async def fetch_snapshot(session: str, access_token: str, *, account_id: str,
                       f"/backend-api/accounts/{account_id}/invoices", None))
     calls.append(("transactions", "/backend-api/payments/transactions", account_params))
     return await asyncio.to_thread(_fetch_serial, session, access_token, tuple(calls),
-                                   account_id=account_id, proxy=proxy, timeout=timeout)
+                                   account_id=account_id, proxy=proxy, timeout=timeout,
+                                   country=country)
 
 
 # ── normalization ────────────────────────────────────────────────────
-def _deep(payload: Any, keys: tuple[str, ...], depth: int = 0) -> Any:
+def _deep(
+    payload: Any,
+    keys: tuple[str, ...],
+    depth: int = 0,
+    *,
+    include_last_active: bool = True,
+) -> Any:
     if depth > 6:
         return None
     if isinstance(payload, dict):
         for key in keys:
             if key in payload and payload[key] not in (None, "", [], {}):
                 return payload[key]
-        for key in ("entitlement", "subscription", "last_active_subscription",
-                    "current_subscription", "data", "result", "accounts", "default",
-                    "account"):
+        nested_keys = (
+            ("entitlement", "subscription", "last_active_subscription",
+             "current_subscription", "data", "result", "accounts", "default", "account")
+            if include_last_active
+            else ("entitlement", "subscription",
+                  "current_subscription", "data", "result", "accounts", "default", "account")
+        )
+        for key in nested_keys:
             if key in payload:
-                found = _deep(payload[key], keys, depth + 1)
+                found = _deep(payload[key], keys, depth + 1, include_last_active=include_last_active)
                 if found is not None:
                     return found
     return None
@@ -599,9 +744,9 @@ def _plan_label(value: Any, *, fallback: str = "") -> str:
     if key in _PLAN_LABELS:
         return _PLAN_LABELS[key]
     if key:
-        if "pro max" in key or "chatgptpromax" in key:
+        if any(tok in key for tok in ("pro max", "pro_max", "pro-max", "promax", "chatgptpromax")):
             return "ChatGPT Pro Max"
-        if "pro lite" in key or "chatgptprolite" in key:
+        if any(tok in key for tok in ("pro lite", "pro_lite", "pro-lite", "prolite", "chatgptprolite", "pro standard", "pro 5x")):
             return "ChatGPT Pro Lite"
         if "chatgpt pro" in key or "chatgptpro" in key:
             return "ChatGPT Pro"
@@ -639,6 +784,8 @@ def _channel_label(subs: Dict[str, Any], accounts: Dict[str, Any]) -> str:
 
 def _should_fetch_portal_invoices(merged: Dict[str, Any]) -> bool:
     """Decide whether to read historical bills from Stripe Customer Portal."""
+    if merged.get("_tx_history_ok"):
+        return False
     if _invoice_records(merged):
         return False
     subs = merged.get("subscriptions") if isinstance(merged.get("subscriptions"), dict) else {}
@@ -655,7 +802,11 @@ def _should_fetch_portal_invoices(merged: Dict[str, Any]) -> bool:
         return True
     if _as_bool(_deep(subs, ("is_active", "active", "has_active_subscription"))) is True:
         return True
-    if _deep(subs, ("subscription_id",)):
+    if _deep(subs, ("subscription_id",)) or _deep(accounts, ("subscription_id",)):
+        return True
+    if isinstance(subs.get("last_active_subscription"), dict) and subs["last_active_subscription"]:
+        return True
+    if _deep(accounts, ("last_active_subscription",)):
         return True
     plan_source = (_deep(subs, ("plan_type", "subscription_plan", "plan", "plan_name"))
                    or _deep(accounts, ("plan_type", "subscription_plan")))
@@ -722,21 +873,23 @@ def _invoice_items(payload: Any) -> List[dict]:
 
 def _invoice_records(merged: Dict[str, Any], *, default_plan: str = "") -> List[dict]:
     """Merge every billing source, de-duplicate, newest first."""
-    candidates: List[tuple[dict, str]] = []
+    candidates: List[tuple[dict, str, str]] = []
+    for item in _invoice_items(merged.get("transaction_history")):
+        candidates.append((item, "upstream_api", "minor"))
     for key in ("invoices", "billing_history", "receipts", "account_billing",
                 "account_invoices", "transactions"):
         for item in _invoice_items(merged.get(key)):
-            candidates.append((item, "upstream_api"))
+            candidates.append((item, "upstream_api", ""))
     for item in _invoice_items(merged.get("portal_invoices")):
-        candidates.append((item, "stripe_portal"))
+        candidates.append((item, "stripe_portal", ""))
     subs = merged.get("subscriptions") if isinstance(merged.get("subscriptions"), dict) else {}
     period = subs.get("current_billing_period") if isinstance(subs, dict) else None
     if isinstance(period, dict) and _deep(period, ("amount_paid", "total", "amount",
                                                     "total_amount", "price")):
-        candidates.append((period, "current_period"))
+        candidates.append((period, "current_period", ""))
     records: List[dict] = []
-    seen: Dict[tuple[str, str, str], int] = {}
-    for item, source in candidates:
+    seen: Dict[tuple[str, ...], int] = {}
+    for item, source, default_unit in candidates:
         moment = _moment(_deep(item, ("paid_at", "created", "date", "invoice_date",
                                       "created_at", "period_start")))
         amount_raw = _deep(item, ("amount_paid", "total", "amount", "total_amount", "price"))
@@ -746,7 +899,11 @@ def _invoice_records(merged: Dict[str, Any], *, default_plan: str = "") -> List[
         invoice_url = safe_invoice_url(
             item.get("invoice_url") or item.get("hosted_invoice_url") or item.get("invoice_pdf")
         )
-        signature = (moment.isoformat() if moment else "", str(amount_raw), currency)
+        signature = (
+            ("id", invoice_id)
+            if invoice_id
+            else ("fields", moment.isoformat() if moment else "", str(amount_raw), currency)
+        )
         if signature in seen:
             existing = records[seen[signature]]
             if invoice_url and not existing.get("invoice_url"):
@@ -755,14 +912,21 @@ def _invoice_records(merged: Dict[str, Any], *, default_plan: str = "") -> List[
                 existing["invoice_id"] = invoice_id
             continue
         seen[signature] = len(records)
-        raw_plan = _deep(item, ("plan_name", "plan", "subscription_plan",
-                                "description", "product_name"))
+        product_obj = item.get("product") if isinstance(item.get("product"), dict) else {}
+        raw_plan = (
+            product_obj.get("plan")
+            or product_obj.get("plan_type")
+            or product_obj.get("subscription_plan")
+            or product_obj.get("name")
+            or _deep(item, ("plan_name", "plan", "subscription_plan",
+                            "description", "product_name"))
+        )
         records.append({
             "moment": moment,
             "plan": _plan_label(raw_plan, fallback=default_plan),
             "status": _INVOICE_STATUS.get(status_key, "未知"),
             "amount_raw": amount_raw,
-            "amount_unit": str(item.get("amount_unit") or ""),
+            "amount_unit": str(item.get("amount_unit") or default_unit),
             "currency": currency,
             "invoice_id": invoice_id,
             "invoice_url": invoice_url,
@@ -806,10 +970,10 @@ def _billing_meta(
             "mobile_store",
             f"当前订阅由 {payment_channel} 代扣，ChatGPT 网页端与 Stripe 门户不保存移动端历史账单，请在对应应用商店查看。",
         )
-    if status == "未订阅" and is_free and not portal_meta.get("attempted"):
-        return "none", "当前为免费账号，暂无付费账单记录。"
     if portal_meta.get("stage") == "deferred":
         return "loading", None
+    if status == "未订阅" and is_free and not portal_meta.get("attempted"):
+        return "none", "当前为免费账号，暂无付费账单记录。"
     if portal_meta.get("attempted"):
         stage = str(portal_meta.get("stage") or "")
         if stage == "browser_disabled":
@@ -841,36 +1005,73 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
     subs = merged.get("subscriptions") if isinstance(merged.get("subscriptions"), dict) else {}
     portal_meta = merged.get("_portal_meta") if isinstance(merged.get("_portal_meta"), dict) else {}
 
-    plan_source = (_deep(subs, ("plan_type", "subscription_plan", "plan", "plan_name"))
-                   or _deep(accounts, ("plan_type", "subscription_plan")))
+    # Inspect current subscription state WITHOUT conflating historical `last_active_subscription`.
+    plan_source = (
+        _deep(subs, ("plan_type", "subscription_plan", "plan", "plan_name"), include_last_active=False)
+        or _deep(accounts, ("plan_type", "subscription_plan"), include_last_active=False)
+    )
     plan_key = str(plan_source or "").strip().lower()
     is_free = plan_key in {"", "free", "chatgptfreeplan"}
 
-    active = _as_bool(_deep(subs, ("is_active", "active", "has_active_subscription")))
-    if active is None:
-        active = not is_free
-    status = "使用中" if active else ("已过期" if plan_key and not is_free else "未订阅")
-
-    end = _deep(subs, ("current_period_end", "expires_at", "active_until",
-                       "end_date", "renews_at", "expiration_time"))
-    end_moment = _moment(end)
-    remaining = None
-    if end_moment is not None:
-        remaining = max(0, math.ceil((end_moment - now).total_seconds() / 86400))
-
-    cancel = _as_bool(_deep(subs, ("cancel_at_period_end", "cancel_at_period_end_on")))
-    will_renew = _as_bool(_deep(subs, ("will_renew", "auto_renew", "renews")))
-    cancels_at = _deep(subs, ("cancels_at",))
-    auto_renew = (
-        "已关闭"
-        if (cancel is True or will_renew is False or (bool(cancels_at) and will_renew is not True))
-        else "已开启"
+    active_flag = _as_bool(
+        _deep(subs, ("is_active", "active", "has_active_subscription"), include_last_active=False)
     )
+    if active_flag is None:
+        active_flag = _as_bool(
+            _deep(accounts, ("has_active_subscription", "is_active", "active"), include_last_active=False)
+        )
+
+    end = (
+        _deep(
+            subs,
+            ("current_period_end", "expires_at", "active_until", "end_date", "renews_at", "expiration_time"),
+            include_last_active=False,
+        )
+        or _deep(
+            accounts,
+            ("expires_at", "active_until", "current_period_end"),
+            include_last_active=False,
+        )
+    )
+    end_moment = _moment(end)
+
+    # An account whose subscription is inactive, reverted to free, or past its expiry time
+    # currently has no active paid plan — normalize cleanly to "未订阅 / 免费套餐 / 不适用"
+    # while still retaining Stripe payment channel, currency, and historical invoices.
+    if active_flag is False or is_free:
+        active = False
+    elif active_flag is True:
+        active = True
+    elif end_moment is not None and end_moment <= now:
+        active = False
+    else:
+        active = not is_free
+
+    status = "使用中" if active else "未订阅"
+
+    remaining: Optional[int] = None
+    if active and end_moment is not None and end_moment > now:
+        remaining = max(1, math.ceil((end_moment - now).total_seconds() / 86400))
+
+    if active:
+        cancel = _as_bool(_deep(subs, ("cancel_at_period_end", "cancel_at_period_end_on")))
+        will_renew = _as_bool(_deep(subs, ("will_renew", "auto_renew", "renews")))
+        cancels_at = _deep(subs, ("cancels_at",))
+        auto_renew = (
+            "已关闭"
+            if (cancel is True or will_renew is False or (bool(cancels_at) and will_renew is not True))
+            else "已开启"
+        )
+        plan_name = _plan_label(plan_source)
+    else:
+        auto_renew = "不适用"
+        plan_name = "免费套餐"
+        end = None
+        end_moment = None
 
     payment_channel = _channel_label(subs, accounts)
 
-    plan_name = _plan_label(plan_source)
-    default_invoice_plan = "" if is_free or plan_name == "未知套餐" else plan_name
+    default_invoice_plan = "" if not active or plan_name in {"未知套餐", "免费套餐", "ChatGPT 免费版"} else plan_name
     records = _invoice_records(merged, default_plan=default_invoice_plan)
     currency = _pick_currency(records, subs, accounts)
     invoices = [{
@@ -889,27 +1090,30 @@ def normalize(merged: Dict[str, Any], *, email: str, account_id: str,
         records,
         payment_channel=payment_channel,
         status=status,
-        is_free=is_free,
+        is_free=not active,
         portal_meta=portal_meta,
     )
 
-    # Start time: subscription period start, else the latest settled invoice,
-    # else a labelled one-month estimate before the expiry.
-    start_moment = _moment(_deep(subs, ("current_period_start", "active_start",
-                                        "start_date", "started_at", "subscription_start",
-                                        "created_at", "created")))
-    estimated = False
-    if start_moment is None:
-        start_moment = next((row["moment"] for row in records
-                             if row["status"] == "已支付" and row["moment"]), None)
-    if start_moment is None and end_moment is not None:
-        start_moment = end_moment - timedelta(days=30)
-        estimated = True
-    start_time = None
-    if start_moment is not None:
-        start_time = start_moment.astimezone(BEIJING).strftime("%Y/%m/%d %H:%M")
-        if estimated:
-            start_time += "（约）"
+    # Start time: only meaningful for an active subscription.
+    start_time: Optional[str] = None
+    if active:
+        start_moment = _moment(_deep(
+            subs,
+            ("current_period_start", "active_start", "start_date", "started_at",
+             "subscription_start", "created_at", "created"),
+            include_last_active=False,
+        ))
+        estimated = False
+        if start_moment is None:
+            start_moment = next((row["moment"] for row in records
+                                 if row["status"] == "已支付" and row["moment"]), None)
+        if start_moment is None and end_moment is not None:
+            start_moment = end_moment - timedelta(days=30)
+            estimated = True
+        if start_moment is not None:
+            start_time = start_moment.astimezone(BEIJING).strftime("%Y/%m/%d %H:%M")
+            if estimated:
+                start_time += "（约）"
 
     return {
         "email": email or str(_deep(accounts, ("email",)) or ""),
@@ -1100,10 +1304,9 @@ def _request_portal_url(
 def fetch_stripe_portal(session: str, access_token: str, *, account_id: str,
                         country: str, timeout: float = ORDER_HTTP_TIMEOUT_S) -> Dict[str, str]:
     """Create a Stripe customer-portal session on the bound exit."""
-    proxy = align_proxy_region(configured_proxy("checkout"), country) if country else configured_proxy("checkout")
-    client = ChatGPTClient.from_raw_session(session, proxy=proxy, strip_ambient=True)
+    proxy = _detail_read_proxy(country)
+    client = _detail_read_client(session, proxy, timeout=timeout)
     client.access_token = access_token
-    client.timeout = timeout
     try:
         url, source, attempts = _request_portal_url(client, account_id, timeout, allow_refresh=True)
         if url:

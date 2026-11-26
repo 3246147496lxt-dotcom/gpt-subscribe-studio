@@ -354,6 +354,9 @@ pnpm --dir apps/web dev
 | `GSS_DEVICE_STORE` | 按账号持久化的设备库，默认 `$GSS_DATA_DIR/device_store.json` |
 | `GSS_SOLVER_PROXY` | 求解器专用出口（HTTP 桥），留空则用订单代理 |
 | `GSS_PROXY_SID` | 钉住某个 sticky 会话（调试 / 让求解器与支付同 IP） |
+| `GSS_PROXY_COOLDOWN_SECONDS` | 建单命中 `unusual_activity` / `invalid_session` 时该出口 SID 的冷却时长，默认 `1800` |
+| `GSS_WARMUP_INTERVAL` | 重颁 → 建单之间拟人停顿秒数（留空默认 1.5–2.5s；`0` 关闭，单测/离线用） |
+| `GSS_ACCOUNT_DETAIL_SID_ISOLATION` | 查订阅/账单详情时是否换一条随机 SID（默认开；`0` 关闭） |
 | `GSS_LLM_SOLVER_URL` | hCaptcha passive 求解器地址，产出 `P1_…` radar token |
 
 `STRIPE_PUBLISHABLE_KEY` 只给旧引擎（`GSS_PLUS_ENGINE=legacy`）用；HAR 引擎从结账页里读 publishable key，代码里不再存任何 key。
@@ -393,7 +396,7 @@ pnpm --dir apps/web dev
 
 ```json
 {
-  "card": { "number": "4242424242424242", "exp_month": "12", "exp_year": "2030", "cvc": "123" },
+  "card": { "number": "<stripe-test-card-number>", "exp_month": "12", "exp_year": "2030", "cvc": "123" },
   "billing": {
     "name": "…", "email": "…", "line1": "…",
     "city": "…", "state": "…", "postal_code": "…", "country": "US"

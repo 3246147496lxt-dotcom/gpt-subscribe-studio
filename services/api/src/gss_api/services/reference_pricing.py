@@ -60,6 +60,8 @@ DEFAULT_LOCAL_PRICES: Dict[str, Dict[str, Dict[str, Any]]] = {
         "US": {"currency": "USD", "amount": 20.00, "source": "seed"},
     },
     "pro_lite": {
+        "PH": {"currency": "PHP", "amount": 5794.64, "source": "seed"},
+        "EG": {"currency": "EGP", "amount": 4736.84, "source": "seed"},
         "CL": {"currency": "CLP", "amount": 86365.0, "source": "seed"},
         "JP": {"currency": "JPY", "amount": 13636.0, "source": "seed"},
         "US": {"currency": "USD", "amount": 100.00, "source": "seed"},
@@ -72,6 +74,8 @@ DEFAULT_LOCAL_PRICES: Dict[str, Dict[str, Dict[str, Any]]] = {
         "US": {"currency": "USD", "amount": 200.00, "source": "seed"},
     },
     "pro_max": {
+        "PH": {"currency": "PHP", "amount": 29008.93, "source": "seed"},
+        "EG": {"currency": "EGP", "amount": 23684.21, "source": "seed"},
         "CL": {"currency": "CLP", "amount": 428563.0, "source": "seed"},
         "JP": {"currency": "JPY", "amount": 68182.0, "source": "seed"},
         "US": {"currency": "USD", "amount": 500.00, "source": "seed"},
@@ -159,6 +163,24 @@ def _format_beijing_hm(epoch: Optional[float]) -> str:
         return ""
     try:
         return datetime.fromtimestamp(float(epoch), tz=timezone.utc).astimezone(BEIJING).strftime("%m/%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _format_beijing_full(epoch: Optional[float]) -> str:
+    if not epoch or epoch <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc).astimezone(BEIJING).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _format_beijing_date(epoch: Optional[float]) -> str:
+    if not epoch or epoch <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc).astimezone(BEIJING).strftime("%Y-%m-%d")
     except (OSError, OverflowError, ValueError):
         return ""
 
@@ -481,14 +503,22 @@ class ReferencePricingService:
                     best["region_prices"] = region_prices
                     reference_prices[plan_id] = best
 
+            public_fx = {
+                code: round(float(rate), 6)
+                for code, rate in fx.items()
+                if code in ("USD", "CNY", "PHP", "EGP", "CLP", "JPY", "SEK") and rate > 0
+            }
             return {
                 "usd_cny_rate": round(cny_rate, 4),
+                "fx_rates": public_fx,
                 "price_updated_at": _format_beijing_hm(effective_updated),
                 "reference_prices": reference_prices,
                 "reference_price_status": {
                     "enabled": True,
                     "updated_at": effective_updated,
+                    "updated_full_label": _format_beijing_full(effective_updated),
                     "fx_updated_at": self._fx_updated_at,
+                    "fx_date": _format_beijing_date(self._fx_updated_at or effective_updated),
                     "fx_source": self._fx_source,
                     "stale": is_stale,
                 },
@@ -520,6 +550,7 @@ class ReferencePricingService:
         out = dict(config)
         out["plans"] = plans
         out["usd_cny_rate"] = computed["usd_cny_rate"]
+        out["fx_rates"] = computed["fx_rates"]
         if computed["price_updated_at"]:
             out["price_updated_at"] = computed["price_updated_at"]
         out["reference_prices"] = ref_map

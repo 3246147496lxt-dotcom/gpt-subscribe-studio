@@ -17,9 +17,10 @@ def test_invalid_existing_attempt_is_replaced():
     assert stable_purchase_attempt_id("bad").startswith("pa_")
 
 
-def test_purchase_attempt_is_sent_as_internal_header_only():
+def test_purchase_attempt_is_never_leaked_to_upstream_headers():
     from gss_core.chatgpt import ChatGPTClient
     client = ChatGPTClient(access_token="", purchase_attempt_id="pa_test")
     headers = client._route_headers("/backend-api/payments/checkout")
-    assert headers["X-GSS-Purchase-Attempt"] == "pa_test"
+    assert client.purchase_attempt_id == "pa_test"
+    assert "X-GSS-Purchase-Attempt" not in headers
     assert "checkout_attempt_id" not in headers

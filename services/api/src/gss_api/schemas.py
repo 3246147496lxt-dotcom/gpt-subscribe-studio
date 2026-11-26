@@ -324,6 +324,12 @@ class OrderLedgerStatsOut(BaseModel):
 
 class OrderLedgerItemOut(BaseModel):
     id: str
+    source: str = "step"
+    account_email: Optional[str] = None
+    masked_email: Optional[str] = None
+    portal_username: Optional[str] = None
+    account_tag: Optional[str] = None
+    card_brand: Optional[str] = None
     plan: str
     billing_country: str
     exit_country: Optional[str] = None
@@ -332,17 +338,36 @@ class OrderLedgerItemOut(BaseModel):
     delivery_status: str = "pending"
     amount: Optional[str] = None
     currency: Optional[str] = None
+    tax_delta: Optional[str] = None
     failure_code: Optional[str] = None
     last_error: Optional[str] = None
     purchase_attempt_id: Optional[str] = None
     payment_intent_id: Optional[str] = None
+    checkout_session_id: Optional[str] = None
+    checkout_kind: Optional[str] = None
+    route_profile: Optional[str] = None
+    billing_mode: Optional[str] = None
+    billing_verified: bool = False
+    session_reissued: bool = False
     auto_cancel_renew: bool = False
     auto_renew_status: str = "disabled"
+    auto_renew_attempts: int = 0
     auto_renew_canceled_at: Optional[str] = None
     auto_renew_error: Optional[str] = None
+    auto_renew_http_status: Optional[int] = None
+    proxy_rotations: int = 0
+    proxy_last_sid: Optional[str] = None
+    proxy_last_exit_ip: Optional[str] = None
     job_id: Optional[str] = None
+    job_status: Optional[str] = None
+    job_stage: Optional[str] = None
+    job_attempts: int = 0
     reconcile_attempts: int = 0
+    last_reconciled_at: Optional[str] = None
     active_lock_id: Optional[str] = None
+    total_ms: Optional[int] = None
+    timings_ms: Dict[str, int] = Field(default_factory=dict)
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
     unknown_since: Optional[str] = None
@@ -355,6 +380,30 @@ class OrderLedgerOut(BaseModel):
     limit: int = 20
     offset: int = 0
     items: list[OrderLedgerItemOut] = Field(default_factory=list)
+
+
+class OrderFailureExchangeOut(BaseModel):
+    title: str
+    method: Optional[str] = None
+    url: Optional[str] = None
+    http_status: Optional[int] = None
+    request: Optional[Any] = None
+    response: Optional[Any] = None
+    captured: bool = True
+
+
+class OrderFailureDetailOut(BaseModel):
+    order_id: str
+    title: str = "开通失败详情"
+    summary: str
+    error_code: Optional[str] = None
+    stage: Optional[str] = None
+    upstream_status: Optional[int] = None
+    upstream_code: Optional[str] = None
+    cf_ray: Optional[str] = None
+    request_id: Optional[str] = None
+    exchange: Optional[OrderFailureExchangeOut] = None
+    events: list[QuickPayEventOut] = Field(default_factory=list)
 
 
 class PaymentLockSummaryOut(BaseModel):

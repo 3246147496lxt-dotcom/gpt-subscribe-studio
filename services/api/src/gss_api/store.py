@@ -37,6 +37,8 @@ class OrderView:
     create_request_tag: Optional[bytes] = field(default=None, repr=False)
     purchase_attempt_id: Optional[str] = None
     account_fingerprint: Optional[str] = field(default=None, repr=False)
+    account_email: Optional[str] = None
+    card_brand: Optional[str] = None
     route_profile: str = "A"
     failure_code: Optional[str] = None
     checkout_url: Optional[str] = None
@@ -85,6 +87,7 @@ class OrderView:
     proxy_last_exit_ip: Optional[str] = None
     unknown_since: Optional[str] = None
     finished_at: Optional[str] = None
+    failure_trace: Optional[Dict[str, Any]] = field(default=None, repr=False)
 
 
 class InMemoryStore:

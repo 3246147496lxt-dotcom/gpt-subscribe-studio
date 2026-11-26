@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 from gss_contracts.errors import DomainError, ErrorCode
+from gss_core.failure_trace import build_redacted_http_trace
 from .chatgpt import APP_BASE, STRIPE_BASE, STRIPE_API_VERSION, ChatGPTClient, payment_intent_from_confirm, redact_sensitive
 from .verified_payer import check_observed_billing
 from .saved_cards import restore_account
@@ -180,20 +181,52 @@ def _app_confirm(client: ChatGPTClient, context: dict) -> dict | None:
     _require_live(context)
     context["app_confirmation_started"] = True
     route = "/backend-api/payments/checkout/confirm"
-    response = client.http.post(APP_BASE + route, json={"checkout_session_id": context["checkout_id"],
-        "confirm_token": context["confirmation_token"], "save_payment_method_for_reuse": True,
-        "selected_payment_method_type": "card"},
-        headers=client._route_headers(route, page_url=_page_url(context)), timeout=client.timeout)
+    confirm_body = {
+        "checkout_session_id": context["checkout_id"],
+        "confirm_token": context["confirmation_token"],
+        "save_payment_method_for_reuse": True,
+        "selected_payment_method_type": "card",
+    }
+    response = client.http.post(
+        APP_BASE + route,
+        json=confirm_body,
+        headers=client._route_headers(route, page_url=_page_url(context)),
+        timeout=client.timeout,
+    )
     payload = _json(response)
     status = int(response.status_code)
     if status >= 400:
+        trace = build_redacted_http_trace(
+            title="Checkout 确认",
+            method="POST",
+            url=APP_BASE + route,
+            http_status=status,
+            stage="payment_confirm",
+            request_json=confirm_body,
+            response_json=payload,
+            response_text=getattr(response, "text", ""),
+        )
         terminal = _request_error(payload, status, "payment")
         if terminal:
+            terminal["_http_trace"] = trace
             context["terminal_result"] = terminal
             return terminal
-        return outcome("unknown", "payment", "结账确认的结果待核实，请查询原订单")
-    if str(payload.get("status") or "").lower() in {"blocked", "failed", "error"}:
+        res = outcome("unknown", "payment", "结账确认的结果待核实，请查询原订单")
+        res["_http_trace"] = trace
+        return res
+    if str(payload.get("status") or "").lower() in {"blocked", "failed", "error", "subscription_limit"}:
         result = outcome("request_rejected", "payment", redact_sensitive(str(payload.get("message") or "商户未接受本次结账确认"))[:240])
+        if str(payload.get("status") or "").lower() == "subscription_limit":
+            result["code"] = str(ErrorCode.SUBSCRIPTION_LIMIT)
+        result["_http_trace"] = build_redacted_http_trace(
+            title="Checkout 确认",
+            method="POST",
+            url=APP_BASE + route,
+            http_status=status,
+            stage="payment_confirm",
+            request_json=confirm_body,
+            response_json=payload,
+        )
         context["terminal_result"] = result
         return result
     intent_id, secret, _ = payment_intent_from_confirm(payload)
@@ -303,16 +336,34 @@ def _intent(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict:
         context["stripe_confirmation_started"] = True
         receipt_confirmed = False
         try:
-            response = client.stripe_http.post(STRIPE_BASE + f"/v1/payment_intents/{intent_id}/confirm" if intent_id.startswith("pi_")
-                else STRIPE_BASE + f"/v1/setup_intents/{intent_id}/confirm",
-                data=urlencode({"key": context["publishable_key"], "_stripe_version": STRIPE_API_VERSION,
-                    "client_secret": context["intent_secret"], "confirmation_token": context["confirmation_token"],
-                    "return_url": context["intent_return_url"]}), timeout=client.timeout)
+            confirm_url = (
+                STRIPE_BASE + f"/v1/payment_intents/{intent_id}/confirm"
+                if intent_id.startswith("pi_")
+                else STRIPE_BASE + f"/v1/setup_intents/{intent_id}/confirm"
+            )
+            confirm_form = {
+                "key": context["publishable_key"],
+                "_stripe_version": STRIPE_API_VERSION,
+                "client_secret": context["intent_secret"],
+                "confirmation_token": context["confirmation_token"],
+                "return_url": context["intent_return_url"],
+            }
+            response = client.stripe_http.post(confirm_url, data=urlencode(confirm_form), timeout=client.timeout)
             # A late authenticated receipt still counts even if the Vault expires
             # while this original confirmation is in flight. Never infer it from HTTP 200 alone.
             payload = _json(response)
             if int(response.status_code) >= 400:
                 context["stripe_last_response_error"] = _stripe_error(payload)
+                context["last_http_trace"] = build_redacted_http_trace(
+                    title="Stripe 支付确认",
+                    method="POST",
+                    url=confirm_url,
+                    http_status=int(response.status_code),
+                    stage="payment_confirm",
+                    request_form=confirm_form,
+                    response_json=payload,
+                    response_text=getattr(response, "text", ""),
+                )
             else:
                 receipt_confirmed = _confirmed_receipt(context, payload)
         except Exception:
@@ -327,7 +378,10 @@ def _intent(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict:
             raise
     if status in {"requires_payment_method", "canceled"}:
         error = _stripe_error(intent)
-        return outcome("card_declined", "payment", error.pop("message", "Stripe 未完成本次付款"), intent_status=status, **error)
+        res = outcome("card_declined", "payment", error.pop("message", "Stripe 未完成本次付款"), intent_status=status, **error)
+        if isinstance(context.get("last_http_trace"), dict):
+            res["_http_trace"] = context["last_http_trace"]
+        return res
     if status == "requires_action":
         action = intent.get("next_action") if isinstance(intent.get("next_action"), dict) else {}
         return outcome("challenge_required", "payment", "Stripe 要求继续验证，本次未自动重新确认", intent_status=status,

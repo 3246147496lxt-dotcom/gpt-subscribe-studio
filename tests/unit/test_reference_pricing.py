@@ -43,8 +43,11 @@ def test_fx_refresh_computes_winners_discounts_and_persists(monkeypatch, tmp_pat
     assert refs["plus"]["discount"] == "7.7折"
 
     assert refs["pro_lite"]["country"] == "CL"
+    assert set(refs["pro_lite"]["region_prices"].keys()) >= {"PH", "EG", "CL"}
     assert refs["pro"]["country"] == "PH"
+    assert set(refs["pro"]["region_prices"].keys()) >= {"PH", "EG", "CL"}
     assert refs["pro_max"]["country"] == "CL"
+    assert set(refs["pro_max"]["region_prices"].keys()) >= {"PH", "EG", "CL"}
     assert out["reference_price_status"]["stale"] is False
     assert out["price_updated_at"] != ""
 

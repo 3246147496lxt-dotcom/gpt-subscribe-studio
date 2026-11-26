@@ -1,3 +1,5 @@
+import { handleAdminAuthRedirect } from "./http";
+
 export type Plan = "plus" | "go" | "pro_lite" | "pro" | "pro_max" | "team";
 
 export interface Order {
@@ -95,7 +97,9 @@ const jsonHeaders = { "Content-Type": "application/json" };
 
 async function readError(res: Response): Promise<string> {
   const detail = await res.json().catch(() => ({}));
-  return detail?.detail?.message ?? detail?.detail ?? `请求失败（${res.status}）`;
+  const rawMessage = typeof detail?.detail === "string" ? detail.detail : detail?.detail?.message;
+  handleAdminAuthRedirect(res.url || "", res.status, rawMessage);
+  return rawMessage ?? `请求失败（${res.status}）`;
 }
 
 type CreateRegion =
@@ -454,6 +458,22 @@ export async function saveProxy(raw: string, enabled: boolean): Promise<ProxyInf
     headers: jsonHeaders,
     body: JSON.stringify({ raw, enabled }),
   });
+  if (!res.ok) throw new Error(await readError(res));
+  return await res.json();
+}
+
+export async function setProxyEnabled(enabled: boolean): Promise<ProxyInfo> {
+  const res = await fetch("/api/settings/proxies", {
+    method: "PATCH",
+    headers: jsonHeaders,
+    body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return await res.json();
+}
+
+export async function clearProxy(): Promise<ProxyInfo> {
+  const res = await fetch("/api/settings/proxies", { method: "DELETE" });
   if (!res.ok) throw new Error(await readError(res));
   return await res.json();
 }

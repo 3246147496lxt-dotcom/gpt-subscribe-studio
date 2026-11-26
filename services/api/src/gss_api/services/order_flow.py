@@ -697,6 +697,7 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             _event(job, job.stage, "正在提交卡片并确认支付")
             _publish_sse(job)
             payment_started = time.monotonic()
+            stage_started["confirming_payment"] = payment_started
             order_billing = BillingIn(**order.billing) if getattr(order, "billing", None) else None
             resolved_billing = payload.billing or order_billing
             normalized_plan = orders.normalize_plan_name(payload.plan)
@@ -729,7 +730,12 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
                 if not delivered:
                     job.message = "已付款，待核验订阅交付。请勿重复付款。"
                 _persist_job(job)
-                await _cancel_auto_renew(job, order_id=job.order_id or order.id, plan=payload.plan)
+                if view.auto_cancel_renew:
+                    cancel_started = time.monotonic()
+                    await _cancel_auto_renew(job, order_id=job.order_id or order.id, plan=payload.plan)
+                    job.timings["cancel_renew_ms"] = max(0, int((time.monotonic() - cancel_started) * 1000))
+                else:
+                    await _cancel_auto_renew(job, order_id=job.order_id or order.id, plan=payload.plan)
                 job.stage = "auto_renew_canceled" if delivered and job.auto_renew_status == "canceled" else job.status
             elif state in {"requires_action", "challenge_required"} or status == "requires_action":
                 job.status = "requires_action"
@@ -763,6 +769,24 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             _notify_webhook(job)
             return job
         except Exception as exc:  # noqa: BLE001
+            fail_now = time.monotonic()
+            failed_stage = job.stage
+            if failed_stage == "creating_checkout" and "create_checkout_ms" not in job.timings:
+                job.timings["create_checkout_ms"] = max(
+                    0, int((fail_now - stage_started.get("creating_checkout", run_started)) * 1000),
+                )
+            elif failed_stage in {"reissuing", "session_refresh"} and "reissue_ms" not in job.timings:
+                job.timings["reissue_ms"] = max(
+                    0, int((fail_now - stage_started.get(failed_stage, run_started)) * 1000),
+                )
+            elif failed_stage == "browser_decode" and "browser_decode_ms" not in job.timings:
+                job.timings["browser_decode_ms"] = max(
+                    0, int((fail_now - stage_started.get("browser_decode", run_started)) * 1000),
+                )
+            elif failed_stage == "confirming_payment" and "payment_ms" not in job.timings:
+                job.timings["payment_ms"] = max(
+                    0, int((fail_now - stage_started.get("confirming_payment", run_started)) * 1000),
+                )
             _capture_checkout_failure(job, exc)
             job.status = "failed"
             job.stage = "failed"

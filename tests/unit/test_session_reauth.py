@@ -76,6 +76,8 @@ def _session():
 
 
 def test_reauthorize_drops_old_identity_and_uses_target_proxy(monkeypatch):
+    # 拟人停顿在单测里必须为零延迟。
+    monkeypatch.setenv("GSS_WARMUP_INTERVAL", "0")
     created = {}
     http = _Http("new-access-token")
 
@@ -96,7 +98,10 @@ def test_reauthorize_drops_old_identity_and_uses_target_proxy(monkeypatch):
         assert client.session_country == "PH"
         assert created["proxy"] == "http://user-region-PH-sid-PIN:pw@gw.example.com:3010"
 
-        assert http.gets and "/api/auth/session" in http.gets[0]["url"]
+        # 先同连接首页边缘握手，再打 /api/auth/session（冷连接裸发 ST 易被边缘判异常）。
+        assert [call["url"] for call in http.gets][0] == "https://chatgpt.com/"
+        assert http.gets[-1]["url"].endswith("/api/auth/session")
+        assert len(http.gets) == 2
         # 身份头挂在会话上，随请求一起发出。
         headers = http.headers
         assert headers["Authorization"] == "Bearer new-access-token"
@@ -120,3 +125,71 @@ def test_reauthorize_requires_session_token():
     with pytest.raises(Exception) as exc:
         ChatGPTClient.reauthorize_for_country(raw, proxy=None, country="PH")
     assert "sessionToken" in str(exc.value) or "session-token" in str(exc.value)
+
+
+def test_reauthorize_warmup_is_anonymous_and_sanitizes_cookie_crlf(monkeypatch):
+    monkeypatch.setenv("GSS_WARMUP_INTERVAL", "0")
+    http = _Http("new-access-token")
+    monkeypatch.setattr("gss_core.chatgpt._new_session", lambda **kw: http)
+
+    raw = json.dumps({
+        "accessToken": "old-at",
+        "sessionToken": "line1-token\r\nline2-token",
+        "statsigContext": {"country": "US"},
+    })
+    client = ChatGPTClient.reauthorize_for_country(raw, proxy=None, country="PH")
+    try:
+        assert len(http.gets) == 2
+        warmup_cookie = http.gets[0]["headers"]["Cookie"]
+        assert "__Secure-next-auth.session-token" not in warmup_cookie
+        assert "line1-token" not in warmup_cookie
+        assert f"oai-did={client.device_id}" in warmup_cookie
+
+        # 清洗掉换行符，确保最终 Cookie 与 session_token 均不含 CR/LF。
+        assert client.session_token == "line1-tokenline2-token"
+        assert "\r" not in http.headers["Cookie"] and "\n" not in http.headers["Cookie"]
+        assert "__Secure-next-auth.session-token=line1-tokenline2-token" in http.headers["Cookie"]
+    finally:
+        client.close()
+
+
+def test_reauthorize_distinguishes_transport_errors_from_invalid_session(monkeypatch, caplog):
+    from gss_contracts.errors import DomainError, ErrorCode
+
+    monkeypatch.setenv("GSS_WARMUP_INTERVAL", "0")
+
+    class FakeCurlErr(RuntimeError):
+        code = 56
+
+    # 1) 匿名 warmup_edge 断连：未发送任何凭证（credentials_sent=False），归类为上游传输错误。
+    class WarmupFailHttp(_Http):
+        def get(self, url, **kwargs):
+            raise FakeCurlErr("http://user:secret-proxy-pw@gw.invalid:1111 tunnel failed")
+
+    monkeypatch.setattr("gss_core.chatgpt._new_session", lambda **kw: WarmupFailHttp("tok"))
+    with caplog.at_level("WARNING"):
+        with pytest.raises(DomainError) as exc1:
+            ChatGPTClient.reauthorize_for_country(_session(), proxy="http://p.invalid:80", country="PH")
+    assert exc1.value.code is ErrorCode.CHECKOUT_UPSTREAM_ERROR
+    assert exc1.value.detail["credentials_sent"] is False
+    assert "warmup_transport_error type=FakeCurlErr code=56" in caplog.text
+    assert "secret-proxy-pw" not in caplog.text
+
+    # 2) /api/auth/session 断连：已发送凭证（credentials_sent=True），绝不误报 invalid_session，
+    #    也不得泄漏代理口令。
+    caplog.clear()
+
+    class RefreshFailHttp(_Http):
+        def get(self, url, **kwargs):
+            if url.endswith("/api/auth/session"):
+                raise FakeCurlErr("http://user:secret-proxy-pw@gw.invalid:1111 reset")
+            return super().get(url, **kwargs)
+
+    monkeypatch.setattr("gss_core.chatgpt._new_session", lambda **kw: RefreshFailHttp("tok"))
+    with caplog.at_level("WARNING"):
+        with pytest.raises(DomainError) as exc2:
+            ChatGPTClient.reauthorize_for_country(_session(), proxy="http://p.invalid:80", country="PH")
+    assert exc2.value.code is ErrorCode.CHECKOUT_UPSTREAM_ERROR
+    assert exc2.value.detail["credentials_sent"] is True
+    assert "session_refresh_transport_error type=FakeCurlErr code=56" in caplog.text
+    assert "secret-proxy-pw" not in caplog.text

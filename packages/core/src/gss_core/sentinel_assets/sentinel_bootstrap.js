@@ -64,6 +64,30 @@
   g.parent = g;
 
   // ---- Date 覆写：输出与当前出口国家一致的时区 ----
+  // 真 Chrome 的 Date.prototype.toString() 里括号内是「本地化长时区名」
+  // （如 Philippine Standard Time / Eastern Standard Time），不是 IANA 标识
+  // （Asia/Manila）。输出 IANA 标识会与服务端记录的真实浏览器指纹直接矛盾。
+  var _tzDisplayCache = "";
+  function tzDisplayName(timezone) {
+    if (_tzDisplayCache) return _tzDisplayCache;
+    var name = "";
+    try {
+      var parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+        timeZoneName: "long"
+      }).formatToParts(new Date());
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i].type === "timeZoneName") { name = parts[i].value; break; }
+      }
+    } catch (e) {}
+    // 极小 ICU 构建拿不到长名时退回 IANA 标识，保证不抛错。
+    if (!name) name = timezone;
+    _tzDisplayCache = name;
+    return name;
+  }
+  // 暴露给 sentinel_bridge.js 的 PoW 生成器，两段必须写出同一个时区名。
+  g.__TZ_DISPLAY_NAME__ = tzDisplayName(g.__TIMEZONE__ || "America/Chicago");
+
   var _DateToString = Date.prototype.toString;
   Date.prototype.toString = function () {
     try {
@@ -91,7 +115,7 @@
       var offset = Math.abs(offsetMinutes);
       return wd + " " + mo + " " + p(d.getUTCDate()) + " " + d.getUTCFullYear() +
         " " + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds()) +
-        " GMT" + sign + p(Math.floor(offset / 60)) + p(offset % 60) + " (" + timezone + ")";
+        " GMT" + sign + p(Math.floor(offset / 60)) + p(offset % 60) + " (" + tzDisplayName(timezone) + ")";
     } catch (e) {
       return _DateToString.call(this);
     }
@@ -154,10 +178,11 @@
   navigator.locks = { request: noopPromise, query: function () { return Promise.resolve({ held: [], pending: [] }); } };
   navigator.mediaCapabilities = { decodingInfo: function () { return Promise.resolve({ supported: true, smooth: true, powerEfficient: true }); } };
   (function () {
-    var m = String(g.__UA__ || "").match(/Chrome\/(\d+)\./);
-    var ver = m ? m[1] : "136";
+    var m = String(g.__UA__ || "").match(/Chrome\/(\d+(?:\.\d+)*)/);
+    var fullVer = m ? m[1] : "150.0.7871.189";
+    var ver = fullVer.split(".")[0] || "150";
     var plat = (g.__PLATFORM_LABEL__ || "Windows");
-    navigator.userAgentData = { brands: [{ brand: "Google Chrome", version: ver }, { brand: "Chromium", version: ver }, { brand: "Not.A/Brand", version: "99" }], mobile: false, platform: plat, getHighEntropyValues: function () { return Promise.resolve({ platform: plat, platformVersion: (plat === "Windows" ? "10.0.0" : (plat === "macOS" ? "14.6.1" : "")), fullVersionList: [{ brand: "Google Chrome", version: ver }, { brand: "Chromium", version: ver }, { brand: "Not.A/Brand", version: "99" }] }); } };
+    navigator.userAgentData = { brands: [{ brand: "Google Chrome", version: ver }, { brand: "Chromium", version: ver }, { brand: "Not(A:Brand", version: "24" }], mobile: false, platform: plat, getHighEntropyValues: function () { return Promise.resolve({ platform: plat, platformVersion: (plat === "Windows" ? "10.0.0" : (plat === "macOS" ? "14.6.1" : "")), fullVersionList: [{ brand: "Google Chrome", version: fullVer }, { brand: "Chromium", version: fullVer }, { brand: "Not(A:Brand", version: "24.0.0.0" }] }); } };
   })();
   navigator.scheduling = { isInputPending: function () { return false; } };
   navigator.ink = { requestPresenter: noopPromise };
@@ -173,12 +198,15 @@
   g.navigator = navigator;
 
   // ---- screen ----
+  var _sw = g.__SCREEN_W__ || 1920;
+  var _sh = g.__SCREEN_H__ || 1080;
+  var _ah = g.__AVAIL_H__ || (_sh - 48);
   g.screen = {
-    width: (g.__SCREEN_W__ || 1920), height: (g.__SCREEN_H__ || 1080), availWidth: (g.__SCREEN_W__ || 1920), availHeight: (g.__AVAIL_H__ || (((g.__SCREEN_W__ || 1920)) - 48)),
+    width: _sw, height: _sh, availWidth: _sw, availHeight: _ah,
     colorDepth: 24, pixelDepth: 24, availLeft: 0, availTop: 0
   };
-  g.innerWidth = (g.__SCREEN_W__ || 1920); g.innerHeight = (g.__AVAIL_H__ || (((g.__SCREEN_W__ || 1920)) - 48));
-  g.outerWidth = (g.__SCREEN_W__ || 1920); g.outerHeight = (g.__AVAIL_H__ || (((g.__SCREEN_W__ || 1920)) - 48));
+  g.innerWidth = _sw; g.innerHeight = _ah;
+  g.outerWidth = _sw; g.outerHeight = _ah;
   g.devicePixelRatio = 1;
   g.navigator.maxTouchPoints = (g.__MAX_TOUCH__ || 0);
 
@@ -218,6 +246,22 @@
     mark: function () {}, measure: function () {}, clearMarks: function () {}, clearMeasures: function () {},
     clearResourceTimings: function () {}, setResourceTimingBufferSize: function () {}
   };
+
+  // ---- 与 sentinel_bridge.js 的 PoW 生成器共享同一份会话标识与启动基准 ----
+  // 若 sdk.js 与 PoW 各自新建 sid / loadTs，服务端会同时看到两条互相矛盾
+  // 的指纹（同一 flow 两次上报不同设备），这正是 unusual_activity 的触发点。
+  if (!g.__SENTINEL_SID__) {
+    g.__SENTINEL_SID__ = (g.crypto && typeof g.crypto.randomUUID === "function")
+      ? g.crypto.randomUUID()
+      : "00000000-0000-4000-8000-000000000000";
+  }
+  if (typeof g.__SENTINEL_PERF__ !== "number") {
+    g.__SENTINEL_PERF__ = 350.0 + Math.random() * 2200.0;
+  }
+  if (typeof g.__LOAD_TS__ !== "number") {
+    g.__LOAD_TS__ = _t0 - g.__SENTINEL_PERF__;
+  }
+  g.__SENTINEL_HEAP_LIMIT__ = 4294705152;
 
   // ---- localStorage ----
   // collector_dx 会枚举 Object.keys(localStorage) 作为指纹熵。真实 auth 页在
@@ -362,8 +406,8 @@
   g.caches = { open: function () { return Promise.resolve({ match: function () { return Promise.resolve(); } }); }, keys: function () { return Promise.resolve([]); }, has: function () { return Promise.resolve(false); }, match: function () { return Promise.resolve(); } };
   g.indexedDB = { open: function () { return { result: null, onerror: null, onsuccess: null }; }, databases: function () { return Promise.resolve([]); } };
   g.speechSynthesis = { getVoices: function () { return []; }, speak: function () {}, cancel: function () {}, pause: function () {}, resume: function () {} };
-  g.visualViewport = { width: 1920, height: 945, offsetLeft: 0, offsetTop: 0, scale: 1, pageLeft: 0, pageTop: 0, addEventListener: function () {} };
-  g.origin = "https://auth.openai.com";
+  g.visualViewport = { width: g.innerWidth, height: g.innerHeight, offsetLeft: 0, offsetTop: 0, scale: 1, pageLeft: 0, pageTop: 0, addEventListener: function () {} };
+  g.origin = _parsedPageUrl.origin;
   g.isSecureContext = true;
   g.crossOriginIsolated = false;
   g.originAgentCluster = false;
@@ -408,35 +452,67 @@
   // create_account 需要第二个 sentinel 头 openai-sentinel-so-token，其内容由
   // /sentinel/req 里的 so.collector_dx + so.snapshot_dx 两段 DX 程序读取一批
   // window.__oai_so_* 累加器算出（真实页面通过 keydown/pointermove/click/scroll/
-  // wheel 事件监听器实时累计）。协议模式无真实事件，这里按“人在 about-you 页停留
-  // ~8 秒、输入姓名+生日、移动鼠标、点击”预置自洽的人类行为值，保证 collector
-  // 不读到 undefined 且产出结构完整的 so-token。
+  // wheel 事件监听器实时累计）。协议模式无真实事件，这里按 flow 预置自洽的人类行为值：
+  //   - oauth_create_account 等注册流：人在 /about-you 页停留 ~8 秒、输入姓名+生日；
+  //   - chatgpt_checkout / checkout_session_approval 等结账流：浏览定价弹窗 →
+  //     移动鼠标 → 点击升级按钮，全程没有任何键盘输入（keydown 必须为空）。
+  // 结账流套用注册流的 12 次姓名按键会与真实结账页行为直接矛盾。
   (function () {
     var nowP = (g.performance && g.performance.now) ? g.performance.now() : 1500;
-    var t0 = nowP - 8085.5;              // 进页到采集约 8 秒
-    // keydown 事件序列（输入姓名 "Anna Wilson" + 生日 ~ 12 次按键）
+    var flow = String(g.__FLOW__ || g.__SENTINEL_FLOW__ || "oauth_create_account");
+    var isCheckout = /checkout|payment|approval|billing/i.test(flow);
+    // 进页到采集的停留时间：注册流 ~8 秒；结账流（浏览定价 → 点击升级）~6.5 秒。
+    var dwell = isCheckout ? 6480.5 : 8085.5;
+    var t0 = nowP - dwell;
+
     var kd = [];
-    var keys = ["A","n","n","a"," ","W","i","l","s","o","n","2"];
-    var kt = t0 + 1200;
-    for (var i = 0; i < keys.length; i++) {
-      kt += 140 + Math.random() * 90;
-      kd.push({ ctrlKey: false, metaKey: false, altKey: false, shiftKey: (i === 0 || i === 5), key: keys[i], type: "keydown", t: kt });
+    if (!isCheckout) {
+      // 注册流：输入姓名 "Anna Wilson2"（12 次按键）。
+      var keys = ["A", "n", "n", "a", " ", "W", "i", "l", "s", "o", "n", "2"];
+      var kt = t0 + 1200;
+      for (var i = 0; i < keys.length; i++) {
+        kt += 140 + Math.random() * 90;
+        kd.push({ ctrlKey: false, metaKey: false, altKey: false, shiftKey: (i === 0 || i === 5), key: keys[i], type: "keydown", t: kt });
+      }
     }
-    // pointermove 事件序列（鼠标移动，累计路径长度）
+
+    // pointermove 事件序列（鼠标移动，累计路径长度）。
+    // 结账流起点在定价弹窗右上角，终点落在升级按钮上（两次点击之间不离开按钮）。
     var pm = [];
-    var px = 640, py = 360, pt = t0 + 300, htot = 0, pcnt = 0;
-    for (var j = 0; j < 30; j++) {
-      var dx = (Math.random() - 0.5) * 40, dy = (Math.random() - 0.5) * 30;
+    var px = isCheckout ? 1184 : 640;
+    var py = isCheckout ? 232 : 360;
+    var pt = t0 + (isCheckout ? 420 : 300);
+    var htot = 0, pcnt = 0;
+    var steps = isCheckout ? 24 : 30;
+    for (var j = 0; j < steps; j++) {
+      var dx, dy;
+      if (isCheckout) {
+        // 单调向按钮滑动 + 少量抖动，模拟真实手部轨迹。
+        dx = 12 + (Math.random() - 0.5) * 14;
+        dy = 9 + (Math.random() - 0.5) * 12;
+      } else {
+        dx = (Math.random() - 0.5) * 40;
+        dy = (Math.random() - 0.5) * 30;
+      }
       px += dx; py += dy; pt += 60 + Math.random() * 80;
       htot += Math.hypot(dx, dy); pcnt++;
       pm.push({ clientX: Math.round(px), clientY: Math.round(py), type: "pointermove", t: pt });
     }
+
+    // scroll 序列：结账流滚动定价弹窗查看全部套餐（4 次），注册流为 0。
+    var scrollSum = isCheckout ? 1180 : 0;
+    var scrollCount = isCheckout ? 4 : 0;
+    var scrollTop = isCheckout ? 640 : 0;
+    // click 序列：结账流点击「升级」按钮 2 次（打开弹窗 + 确认套餐），注册流为提交按钮。
+    var clickCount = 2;
+
+    g.__FLOW_EFFECTIVE = flow;
     g.__oai_so_t0 = t0;
     g.__oai_so_h = kd;          // keydown 事件数组
     g.__oai_so_hi = kd.length;
     g.__oai_so_hp = 0;
     g.__oai_so_hw = 0;
-    g.__oai_so_s = 0;
+    g.__oai_so_s = scrollSum;   // scroll 累加
     g.__oai_so_k = kd.length;   // 按键计数
     g.__oai_so_kp = 0;
     g.__oai_so_we = 0;          // wheel 事件数
@@ -447,24 +523,24 @@
     g.__oai_so_fn = 0;
     g.__oai_so_p = pm;          // pointer 事件数组
     g.__oai_so_pc = pcnt;       // pointer 计数
-    g.__oai_so_i = [];          // input 事件数组
+    g.__oai_so_i = [];          // input 事件数组（结账流无输入）
     g.__oai_so_m = pm.length;   // mousemove 计数
     g.__oai_so_ht = htot;       // 鼠标路径总长（hypot 累加）
     g.__oai_so_hc = pcnt;       // hypot 计数
-    g.__oai_so_bc = 2;          // click 计数
+    g.__oai_so_bc = clickCount; // click 计数
     g.__oai_so_bm = 0;
-    g.__oai_so_ss = 0;          // scroll 累加
-    g.__oai_so_ss2 = 0;
-    g.__oai_so_sn = 0;          // scroll 计数
-    g.__oai_so_cs = 0;          // click 累加
-    g.__oai_so_cs2 = 0;
-    g.__oai_so_cn = 2;          // click 计数
-    g.__oai_so_st = 0;          // scrollTop
-    g.__oai_so_sw = 0;
+    g.__oai_so_ss = scrollSum;
+    g.__oai_so_ss2 = scrollSum;
+    g.__oai_so_sn = scrollCount; // scroll 计数
+    g.__oai_so_cs = clickCount ? Math.round(180 + Math.random() * 160) : 0;  // click 累加
+    g.__oai_so_cs2 = g.__oai_so_cs;
+    g.__oai_so_cn = clickCount; // click 计数
+    g.__oai_so_st = scrollTop;  // scrollTop
+    g.__oai_so_sw = 1440;
     g.__oai_so_sp = 0;
     g.__oai_so_spt = 0;
-    g.__oai_so_sx0 = 640;
-    g.__oai_so_sy0 = 360;
+    g.__oai_so_sx0 = isCheckout ? 1184 : 640;
+    g.__oai_so_sy0 = isCheckout ? 232 : 360;
     g.__oai_so_lx = Math.round(px);
     g.__oai_so_ly = Math.round(py);
   })();

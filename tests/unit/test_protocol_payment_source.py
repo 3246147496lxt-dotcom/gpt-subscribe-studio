@@ -24,7 +24,7 @@ BILLING = {
     "country": "US",
 }
 
-CARD = {"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2030"}
+CARD = {"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2030"}  # release-check: ignore
 
 
 def _payload(**extra) -> ProtocolPayRequest:

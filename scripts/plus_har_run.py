@@ -18,7 +18,7 @@ Environment:
 
 Example:
     GSS_SESSION_FILE=~/session.txt GSS_CHECKOUT_URL=https://chatgpt.com/checkout/openai_llc/oaics_... \
-    GSS_CARD='{"number":"4242424242424242","exp_month":"12","exp_year":"2030","cvc":"123"}' \
+    GSS_CARD='{"number":"<stripe-test-card-number>","exp_month":"12","exp_year":"2030","cvc":"123"}' \
     .venv/bin/python scripts/plus_har_run.py
 """
 from __future__ import annotations

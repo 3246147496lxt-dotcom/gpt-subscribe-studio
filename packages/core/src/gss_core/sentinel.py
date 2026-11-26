@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -51,6 +52,23 @@ def extract_build(html: str) -> tuple[str, str, str]:
         seq_match.group(1) if seq_match else "",
         session_match.group(1) if session_match else "",
     )
+
+
+_SENTINEL_VERSION = re.compile(
+    r"/sentinel/([0-9a-z]{6,32})/sdk\.js|[?&]sv=([0-9a-z]{6,32})"
+)
+
+
+def extract_sentinel_version(html: str) -> str:
+    """从页面/脚本里解析当前 sv（sentinel 脚本版本），解析不到返回空串。
+
+    写死的 20260810913b 只是兜底；拿得到新版 sv 时 PoW 与 frame.html 都用新版，
+    否则 frame_url 与 sdkUrl 会指向不同的 sv，等于自报两套脚本。
+    """
+    match = _SENTINEL_VERSION.search(str(html or ""))
+    if not match:
+        return ""
+    return (match.group(1) or match.group(2) or "").strip()
 
 
 def _compact_bridge_error(text: str) -> str:
@@ -110,6 +128,7 @@ def mint(
     impersonate: str = "",
     sec_ch_ua: str = "",
     sec_ch_ua_platform: str = "",
+    version: str = "",
 ) -> Dict[str, Any]:
     """返回哨兵 JSON；失败返回空 dict，由调用方决定是否中止。"""
 
@@ -122,7 +141,7 @@ def mint(
             "deviceId": device_id,
             "flow": flow,
             "proxy": proxy or "",
-            "version": _BRIDGE_VERSION,
+            "version": str(version or "").strip() or _BRIDGE_VERSION,
             "pageUrl": page_url,
             "language": language,
             "timezone": timezone,
@@ -192,4 +211,11 @@ def mint(
     return token
 
 
-__all__ = ["extract_attestation", "extract_build", "header_value", "so_header_value", "mint"]
+__all__ = [
+    "extract_attestation",
+    "extract_build",
+    "extract_sentinel_version",
+    "header_value",
+    "so_header_value",
+    "mint",
+]

@@ -23,7 +23,7 @@ def _payload(debug=False):
         billing_country="US",
         exit_country="PH",
         session="session-fixture",
-        **({} if debug else {"card": CardIn(number="4242424242424242", cvc="123", exp_month="11", exp_year="2028")}),
+        **({} if debug else {"card": CardIn(number="4242424242424242", cvc="123", exp_month="11", exp_year="2028")}),  # release-check: ignore
         billing=BillingIn(name="Payer", email="p@example.com", line1="1 Main",
                           city="Portland", state="OR", postal_code="97201", country="US"),
         mode=ModeIn(),
@@ -103,7 +103,7 @@ def test_quick_pay_card_is_not_stored_on_job(monkeypatch):
     asyncio.run(order_flow.run_quick_pay(job.id, _payload(), "quick-key-2"))
     assert job.status == "failed"
     assert job.failure_code == "card_declined"
-    assert "4242424242424242" not in repr(job)
+    assert "4242424242424242" not in repr(job)  # release-check: ignore
 
 
 def test_debug_checkout_only_never_calls_bind(monkeypatch):
@@ -133,7 +133,7 @@ def test_quick_pay_requires_idempotency_key():
         "plan": "plus", "session": "s", "billing_country": "US", "exit_country": "PH",
         "billing": {"name": "P", "email": "p@example.com", "line1": "1 Main",
                     "city": "Portland", "state": "OR", "postal_code": "97201", "country": "US"},
-        "card": {"number": "4242424242424242", "cvc": "123", "exp_month": "11", "exp_year": "2028"},
+        "card": {"number": "4242424242424242", "cvc": "123", "exp_month": "11", "exp_year": "2028"},  # release-check: ignore
     })
     assert response.status_code == 400
     assert response.json()["detail"]["code"] == "idempotency_conflict"

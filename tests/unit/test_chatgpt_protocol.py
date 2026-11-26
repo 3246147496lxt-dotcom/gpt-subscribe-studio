@@ -48,6 +48,18 @@ def _jwt(account_id: str) -> str:
     return f"eyJhbGciOiJub25lIn0.{payload}.x"
 
 
+def _checkout_post(http) -> dict:
+    """Sentinel ping / taxes 与建单共用同一 transport：取建单那条 POST。"""
+    for post in http.posts:
+        if post["url"].endswith("/backend-api/payments/checkout"):
+            return post
+    raise AssertionError("未记录到 /backend-api/payments/checkout 请求")
+
+
+def _posts_to(http, suffix: str) -> list:
+    return [post for post in http.posts if post["url"].endswith(suffix)]
+
+
 def test_jwt_account_id() -> None:
     assert jwt_account_id(_jwt("acct-123")) == "acct-123"
     assert jwt_account_id("not-a-jwt") == ""
@@ -431,7 +443,7 @@ def test_create_checkout_sends_selected_personal_campaign(monkeypatch: pytest.Mo
         country="US",
         promo_campaign_id="plus-3-months-50-pct-off",
     )
-    body = client._http.posts[0]["json"]
+    body = _checkout_post(client._http)["json"]
     assert body["promo_campaign"]["promo_campaign_id"] == "plus-3-months-50-pct-off"
     assert body["promo_campaign"]["is_coupon_from_query_param"] is False
 
@@ -517,11 +529,16 @@ def test_create_checkout_sends_sentinel(monkeypatch: pytest.MonkeyPatch) -> None
     assert created.checkout_session_id == "cs_test_1"
     assert created.customer_session_client_secret == "cuss_test"
     assert created.attestation == "sig.payload"
-    headers = client._http.posts[0]["headers"]
+    headers = _checkout_post(client._http)["headers"]
     assert "openai-sentinel-token" in headers
     assert "oai-web-deployment-attestation" in headers
     assert '"flow":"chatgpt_checkout"' in headers["openai-sentinel-token"]
-    body = client._http.posts[0]["json"]
+    # 真浏览器在 /sentinel/req 后由 iframe 补一次 /sentinel/ping。
+    assert _posts_to(client._http, "/backend-api/sentinel/ping"), "缺少 sentinel ping"
+    # 单次令牌立即消费：后续 GET /checkout/… 与 /taxes 不能再带同一份 so/t。
+    assert client.sentinel_token == ""
+    assert client.sentinel_so == ""
+    body = _checkout_post(client._http)["json"]
     assert body["plan_name"] == "chatgptplusplan"
     assert body["checkout_source"] == "chatgpt_web_merged"
     assert body["purchase_attempt_id"]
@@ -549,8 +566,8 @@ def test_create_checkout_maps_pro_max_to_chatgptpromax(monkeypatch: pytest.Monke
     client._http = _FakeHttp("")
     created = client.create_checkout(plan="pro_max", country="US")
     assert created.checkout_session_id == "cs_test_1"
-    assert client._http.posts[0]["json"]["plan_name"] == "chatgptpromax"
-    assert client._http.posts[0]["json"]["billing_details"]["country"] == "US"
+    assert _checkout_post(client._http)["json"]["plan_name"] == "chatgptpromax"
+    assert _checkout_post(client._http)["json"]["billing_details"]["country"] == "US"  # 出口 US
     assert "plan_type=promax" in created.confirm_return_url
 
 
@@ -571,7 +588,7 @@ def test_create_checkout_jp_uses_openai_llc(monkeypatch: pytest.MonkeyPatch, ver
     created = client.create_checkout(plan="pro_lite", country="JP")
     assert created.processor_entity == "openai_llc"
     assert created.checkout_url == "https://chatgpt.com/checkout/openai_llc/cs_test_1"
-    assert client._http.posts[0]["json"]["plan_name"] == "chatgptprolite"
+    assert _checkout_post(client._http)["json"]["plan_name"] == "chatgptprolite"
     assert "plan_type=prolite" in created.confirm_return_url
 
 
@@ -644,7 +661,7 @@ def test_create_checkout_maps_team_seats_and_promo(monkeypatch: pytest.MonkeyPat
         seat_quantity=8,
         price_interval="month",
     )
-    body = client._http.posts[0]["json"]
+    body = _checkout_post(client._http)["json"]
     assert body["plan_name"] == "chatgptteamplan"
     assert body["checkout_ui_mode"] == "redirect"
     assert body["team_plan_data"]["seat_quantity"] == 8
@@ -722,7 +739,7 @@ def test_create_checkout_maps_go_to_chatgptgoplan(monkeypatch: pytest.MonkeyPatc
     client._http = _FakeHttp("")
     created = client.create_checkout(plan="go", country="US")
     assert created.checkout_session_id == "cs_test_1"
-    assert client._http.posts[0]["json"]["plan_name"] == "chatgptgoplan"
+    assert _checkout_post(client._http)["json"]["plan_name"] == "chatgptgoplan"
     assert "plan_type=go" in created.confirm_return_url
 
 
@@ -742,8 +759,8 @@ def test_create_checkout_maps_go_lite_plan(monkeypatch: pytest.MonkeyPatch, veri
     client._http = _FakeHttp("")
     created = client.create_checkout(plan="pro_lite", country="JP")
     assert created.checkout_session_id == "cs_test_1"
-    assert client._http.posts[0]["json"]["plan_name"] == "chatgptprolite"
-    assert client._http.posts[0]["json"]["billing_details"]["currency"] == "JPY"
+    assert _checkout_post(client._http)["json"]["plan_name"] == "chatgptprolite"
+    assert _checkout_post(client._http)["json"]["billing_details"]["currency"] == "JPY"
 
 
 @pytest.mark.usefixtures("verified_us_payer")
@@ -942,7 +959,11 @@ def test_payment_checkout_body_matches_har_and_headers_carry_codex_identity() ->
     headers = client._route_headers("/backend-api/payments/checkout")
     assert headers["originator"] == "Codex Browser"
     assert headers["x-openai-web-frontend"] == "codex_webview"
-    assert headers["x-oai-mcp-form-version"] == "2"
+    assert headers["x-openai-rate-limit-join-workspace"] == "1"
+    # HAR 的 payments/* 上没有这两个头，多发即是多余指纹。
+    assert "x-oai-mcp-form-version" not in headers
+    assert "x-openai-target-path" not in headers
+    assert "x-openai-target-route" not in headers
     assert "originator" not in client._route_headers("/backend-api/sentinel/req")
 
 
@@ -1118,7 +1139,8 @@ def test_checkout_uses_billing_country_with_free_exit(monkeypatch, verified_us_p
     monkeypatch.setattr(client, "prepare_risk", lambda **kwargs: None)
     client.create_checkout(plan="plus", country="PH", billing_country="US", verified_billing=verified_us_payer)
     create = [post for post in http.posts if post["url"].endswith("/checkout")][0]
-    assert create["json"]["billing_details"] == {"country": "US", "currency": "PHP"}
+    # 建单阶段 billing_details 记录的是「当前选中地区」= 出口国（HAR 实测）。
+    assert create["json"]["billing_details"] == {"country": "PH", "currency": "PHP"}
     taxes = [post for post in http.posts if post["url"].endswith("/checkout/taxes")][0]
     assert taxes["json"]["billing_country"] == "US"
 
@@ -1165,8 +1187,65 @@ def test_pro_lite_cl_price_keeps_us_billing_country() -> None:
 
     body = _checkout_body(plan="pro_lite", country="CL", currency="CLP", billing_country="US")
     assert body["plan_name"] == "chatgptprolite"
-    # 出口 CL 决定币种；账单国固定 US（与网页端实测一致）。
-    assert body["billing_details"] == {"country": "US", "currency": "CLP"}
+    # 出口 CL 同时决定币种与建单 billing_details；固定 US 账单在 taxes 阶段提交。
+    assert body["billing_details"] == {"country": "CL", "currency": "CLP"}
     assert body["checkout_ui_mode"] == "custom"
     assert body["checkout_source"] == "chatgpt_web_merged"
     assert body["purchase_attempt_id"]
+
+
+def test_extract_sentinel_version_from_page() -> None:
+    from gss_core.sentinel import extract_sentinel_version
+
+    assert extract_sentinel_version('src="/sentinel/20261101001a/sdk.js"') == "20261101001a"
+    assert extract_sentinel_version("frame.html?sv=20260810913b") == "20260810913b"
+    assert extract_sentinel_version("<html></html>") == ""
+
+
+def test_warmup_learns_sentinel_version_and_mint_forwards_it(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_mint(**kwargs):
+        captured.update(kwargs)
+        return {"p": "pow", "c": "chal", "t": "turn"}
+
+    monkeypatch.setattr("gss_core.chatgpt.mint", fake_mint)
+    client = ChatGPTClient(access_token="tok")
+    client._http = _FakeHttp(
+        '<script src="/sentinel/20261101001a/sdk.js"></script>'
+        ' "webDeploymentAttestation":"sig.payload"'
+    )
+    client.warmup(page_url="https://chatgpt.com/")
+    assert client.sentinel_version == "20261101001a"
+
+    client.mint_sentinel(flow="chatgpt_checkout")
+    assert captured["version"] == "20261101001a"
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [("", "20260810913b"), ("20261101001a", "20261101001a")],
+)
+def test_mint_forwards_learned_sv_or_bridge_default(monkeypatch, version, expected) -> None:
+    from types import SimpleNamespace as _NS
+
+    from gss_core import sentinel as sentinel_mod
+
+    sent_payloads: list[dict] = []
+
+    def fake_run(cmd, *, input=None, **kwargs):  # noqa: A002
+        sent_payloads.append(json.loads(input.decode("utf-8")))
+        main = json.dumps({"p": "pow", "c": "chal"})
+        return _NS(returncode=0, stdout=json.dumps({"main": main, "so": ""}).encode(), stderr=b"")
+
+    monkeypatch.setattr(sentinel_mod.subprocess, "run", fake_run)
+    token = sentinel_mod.mint(
+        flow="chatgpt_checkout", device_id="did", user_agent="ua", version=version
+    )
+    assert token["c"] == "chal"
+    # 空 sv 一律回退桥内置版本，绝不把空串透传给 frame.html / sdk.js。
+    assert sent_payloads[0]["version"] == expected
+
+
+def test_client_without_learned_version_leaves_it_empty() -> None:
+    assert ChatGPTClient(access_token="tok").sentinel_version == ""

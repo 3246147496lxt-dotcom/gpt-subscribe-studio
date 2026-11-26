@@ -65,6 +65,47 @@ async def save_proxy_all(request: Request):
         raise HTTPException(400, "代理配置保存失败，请检查参数与文件权限")
 
 
+@router.patch("")
+async def toggle_proxy_all(request: Request):
+    """在不重填账号密码的前提下，统一启用或停用已保存的代理网关。"""
+    try:
+        values = await request.json()
+        enabled = values.get("enabled")
+        if type(enabled) is not bool:
+            raise ValueError("启用状态格式不正确")
+        last = None
+        for role in ROLES:
+            last = store(request).save(role, {"enabled": enabled})
+        assert last is not None
+        return describe_gateway(last)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc) if type(exc) is ValueError else "代理配置更新失败")
+    except (TypeError, AttributeError, OSError):
+        raise HTTPException(400, "代理配置更新失败，请检查参数与文件权限")
+
+
+@router.delete("")
+async def clear_proxy_all(request: Request):
+    """清空提链与支付两个阶段的代理地址与认证信息。"""
+    try:
+        last = None
+        for role in ROLES:
+            last = store(request).save(
+                role,
+                {
+                    "host": "",
+                    "port": 3010,
+                    "scheme": "http",
+                    "enabled": False,
+                    "clear_auth": True,
+                },
+            )
+        assert last is not None
+        return describe_gateway(last)
+    except (ValueError, TypeError, AttributeError, OSError):
+        raise HTTPException(400, "清空代理配置失败，请检查文件权限")
+
+
 @router.put("/{role}")
 async def save_proxy(role: str, request: Request):
     if role not in ROLES:

@@ -32,6 +32,7 @@ def _request_with_impersonate(payload: dict):
                 proxy=str(payload.get("proxy") or "") or None,
                 timeout=float(payload.get("timeout") or 120),
                 impersonate=target,
+                default_headers=False,
             )
         except ValueError as exc:
             last_exc = exc

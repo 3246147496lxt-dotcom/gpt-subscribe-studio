@@ -53,7 +53,9 @@ _PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9._-]{30,}\b")),
     ("proxy_credentials", re.compile(r"https?://[^:/\s@]{1,64}:[^@/\s]{6,}@")),
-    ("card_number_candidate", re.compile(r"\b(?:\d[ -]?){15,16}\b")),
+    # Do not treat the digit tail of a decimal timing value as a card number,
+    # while still catching a real card followed by a sentence-ending period.
+    ("card_number_candidate", re.compile(r"(?<![A-Za-z0-9.])(?:\d[ -]?){15,16}(?![A-Za-z0-9]|\.\d)")),
 ]
 
 

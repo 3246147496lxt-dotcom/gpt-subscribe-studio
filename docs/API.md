@@ -476,7 +476,7 @@ approve
 
 ```json
 {
-  "raw": "http://USER:PASSWORD@HOST:PORT",
+  "raw": "http://<USER>:<PASSWORD>@<HOST>:<PORT>",
   "enabled": true
 }
 ```

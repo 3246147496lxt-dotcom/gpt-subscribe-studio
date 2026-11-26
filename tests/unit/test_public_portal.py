@@ -107,7 +107,7 @@ def test_public_quick_pay_rejects_codex_coming_soon(portal_client: TestClient) -
             "plan": "codex",
             "exit_country": "PH",
             "session": _session_payload(),
-            "card": {"number": "4242424242424242", "exp_month": "12", "exp_year": "2030", "cvc": "123"},
+            "card": {"number": "4242424242424242", "exp_month": "12", "exp_year": "2030", "cvc": "123"},  # release-check: ignore
         },
     )
     assert resp.status_code == 400
@@ -122,7 +122,7 @@ def test_guest_task_isolation_and_user_login_claims_tasks(portal_client: TestCli
             "plan": "plus",
             "exit_country": "PH",
             "session": _session_payload("alice@example.test"),
-            "card": {"number": "4242424242424242", "exp_month": "12", "exp_year": "2030", "cvc": "123"},
+            "card": {"number": "4242424242424242", "exp_month": "12", "exp_year": "2030", "cvc": "123"},  # release-check: ignore
         },
     )
     assert submit.status_code == 202

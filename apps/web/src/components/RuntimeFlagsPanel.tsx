@@ -146,7 +146,7 @@ export function RuntimeFlagsPanel() {
           <Group justify="space-between" align="flex-start" wrap="wrap" gap="sm">
             <div>
               <Group gap="xs" align="center">
-                <Title order={2}>协议与运行时策略开关</Title>
+                <Title order={2}>策略开关</Title>
                 {(snapshot?.override_count ?? 0) > 0 && (
                   <Badge color="violet" variant="light" size="sm">
                     已覆盖 {snapshot?.override_count} 项

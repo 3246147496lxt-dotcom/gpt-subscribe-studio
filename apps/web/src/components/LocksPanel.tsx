@@ -1,5 +1,5 @@
 import {
-  Alert, Badge, Button, Card, Checkbox, Code, Group, Modal, SegmentedControl, Stack, Table, Text, Textarea, TextInput, Title,
+  Alert, Badge, Button, Card, Checkbox, Code, Group, Modal, SegmentedControl, Stack, Table, Text, Textarea, TextInput, Title, Tooltip,
 } from "@mantine/core";
 import { IconLockOpen, IconRefresh, IconShieldCheck } from "@tabler/icons-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -16,18 +16,21 @@ import {
   type ReconcilerStatus,
 } from "../api/ledger";
 import { planLabel } from "../plans";
+import { formatMonthDayTime, planPillTone } from "../utils/orderLedgerFormat";
 import { CopyIdBadge } from "./CopyIdBadge";
 
-const STATE_LABEL: Record<string, { label: string; color: string }> = {
-  held: { label: "锁定中", color: "red" },
-  resolved: { label: "已对账核销", color: "green" },
-  released: { label: "人工已解锁", color: "gray" },
+const STATE_LABEL: Record<string, { label: string; tone: "failed" | "success" | "muted" }> = {
+  held: { label: "锁定中", tone: "failed" },
+  resolved: { label: "已核销", tone: "success" },
+  released: { label: "已解锁", tone: "muted" },
 };
 
 export function LocksPanel({
+  active = true,
   onCountChange,
   onLocksChanged,
 }: {
+  active?: boolean;
   onCountChange?: (heldCount: number) => void;
   onLocksChanged?: () => void;
 }) {
@@ -45,6 +48,7 @@ export function LocksPanel({
   const [releaseNote, setReleaseNote] = useState("");
   const [releaseBusy, setReleaseBusy] = useState(false);
   const loadControllerRef = useRef<AbortController | null>(null);
+  const wasActiveRef = useRef(active);
 
   const load = useCallback(async () => {
     loadControllerRef.current?.abort();
@@ -79,6 +83,14 @@ export function LocksPanel({
       loadControllerRef.current?.abort();
     };
   }, [load]);
+
+  useEffect(() => {
+    const prev = wasActiveRef.current;
+    wasActiveRef.current = active;
+    if (!prev && active) {
+      void load();
+    }
+  }, [active, load]);
 
   async function handleReconcile(lockId: string) {
     setBusyLockId(lockId);
@@ -123,7 +135,7 @@ export function LocksPanel({
         <Stack gap="md">
           <Group justify="space-between" align="flex-start" wrap="wrap">
             <div>
-              <Title order={2}>资金锁与只读自动对账台</Title>
+              <Title order={2}>资金对账</Title>
               <Text c="dimmed" size="sm" mt={4}>
                 自动对账器按阶梯退避只读复核待交付与未知订单，绝不重复发起扣款；未确认扣款结果的账号锁需人工核对账单后释放。
               </Text>
@@ -164,74 +176,87 @@ export function LocksPanel({
               {loading ? "正在加载资金锁记录..." : "当前筛选状态下没有资金锁记录。"}
             </Text>
           ) : (
-            <Table.ScrollContainer minWidth={760}>
-              <Table verticalSpacing="sm" highlightOnHover fz="xs">
+            <Table.ScrollContainer minWidth={820}>
+              <Table className="ledger-clean-table" highlightOnHover={false}>
                 <Table.Thead>
                   <Table.Tr>
-                    <Table.Th>锁状态 / 原因</Table.Th>
+                    <Table.Th>状态</Table.Th>
                     <Table.Th>账号指纹</Table.Th>
-                    <Table.Th>关联订单与支付态</Table.Th>
-                    <Table.Th>时间 / 核销信息</Table.Th>
-                    <Table.Th>操作</Table.Th>
+                    <Table.Th>关联订单</Table.Th>
+                    <Table.Th>金额</Table.Th>
+                    <Table.Th>原因 / 备注</Table.Th>
+                    <Table.Th>锁定时间</Table.Th>
+                    <Table.Th style={{ textAlign: "right" }}>操作</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
                   {locksPage.items.map((item) => {
-                    const meta = STATE_LABEL[item.state] ?? { label: item.state, color: "gray" };
+                    const meta = STATE_LABEL[item.state] ?? { label: item.state, tone: "muted" as const };
+                    const amountText = formatAmount(item.order_amount, item.order_currency);
+                    const fullCreated = new Date(item.created_at).toLocaleString();
                     return (
                       <Table.Tr key={item.id}>
                         <Table.Td>
-                          <Stack gap={4}>
-                            <Badge color={meta.color} variant="light" size="sm">{meta.label}</Badge>
-                            <Text size="xs" c="dimmed">{item.reason}</Text>
-                          </Stack>
+                          <span className={`ledger-pill ledger-pill--status-${meta.tone}`}>
+                            <span className={`ledger-dot ledger-dot--${meta.tone}`} />
+                            {meta.label}
+                          </span>
                         </Table.Td>
                         <Table.Td><Code>{item.lock_key_prefix}</Code></Table.Td>
                         <Table.Td>
-                          <Stack gap={2}>
-                            <Group gap={4} wrap="wrap">
-                              <Text size="xs">订单：</Text>
-                              {item.order_id ? <CopyIdBadge value={item.order_id} prefixLength={10} /> : <Text size="xs">-</Text>}
-                              {item.order_plan && <Text size="xs">· {planLabel(item.order_plan)}</Text>}
-                            </Group>
-                            <Text size="xs" c="dimmed">
-                              状态：{item.order_status || "-"} · 支付：{item.order_payment_status || "-"} · 金额：{formatAmount(item.order_amount, item.order_currency) ?? "-"}
-                            </Text>
-                          </Stack>
+                          <Group gap={6} wrap="nowrap">
+                            {item.order_id ? <CopyIdBadge value={item.order_id} prefixLength={8} /> : <span className="ledger-muted">-</span>}
+                            {item.order_plan && (
+                              <span className={`ledger-pill ledger-pill--plan ledger-pill--plan-${planPillTone(item.order_plan)}`}>
+                                {planLabel(item.order_plan)}
+                              </span>
+                            )}
+                          </Group>
+                        </Table.Td>
+                        <Table.Td>
+                          {amountText ? <span className="ledger-amount">{amountText}</span> : <span className="ledger-muted">-</span>}
                         </Table.Td>
                         <Table.Td>
                           <Stack gap={2}>
-                            <Text size="xs">锁定：{new Date(item.created_at).toLocaleString()}</Text>
-                            {item.released_at && (
-                              <Text size="xs" c="dimmed">
-                                处理：{new Date(item.released_at).toLocaleString()} ({item.released_by || "-"})
+                            <Text size="xs" lineClamp={1} title={item.reason}>{item.reason}</Text>
+                            {item.release_note && (
+                              <Text size="xs" c="dimmed" lineClamp={1} title={item.release_note}>
+                                备注：{item.release_note}{item.released_by ? ` (${item.released_by})` : ""}
                               </Text>
                             )}
-                            {item.release_note && <Text size="xs" c="dimmed">备注：{item.release_note}</Text>}
                           </Stack>
                         </Table.Td>
                         <Table.Td>
-                          {item.state === "held" ? (
-                            <Group gap={6} wrap="nowrap">
-                              <Button size="xs" variant="light" color="blue"
-                                leftSection={<IconShieldCheck size={13} />}
-                                loading={busyLockId === item.id}
-                                onClick={() => void handleReconcile(item.id)}>
-                                只读对账
-                              </Button>
-                              <Button size="xs" variant="outline" color="red"
-                                leftSection={<IconLockOpen size={13} />}
-                                onClick={() => {
-                                  setReleaseTarget(item);
-                                  setReleaseConfirmed(false);
-                                  setReleaseNote("");
-                                }}>
-                                核对后解锁
-                              </Button>
-                            </Group>
-                          ) : (
-                            <Text size="xs" c="dimmed">已归档</Text>
-                          )}
+                          <Tooltip label={fullCreated} openDelay={250} withArrow>
+                            <span className="ledger-time">{formatMonthDayTime(item.created_at)}</span>
+                          </Tooltip>
+                        </Table.Td>
+                        <Table.Td>
+                          <Group gap={6} justify="flex-end" wrap="nowrap">
+                            {item.state === "held" ? (
+                              <>
+                                <Button size="xs" variant="light" color="blue"
+                                  leftSection={<IconShieldCheck size={13} />}
+                                  loading={busyLockId === item.id}
+                                  onClick={() => void handleReconcile(item.id)}>
+                                  只读对账
+                                </Button>
+                                <Button size="xs" variant="light" color="red"
+                                  leftSection={<IconLockOpen size={13} />}
+                                  onClick={() => {
+                                    setReleaseTarget(item);
+                                    setReleaseConfirmed(false);
+                                    setReleaseNote("");
+                                  }}>
+                                  核对解锁
+                                </Button>
+                              </>
+                            ) : (
+                              <span className="ledger-muted">
+                                {item.released_at ? `已处理 ${formatMonthDayTime(item.released_at)}` : "已归档"}
+                              </span>
+                            )}
+                          </Group>
                         </Table.Td>
                       </Table.Tr>
                     );

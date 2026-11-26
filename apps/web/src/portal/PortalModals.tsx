@@ -462,11 +462,15 @@ export function SubscriptionStatusModal({
         });
         setDetail(res);
         setLoading(false);
-        // Phase 2: fetch Stripe portal billing history in background when deferred or refreshing a Stripe plan.
+        // Phase 2: only fall back to Stripe portal billing history when Phase 1 didn't already
+        // return authoritative upstream transaction-history records.
         const needsHistory =
-          res.billingSource === "loading"
-          || res.billingSource === "stripe_portal_timeout"
-          || (forceRefresh && res.paymentChannel === "网页支付" && res.status !== "未订阅");
+          res.billingSource !== "upstream_api"
+          && (
+            res.billingSource === "loading"
+            || res.billingSource === "stripe_portal_timeout"
+            || (forceRefresh && res.paymentChannel === "网页支付" && (res.invoices.length > 0 || res.currency !== "-" || res.status !== "未订阅"))
+          );
         if (needsHistory) {
           void loadBillingHistory(res);
         }
@@ -554,8 +558,14 @@ export function SubscriptionStatusModal({
       : detail.status === "使用中"
         ? ""
         : "is-idle";
-  const planKey = detail ? planThemeKey(detail.planName) : "free";
+  const planKey = detail && detail.status === "使用中" ? planThemeKey(detail.planName) : "free";
   const isRenewOn = detail?.autoRenew === "已开启";
+  const renewChipCls =
+    detail?.autoRenew === "已开启"
+      ? ""
+      : detail?.autoRenew === "已关闭"
+        ? "is-off"
+        : "is-na";
   const queriedHm = detail?.queriedAt ? detail.queriedAt.slice(11, 16) : "--:--";
 
   return (
@@ -647,11 +657,15 @@ export function SubscriptionStatusModal({
                     <div className="aq-period">
                       <div className="aq-date-pair">
                         <span className="aq-cell-label">{lang === "zh" ? "开始时间" : "Start Date"}</span>
-                        <span className="aq-cell-time">{detail.startTime || "-"}</span>
+                        <span className="aq-cell-time">
+                          {detail.startTime || (lang === "zh" ? "暂未查到" : "Not found")}
+                        </span>
                       </div>
                       <div className="aq-date-pair">
                         <span className="aq-cell-label">{lang === "zh" ? "到期时间" : "Expires At"}</span>
-                        <span className="aq-cell-time">{detail.endTime || "-"}</span>
+                        <span className="aq-cell-time">
+                          {detail.endTime || (lang === "zh" ? "暂未查到" : "Not found")}
+                        </span>
                       </div>
                     </div>
                   </div>
@@ -664,7 +678,7 @@ export function SubscriptionStatusModal({
                     <div className="aq-package-content">
                       <div className="aq-plan-name">{detail.planName}</div>
                       <div className="aq-remaining-wrap">
-                        {detail.remainingDays != null ? (
+                        {detail.status === "使用中" && detail.remainingDays != null ? (
                           <>
                             <strong className="aq-remaining">{detail.remainingDays}</strong>
                             <span className="aq-remaining-unit">
@@ -673,7 +687,9 @@ export function SubscriptionStatusModal({
                           </>
                         ) : (
                           <span className="aq-remaining-unit">
-                            {lang === "zh" ? "无到期时间" : "No expiry"}
+                            {detail.status === "未订阅"
+                              ? (lang === "zh" ? "暂无付费订阅" : "No active subscription")
+                              : (lang === "zh" ? "无到期时间" : "No expiry")}
                           </span>
                         )}
                       </div>
@@ -686,7 +702,7 @@ export function SubscriptionStatusModal({
                   <div className="aq-billing-cell">
                     <span className="aq-billing-label">{lang === "zh" ? "自动续费" : "Auto-Renew"}</span>
                     <div className="aq-billing-val-row">
-                      <span className={`aq-renew-chip ${isRenewOn ? "" : "is-off"}`}>
+                      <span className={`aq-renew-chip ${renewChipCls}`}>
                         {detail.autoRenew}
                       </span>
                       {isRenewOn && detail.status === "使用中" && (

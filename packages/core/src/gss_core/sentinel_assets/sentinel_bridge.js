@@ -68,35 +68,84 @@ function uuidv4() {
 }
 
 const SEP = "\u2212"; // U+2212 MINUS SIGN
-const ANS_SDK_URL = "https://sentinel.openai.com/backend-api/sentinel/sdk.js";
 
-function makeGenerator(ua, cores, language, timezone, screenW, screenH) {
-  const initialPerformance = 350.0 + Math.random() * 2200.0;
+// 真 Chrome 的 Date.toString() 括号内是本地化长时区名（Philippine Standard Time），
+// 不是 IANA 标识（Asia/Manila）。bootstrap 侧用同一套 Intl 调用，两段必须一致。
+const _tzNameCache = new Map();
+function localizedTimeZoneName(timezone) {
+  const tz = String(timezone || "America/Chicago");
+  if (_tzNameCache.has(tz)) return _tzNameCache.get(tz);
+  let name = "";
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      timeZoneName: "long",
+    }).formatToParts(new Date());
+    const hit = parts.find((part) => part.type === "timeZoneName");
+    if (hit && hit.value) name = hit.value;
+  } catch (_) {}
+  if (!name) name = tz;
+  _tzNameCache.set(tz, name);
+  return name;
+}
+
+function languageList(language) {
+  const loc = String(language || "en-US").trim() || "en-US";
+  const primary = loc.split("-")[0];
+  const out = [loc];
+  if (primary && !out.includes(primary)) out.push(primary);
+  if (primary !== "en" && !out.includes("en")) out.push("en");
+  return out;
+}
+
+function acceptLanguageHeader(language) {
+  const loc = String(language || "en-US").trim() || "en-US";
+  const primary = loc.split("-")[0];
+  let value = primary && primary !== loc ? `${loc},${primary};q=0.9` : loc;
+  if (primary !== "en") {
+    value += ",en;q=0.8";
+  }
+  return value;
+}
+
+function makeGenerator(ua, cores, language, timezone, screenW, screenH, opts) {
+  const overrides = opts || {};
+  const initialPerformance =
+    typeof overrides.initialPerformance === "number"
+      ? overrides.initialPerformance
+      : 350.0 + Math.random() * 2200.0;
   const sw = Number(screenW) || 1920;
   const sh = Number(screenH) || 1080;
+  const loc = language || "en-US";
+  const tz = timezone || "America/Chicago";
+  const startedAt = Date.now();
   return {
     ua,
     cores: cores || 16,
-    language: language || "en-US",
-    languages: [language || "en-US", "en-US", "en"],
-    timezone: timezone || "America/Chicago",
-    sid: uuidv4(),
-    heapLimit: 4395630592,
+    language: loc,
+    languages: languageList(loc),
+    timezone: tz,
+    tzName: localizedTimeZoneName(tz),
+    // 与 sdk.js 沙箱里那份指纹共用同一 sid / 启动基准，避免同一 flow 两次上报不同设备。
+    sid: overrides.sid || uuidv4(),
+    heapLimit: Number(overrides.heapLimit) || 4294705152,
+    sdkUrl: String(overrides.sdkUrl || ""),
     // 与真实浏览器一致：screen.width + screen.height（指纹数组 [0]）
     screenNum: sw + sh,
     nine: 0,
-    loadTs: Date.now() - initialPerformance,
+    loadTs:
+      typeof overrides.loadTs === "number" && overrides.loadTs > 0
+        ? overrides.loadTs
+        : startedAt - initialPerformance,
     initialPerformance,
-    startedAt: Date.now(),
+    startedAt,
     probeNav: "getBattery" + SEP + "function getBattery() { [native code] }",
     reactKey: "location",
     eventName: "onbeforeunload",
   };
 }
 
-function configArray(g) {
-  const perfNow = g.initialPerformance + Math.max(0, Date.now() - g.startedAt);
-  const now = new Date();
+function formatConfigDate(g, now) {
   let offsetMinutes = 0;
   try {
     const parts = new Intl.DateTimeFormat("en-US", {
@@ -120,17 +169,23 @@ function configArray(g) {
   const p2 = (n) => (n < 10 ? "0" : "") + n;
   const sign = offsetMinutes >= 0 ? "+" : "-";
   const offset = Math.abs(offsetMinutes);
-  const tstr =
+  return (
     `${wd} ${mo} ${p2(d.getUTCDate())} ${d.getUTCFullYear()} ` +
     `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())} ` +
-    `GMT${sign}${p2(Math.floor(offset / 60))}${p2(offset % 60)} (${g.timezone})`;
+    `GMT${sign}${p2(Math.floor(offset / 60))}${p2(offset % 60)} (${g.tzName || g.timezone})`
+  );
+}
+
+function configArray(g) {
+  const perfNow = g.initialPerformance + Math.max(0, Date.now() - g.startedAt);
+  const tstr = formatConfigDate(g, new Date());
   return [
     g.screenNum, // 0
     tstr, // 1
     g.heapLimit, // 2
     0, // 3 PoW 计数器
     g.ua, // 4
-    ANS_SDK_URL, // 5
+    g.sdkUrl, // 5 与 sandbox.__SDK_URL__ 完全一致
     null, // 6
     g.language, // 7
     g.languages.join(","), // 8
@@ -147,12 +202,52 @@ function configArray(g) {
   ];
 }
 
+/* 解码 sdk.js 自己发往 /backend-api/sentinel/req 的 p（base64 指纹数组）。
+ * 这是同一 flow 的「第一份」指纹：PoW 的 p 必须与它逐字段一致
+ * （sdkUrl / sid / heapLimit / 时区名 / UA / 语言 / 屏幕），否则服务端会看到
+ * 两条互相矛盾的设备记录。
+ * 注意：真实 sdk.js 发往 /sentinel/req 的 p 前缀为 "gAAAAAC"（请求前置指纹），
+ * 解完 PoW 的回传答案才用 "gAAAAAB"；两者都必须接受。
+ */
+function decodeReqConfig(rawBody) {
+  try {
+    const body = typeof rawBody === "string" ? rawBody : String(rawBody || "");
+    if (!body) return null;
+    const parsed = JSON.parse(body);
+    const p = String((parsed && parsed.p) || "");
+    let b64 = "";
+    if (p.startsWith("gAAAAAC")) {
+      b64 = p.slice("gAAAAAC".length);
+    } else if (p.startsWith("gAAAAAB")) {
+      b64 = p.slice("gAAAAAB".length);
+    } else {
+      return null;
+    }
+    if (b64.endsWith("~S")) b64 = b64.slice(0, -2);
+    const arr = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+    return Array.isArray(arr) && arr.length >= 18 ? arr : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function powBaseConfig(g, captured) {
+  if (Array.isArray(captured) && captured.length >= 18) {
+    const base = captured.slice();
+    // 计数器与耗时逐次覆盖，其余字段保持 /sentinel/req 里的原值。
+    base[3] = 0;
+    base[9] = g.nine;
+    return base;
+  }
+  return configArray(g);
+}
+
 const MAX_ATTEMPTS = 500000;
 const ERR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D";
 
-function solvePoW(g, seed, difficulty) {
+function solvePoW(g, seed, difficulty, captured) {
   if (!difficulty) difficulty = "0";
-  const data = configArray(g);
+  const data = powBaseConfig(g, captured);
   const seedB = Buffer.from(seed, "ascii");
   const dl = difficulty.length;
   const startedAt = Date.now();
@@ -170,15 +265,32 @@ function solvePoW(g, seed, difficulty) {
   return "gAAAAAB" + ERR_PREFIX + b64Compact(null) + "~S";
 }
 
-function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOrigin, frameUrl, secChUa, secChUaPlatform) {
+
+function highEntropyClientHints(ua) {
+  const m = String(ua || "").match(/(?:Chrome|CriOS)\/(\d+(?:\.\d+)*)/);
+  if (!m) return {};
+  const build = m[1];
+  return {
+    "sec-ch-ua-full-version": `"${build}"`,
+    "sec-ch-ua-full-version-list": `"Google Chrome";v="${build}", "Chromium";v="${build}", "Not(A:Brand";v="24.0.0.0"`,
+    "sec-ch-ua-model": '""',
+  };
+}
+
+function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOrigin, frameUrl, secChUa, secChUaPlatform, capture) {
   // sdk 里的 fetch 桥到 fetchImpl：改写 URL 到 sentinel.openai.com、补头、走代理。
   // 关键：dispatcher 与 fetchImpl 必须来自同一个 undici 版本，否则 Node 内置 fetch
   // 校验外部 dispatcher 的 Request handler 会报 "invalid onRequestStart method"。
+  const extraHints = secChUa ? highEntropyClientHints(ua) : {};
   return function (url, opts) {
     opts = opts || {};
     let u = String(url);
     if (u.indexOf("/backend-api/sentinel/req") !== -1) {
       u = sentinelOrigin + "/backend-api/sentinel/req";
+      // 记下 sdk.js 自己的指纹（p 里的 config 数组），PoW 必须复用它。
+      if (capture && opts.body != null) {
+        capture.reqBody = typeof opts.body === "string" ? opts.body : String(opts.body);
+      }
     } else if (u.charAt(0) === "/") {
       u = sentinelOrigin + u;
     }
@@ -189,8 +301,13 @@ function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOr
         referer: frameUrl,
         "user-agent": ua,
         accept: "*/*",
-        "accept-language": `${language},${language.split("-")[0]};q=0.9,en;q=0.8`,
-        ...(secChUa ? { "sec-ch-ua": secChUa, "sec-ch-ua-mobile": "?0" } : {}),
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "accept-language": acceptLanguageHeader(language),
+        priority: "u=1, i",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        ...(secChUa ? { "sec-ch-ua": secChUa, "sec-ch-ua-mobile": "?0", ...extraHints } : {}),
         ...(secChUaPlatform ? { "sec-ch-ua-platform": secChUaPlatform } : {}),
         ...(cookieHeader ? { cookie: cookieHeader } : {}),
       },
@@ -478,6 +595,8 @@ async function handleRequest(raw) {
 
   // Node 的 crypto/navigator/performance/self 是只读全局，会和 bootstrap 的赋值冲突。
   // 用独立 vm 沙箱（全新 global），只注入 sdk 实际需要的 host 能力。
+  const capture = { reqBody: "" };
+  const sdkUrl = `${sentinelOrigin}/sentinel/${version}/sdk.js`;
   const sandbox = {
     console,
     setTimeout,
@@ -494,7 +613,8 @@ async function handleRequest(raw) {
       sentinelOrigin,
       frameUrl,
       secChUa,
-      secChUaPlatform
+      secChUaPlatform,
+      capture
     ),
     TextEncoder,
     TextDecoder,
@@ -505,12 +625,13 @@ async function handleRequest(raw) {
     URLSearchParams,
     __UA__: ua,
     __CORES__: cores,
-    __SDK_URL__: `${sentinelOrigin}/sentinel/${version}/sdk.js`,
+    __FLOW__: flow,
+    __SDK_URL__: sdkUrl,
     __SEED_DID_KEY__: "oai-did",
     __SEED_DID_VAL__: deviceId,
     __PAGE_URL__: pageUrl,
     __LANGUAGE__: language,
-    __LANGUAGES__: [language, "en-US", "en"],
+    __LANGUAGES__: languageList(language),
     __TIMEZONE__: timezone,
     __COOKIE_HEADER__: cookieHeader,
     __PLATFORM__: platform,
@@ -557,12 +678,22 @@ async function handleRequest(raw) {
     return JSON.stringify({ error: "driver 无 c", soErr: rd.soErr || "", raw: String(rawDriver).slice(0, 300) });
   }
 
-  const g = makeGenerator(ua, cores, language, timezone, screenW, screenH);
+  const g = makeGenerator(ua, cores, language, timezone, screenW, screenH, {
+    // bootstrap 在沙箱里生成的会话 sid / 启动基准 / 堆上限，PoW 直接复用。
+    sid: sandbox.__SENTINEL_SID__,
+    loadTs: sandbox.__LOAD_TS__,
+    initialPerformance: sandbox.__SENTINEL_PERF__,
+    heapLimit: sandbox.__SENTINEL_HEAP_LIMIT__,
+    sdkUrl: sandbox.__SDK_URL__,
+  });
+  // sdk.js 自己发到 /sentinel/req 的指纹数组是同一 flow 的第一份自述；
+  // 能解出来就直接复用，保证 p 与它逐字段一致。
+  const captured = decodeReqConfig(capture.reqBody);
   let p;
   if (rd.powReq && rd.seed) {
-    p = solvePoW(g, rd.seed, rd.diff);
+    p = solvePoW(g, rd.seed, rd.diff, captured);
   } else {
-    const data0 = configArray(g);
+    const data0 = powBaseConfig(g, captured);
     data0[3] = 1;
     p = "gAAAAAB" + b64Compact(data0) + "~S";
   }

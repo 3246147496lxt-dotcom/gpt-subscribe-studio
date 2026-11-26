@@ -2175,6 +2175,11 @@ body {
   color: var(--p-ok-ink);
 }
 
+.aq-renew-chip.is-na {
+  background: var(--p-sunken);
+  color: var(--p-text-secondary);
+}
+
 .aq-currency-pill {
   border: 1px solid var(--p-border);
   background: var(--p-card);

@@ -158,7 +158,7 @@ export function BatchPreflightPanel() {
     <Card withBorder radius="lg" p="lg" className="workspace-panel">
       <Stack gap="md">
         <div>
-          <Title order={2}>批量前置体检与安全入队</Title>
+          <Title order={2}>批量体检</Title>
           <Text c="dimmed" size="sm" mt={4}>
             批量检查多条 Session 的凭证有效性、账单与地区一致性、活跃资金锁及队列状态（单次最多 20 条，绝不接收或落盘银行卡和 Session 明文）。
           </Text>

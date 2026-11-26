@@ -24,7 +24,7 @@ from gss_core.checkout_protocol import run_checkout_protocol
 from gss_core.chatgpt import _processor_from_checkout_url
 from gss_core.vault import vault
 
-from ..public_payment import protocol_view
+from ..public_payment import detect_card_brand, normalize_card_brand, protocol_view
 from ..schemas import AddressedRequest, BillingIn, CardIn
 from ..store import store
 from .. import locks
@@ -132,6 +132,9 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
             and view.payment_intent_id is None):
         view.payment_intent_id = observed_intent
     evidence = result.pop("_receipt_evidence", None)
+    http_trace = result.pop("_http_trace", None)
+    if isinstance(http_trace, dict):
+        view.failure_trace = http_trace
     plus_verified = result.pop("_plus_verified", False) is True
     verified_zero = result.pop("_verified_zero", False) is True and view.amount is not None and Decimal(str(view.amount)) == 0
     if result["state"] == "no_payment_required" and not verified_zero:
@@ -216,6 +219,10 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
             store.update_status(order.id, OrderStatus.PAYING)
     if result.get("code"):
         view.failure_code = str(result["code"])
+    if isinstance(result.get("card"), dict):
+        observed_brand = normalize_card_brand(result["card"].get("brand"))
+        if observed_brand:
+            view.card_brand = observed_brand
     store.persist(order.id)
     result.update({
         "payment_status": view.payment_status,
@@ -315,6 +322,10 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
         billing = _verified_order_billing(order, secrets, *claims)
         order, secrets, view, context = _context(order_id, start=True)
         card = payload.card.model_dump()
+        detected_brand = detect_card_brand(payload.card.number)
+        if detected_brand:
+            view.card_brand = detected_brand
+            store.persist(order.id)
         fingerprint = _form_fingerprint(context, card, billing)
         previous = context.get("request_fingerprint")
         if previous and not hmac.compare_digest(previous, fingerprint):

@@ -24,7 +24,7 @@ def test_filters_static_and_redacts_sensitive_values():
                 "postData": {"mimeType": "application/json", "text": json.dumps({
                     "plan_name": "chatgptprolite",
                     "status": "open",
-                    "card": {"number": "4242424242424242", "cvc": "123"},
+                    "card": {"number": "4242424242424242", "cvc": "123"},  # release-check: ignore
                     "email": "secret@example.com",
                 })},
             },
@@ -57,5 +57,5 @@ def test_filters_static_and_redacts_sensitive_values():
     assert entry["response_json"]["currency"] == "CLP"
     assert entry["response_json"]["amount"] == 1000
     assert entry["response_json"]["client_secret"] == module.REDACTED
-    assert "4242424242424242" not in json.dumps(clean)
+    assert "4242424242424242" not in json.dumps(clean)  # release-check: ignore
     assert "secret@example.com" not in json.dumps(clean)

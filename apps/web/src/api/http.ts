@@ -15,6 +15,32 @@ export function isAbortError(err: unknown): boolean {
   return name === "AbortError";
 }
 
+let redirectingAdminLogin = false;
+
+export function handleAdminAuthRedirect(url: string, status: number, rawMessage?: string): boolean {
+  if (status !== 401 || typeof window === "undefined") return false;
+  const currentPath = window.location.pathname || "";
+  if (!currentPath.startsWith("/admin")) return false;
+  let apiPath = url;
+  try {
+    apiPath = new URL(url, window.location.origin).pathname;
+  } catch {
+    // keep raw url fallback
+  }
+  if (apiPath.startsWith("/api/public/")) return false;
+  // Gateway TestAccessMiddleware emits 401 {"detail": "请先输入访问密码"}.
+  // Upstream ChatGPT session 401s on /api/account/* or /api/promo/* must not log out the admin.
+  const isUpstreamSessionEndpoint =
+    apiPath.startsWith("/api/account/") || apiPath.startsWith("/api/promo/");
+  const isGatewayAuthError = rawMessage === "请先输入访问密码";
+  if (isUpstreamSessionEndpoint && !isGatewayAuthError) return false;
+  if (!redirectingAdminLogin) {
+    redirectingAdminLogin = true;
+    window.location.assign("/login");
+  }
+  return true;
+}
+
 export async function requestJson<T>(url: string, options: HttpRequestOptions = {}): Promise<T> {
   const {
     method = "GET",
@@ -75,6 +101,7 @@ export async function requestJson<T>(url: string, options: HttpRequestOptions = 
     if (!response.ok) {
       const detail = (parsed as { detail?: string | { code?: string; message?: string } } | null)?.detail;
       const rawMessage = typeof detail === "string" ? detail : detail?.message;
+      handleAdminAuthRedirect(response.url || url, response.status, rawMessage);
       const code = typeof detail === "object" && detail ? detail.code : undefined;
       const base = rawMessage || (fallbackError ? `${fallbackError}（HTTP ${response.status}）` : `请求失败 HTTP ${response.status}`);
       throw new Error(includeErrorCode && code ? `${base}（${code}）` : base);

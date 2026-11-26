@@ -53,6 +53,7 @@ import httpx
 from gss_contracts.adapter import PaymentReceiptEvidence
 from .verified_payer import ObservedBillingConflict, check_observed_billing
 from gss_contracts.errors import DomainError, ErrorCode
+from gss_core.failure_trace import build_redacted_http_trace
 from gss_core.chatgpt import (
     APP_BASE,
     STRIPE_API_VERSION,
@@ -342,13 +343,14 @@ class PlusHarProtocol:
             return self._web
         from curl_cffi.requests import Session as CurlSession
 
-        session = CurlSession(impersonate=self.device.impersonate)
+        session = CurlSession(impersonate=self.device.impersonate, default_headers=False)
         if hasattr(session, "trust_env"):
             session.trust_env = False
         if self.proxy:
             session.proxies = {"http": self.proxy, "https": self.proxy}
         session.headers.clear()
         web_headers = self.device.web_headers(referer="https://chatgpt.com/")
+        web_headers.setdefault("accept-encoding", "gzip, deflate, br, zstd")
         if self.browser_context is not None:
             web_headers.update(self.browser_context.headers())
         session.headers.update(web_headers)
@@ -386,13 +388,15 @@ class PlusHarProtocol:
                 detail={"code": "curl_cffi_unavailable", "stage": "transport"},
             ) from None
 
-        session = CurlSession(impersonate=self.device.impersonate, timeout=self.timeout)
+        session = CurlSession(impersonate=self.device.impersonate, timeout=self.timeout, default_headers=False)
         if hasattr(session, "trust_env"):
             session.trust_env = False
         if self.proxy:
             session.proxies = {"http": self.proxy, "https": self.proxy}
         session.headers.clear()
-        session.headers.update(headers)
+        merged_headers = dict(headers)
+        merged_headers.setdefault("accept-encoding", "gzip, deflate, br, zstd")
+        session.headers.update(merged_headers)
         return _RecordingSession(session, self._sink, "stripe")
 
     def _stripe_session(self) -> Any:
@@ -591,7 +595,8 @@ class PlusHarProtocol:
         started = time.monotonic()
         logger.info("plus_har_sentinel_start flow=%s", flow)
         try:
-            self.client.mint_sentinel(flow=flow, page_url="https://chatgpt.com/")
+            # 本方法自己按 HAR 设备档案补 ping，避免同一 /sentinel/req 回两次。
+            self.client.mint_sentinel(flow=flow, page_url="https://chatgpt.com/", ping=False)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "plus_har_sentinel_failed flow=%s type=%s elapsed=%.2f",
@@ -627,7 +632,8 @@ class PlusHarProtocol:
             "plan_name": _PLAN_NAME.get(str(self.plan), "chatgptplusplan"),
             "checkout_source": "chatgpt_web_merged",
             "entry_point": "all_plans_pricing_modal",
-            "billing_details": {"country": self.country, "currency": self.currency},
+            # 对齐实测 HAR：建单时上报出口国 + 出口币种，固定 US 账单在 taxes 阶段提交。
+            "billing_details": {"country": self.exit_country, "currency": self.currency},
             "supports_saved_payment_link": True,
             "checkout_ui_mode": "custom",
             "checkout_appearance": "light",
@@ -642,6 +648,9 @@ class PlusHarProtocol:
         response = self._app("POST", "/backend-api/payments/checkout", json_body=body,
                              telemetry=oai_telemetry_header(),
                              referer="https://chatgpt.com/?cta_tab=personal")
+        if self.client is not None:
+            self.client.sentinel_token = ""
+            self.client.sentinel_so = ""
         payload = _json(response)
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 401:
@@ -1065,12 +1074,24 @@ class PlusHarProtocol:
         if status >= 400 or not token.startswith("ctoken_"):
             error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
             self.last_error = _stripe_error(payload)
+            self.last_http_trace = build_redacted_http_trace(
+                title="Stripe 卡片令牌化",
+                method="POST",
+                url=f"{STRIPE_BASE}/v1/confirmation_tokens",
+                http_status=status or None,
+                stage="payment_tokenize",
+                request_form=form,
+                response_json=payload,
+                response_text=getattr(response, "text", ""),
+            )
             message = redact_sensitive(str(error.get("message") or "confirmation_tokens 失败"))[:200]
             declined = status == 402 or str(error.get("code") or "") in {
                 "card_declined", "expired_card", "incorrect_cvc", "incorrect_number",
             }
-            raise DomainError(ErrorCode.PAYMENT_DECLINED if declined else ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+            exc = DomainError(ErrorCode.PAYMENT_DECLINED if declined else ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                               message)
+            exc._http_trace = self.last_http_trace
+            raise exc
         self.ctoken = token
         logger.info("plus_har_ctoken %s…", token[:14])
         preview = payload.get("payment_method_preview")
@@ -1204,14 +1225,37 @@ class PlusHarProtocol:
         self.raw["confirm"] = payload
         if status >= 400:
             self.last_error = _stripe_error(payload)
+            self.last_http_trace = build_redacted_http_trace(
+                title="Checkout 确认",
+                method="POST",
+                url=f"{APP_BASE}/backend-api/payments/checkout/confirm",
+                http_status=status or None,
+                stage="payment_confirm",
+                request_json=body,
+                response_json=payload,
+                response_text=getattr(response, "text", ""),
+            )
             message = redact_sensitive(str(payload.get("message") or f"confirm HTTP {status}"))[:200]
-            raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, message)
+            exc = DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, message)
+            exc._http_trace = self.last_http_trace
+            raise exc
         self.confirmed = payload
         if str(payload.get("status") or "") == "subscription_limit":
-            raise DomainError(
+            self.last_http_trace = build_redacted_http_trace(
+                title="Checkout 确认",
+                method="POST",
+                url=f"{APP_BASE}/backend-api/payments/checkout/confirm",
+                http_status=status or 200,
+                stage="payment_confirm",
+                request_json=body,
+                response_json=payload,
+            )
+            exc = DomainError(
                 ErrorCode.SUBSCRIPTION_LIMIT,
                 "该账号已达到订阅数量上限（subscription_limit），本次未扣款",
             )
+            exc._http_trace = self.last_http_trace
+            raise exc
         intent_id, secret, return_url = payment_intent_from_confirm(payload)
         if return_url:
             self.confirm_return_url = return_url
@@ -1278,7 +1322,19 @@ class PlusHarProtocol:
             if isinstance(payload, dict) and isinstance(payload.get("next_action"), dict) else "-",
             str(_stripe_error(payload).get("code") or "-")[:60] if isinstance(payload, dict) else "-",
         )
-        if int(getattr(response, "status_code", 0) or 0) >= 400:
+        intent_status_code = int(getattr(response, "status_code", 0) or 0)
+        if intent_status_code >= 400 or str(payload.get("status") or "") in {"requires_payment_method", "canceled"}:
+            self.last_http_trace = build_redacted_http_trace(
+                title="Stripe 支付确认",
+                method="POST",
+                url=f"{STRIPE_BASE}/v1/{kind}/{self.intent_id}/confirm",
+                http_status=intent_status_code or None,
+                stage="payment_confirm",
+                request_form=form,
+                response_json=payload,
+                response_text=getattr(response, "text", ""),
+            )
+        if intent_status_code >= 400:
             self.last_error = _stripe_error(payload)
         return payload
 
@@ -1856,6 +1912,9 @@ def run_har_context(
         payload = outcome(out_state, engine.stage,
                           redact_sensitive(exc.message)[:240], code=code)
         payload["stage"] = engine.stage
+        trace = getattr(exc, "_http_trace", None) or getattr(engine, "last_http_trace", None)
+        if isinstance(trace, dict):
+            payload["_http_trace"] = trace
         return payload
     finally:
         context["har_device"] = engine.device.to_dict()
@@ -1886,6 +1945,8 @@ def run_har_context(
     payload["_plus_verified"] = engine.plus_entitlement_verified
     payload["_verified_zero"] = result.state == "no_payment_required" and engine.receipt_expected_minor == 0
     payload["stage"] = engine.stage
+    if result.state != "paid" and isinstance(getattr(engine, "last_http_trace", None), dict):
+        payload["_http_trace"] = engine.last_http_trace
     return payload
 
 

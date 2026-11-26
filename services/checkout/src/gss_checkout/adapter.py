@@ -202,6 +202,7 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
                 client = ChatGPTClient.reauthorize_oauth(
                     raw_session, proxy=proxy, country=exit_country,
                 )
+            ChatGPTClient._warm_wait((1.2, 2.2))
             resolved_ua = getattr(client, "user_agent", "") or getattr(client, "ua", "")
             snapshot: Dict[str, object] = {
                 "accessToken": client.access_token,

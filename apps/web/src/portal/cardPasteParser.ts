@@ -9,9 +9,9 @@ export type ParsedCardInput = {
 
 /**
  * Parse a pasted card line like:
- * - "4242 4242 4242 4242 | 12/30 | 123"
- * - "4242424242424242 12/2030 123"
- * - "4242424242424242|12|2030|123"
+ * - "4242 4242 4242 4242 | 12/30 | 123"   release-check: ignore
+ * - "4242424242424242 12/2030 123"        release-check: ignore
+ * - "4242424242424242|12|2030|123"        release-check: ignore
  * - Multi-line card dump containing PAN, MM/YY, and CVC.
  */
 export function parseCardPaste(raw: string): ParsedCardInput {

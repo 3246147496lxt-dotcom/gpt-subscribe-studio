@@ -19,11 +19,19 @@ from urllib.parse import quote, urlencode
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.verified_payer import checkout_address, check_observed_billing
 from gss_core.checkout_diagnostics import safe_checkout_diagnostics
+from gss_core.failure_trace import build_redacted_http_trace
 from gss_core.config import ORDER_HTTP_TIMEOUT_S
 from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.money import quote_from_payload
 from gss_core.redaction import redact_sensitive
-from gss_core.sentinel import extract_attestation, extract_build, header_value, mint, so_header_value
+from gss_core.sentinel import (
+    extract_attestation,
+    extract_build,
+    extract_sentinel_version,
+    header_value,
+    mint,
+    so_header_value,
+)
 from gss_core.session_token import (
     SessionBundle,
     identity_cookies_for_reissue,
@@ -63,7 +71,9 @@ def impersonate_for_ua(ua: str) -> str:
 
 
 _CLIENT_VERSION = "prod-db390ebea64862bf1899c420a4c736e0cf639747"
-_CLIENT_BUILD = "7904904"
+# 旧版本硬编码的 7904904 只在没有从页面解析到真实构建号时使用（见 _identity_headers），
+# 默认不再无条件发送过期 build number。
+_CLIENT_BUILD = ""
 # ── 真实 Chrome profile（大版本严格对齐 curl_cffi TLS impersonate 目标）────
 _PROFILES = {
     "windows": {
@@ -114,8 +124,10 @@ _PROFILES = {
     },
 }
 
-# 加权：Windows 占真实用户多数
-_PROFILE_ORDER = ["windows", "windows", "windows", "macos", "macos", "linux"]
+# 默认只用 Windows Chrome：实测 macOS / Linux 档案在支付风控里显著更差
+# （linux.do #80：苹果设备风控明显更高）。需要沿用真实 Session UA 时由
+# `reissue_keep_ua=True` 走 profile_from_session_ua，不受此表限制。
+_PROFILE_ORDER = ["windows"]
 
 
 def _hash8(seed: str, salt: str = "") -> int:
@@ -351,12 +363,14 @@ def hosted_checkout_url(url: str = "", session_id: str = "") -> str:
 
 
 # 浏览器抓包里 payments/checkout 与 checkout/confirm 请求都带这组前端标识。
+# 真实 HAR 里 payments/* 上不存在 `x-oai-mcp-form-version` 与
+# `x-openai-target-path/route`，多发自定义头本身就是指纹偏差。
 _CODEX_WEB_HEADERS = {
     "originator": "Codex Browser",
     "x-openai-web-frontend": "codex_webview",
     "x-openai-codex-window-type": "browser",
-    "x-oai-mcp-form-version": "2",
     "x-openai-checkout-source": "chatgpt_web_merged",
+    "x-openai-rate-limit-join-workspace": "1",
 }
 
 
@@ -432,6 +446,7 @@ def _checkout_body(
     workspace_name: str = "",
     seat_quantity: int = 5,
     price_interval: str = "month",
+    cancel_url: str = "",
 ) -> Dict[str, Any]:
     if str(plan) == "team":
         seats = clamp_team_seats(seat_quantity)
@@ -456,13 +471,15 @@ def _checkout_body(
     body = {
         "entry_point": "all_plans_pricing_modal",
         "plan_name": _PLAN_NAME.get(str(plan), "chatgptplusplan"),
-        # 网页端实测（docs/evidence）：出口 JP 时 billing_details.country 仍为 US，
-        # currency 随出口。账单国固定，币种由出口决定。
-        "billing_details": {"country": (billing_country or country).upper(), "currency": currency},
+        # 实测 HAR（docs/evidence/1029plus-payment-subset.json）：建单时
+        # billing_details 记为「当前选中地区」= 出口国 + 出口币种
+        # （例：JP 出口 → {"country": "JP", "currency": "JPY"}）。
+        # 固定美国免税地址在下一步 POST /payments/checkout/taxes 才提交。
+        "billing_details": {"country": (country or billing_country).upper(), "currency": currency},
         "checkout_source": "chatgpt_web_merged",
         "supports_saved_payment_link": True,
         "checkout_appearance": "light",
-        "cancel_url": f"{APP_BASE}/?cta_tab=personal",
+        "cancel_url": cancel_url or f"{APP_BASE}/?cta_tab=personal",
         "purchase_attempt_id": str(uuid.uuid4()),
         "checkout_ui_mode": "custom",
     }
@@ -523,6 +540,16 @@ def jwt_account_id(access_token: str) -> str:
     return ""
 
 
+def _accept_language(language: str) -> str:
+    """Format Accept-Language without duplicating 'en' on en-* locales."""
+    loc = str(language or "en-US").strip() or "en-US"
+    primary = loc.split("-", 1)[0]
+    value = f"{loc},{primary};q=0.9" if primary and primary != loc else loc
+    if primary != "en":
+        value += ",en;q=0.8"
+    return value
+
+
 def _new_session(*, proxy: Optional[str], timeout: float, impersonate: str = _IMPERSONATE):
     try:
         from curl_cffi.requests import Session as CurlSession
@@ -532,9 +559,9 @@ def _new_session(*, proxy: Optional[str], timeout: float, impersonate: str = _IM
             "缺少 curl_cffi，无法用浏览器指纹请求 ChatGPT",
         ) from exc
     try:
-        session = CurlSession(impersonate=impersonate, timeout=timeout)
+        session = CurlSession(impersonate=impersonate, timeout=timeout, default_headers=False)
     except Exception:
-        session = CurlSession(impersonate="chrome150", timeout=timeout)
+        session = CurlSession(impersonate="chrome150", timeout=timeout, default_headers=False)
     if hasattr(session, "trust_env"):
         session.trust_env = False
     proxy = str(proxy or "").strip()
@@ -549,8 +576,8 @@ class ChatGPTClient:
     timeout: float = ORDER_HTTP_TIMEOUT_S
     account_id: str = ""
     attestation: str = ""
-    client_build_number: str = _CLIENT_BUILD
-    client_version: str = _CLIENT_VERSION
+    client_build_number: str = ""
+    client_version: str = ""
     oai_session_id: str = ""
     session_token: str = ""
     # OAuth refresh token; never serialized, logged or persisted.
@@ -563,6 +590,8 @@ class ChatGPTClient:
     timezone: str = "America/New_York"
     sentinel_token: str = ""
     sentinel_so: str = ""
+    # 页面里解析到的 sentinel 脚本版本（sv）；空则回退桥内置默认值。
+    sentinel_version: str = ""
     purchase_attempt_id: str = ""
     browser_context: Any = field(default=None, repr=False)
     _sec_ch_ua_override: str = field(default="", repr=False)
@@ -572,6 +601,7 @@ class ChatGPTClient:
     _stripe_js_id: str = field(default="", repr=False)
     _elements_session_id: str = field(default="", repr=False)
     _strip_ambient: bool = field(default=False, repr=False)
+    _last_refresh_transport_error: Optional[tuple[str, Optional[int]]] = field(default=None, repr=False)
 
     @classmethod
     def from_raw_session(
@@ -611,6 +641,7 @@ class ChatGPTClient:
         proxy: Optional[str],
         country: str,
         preserve_user_agent: bool = False,
+        warmup_edge: bool = True,
     ) -> "ChatGPTClient":
         """在目标出口用 sessionToken（ST）重新签发 accessToken（AT）。
 
@@ -619,7 +650,8 @@ class ChatGPTClient:
         （可选保留原 UA）重新请求 `/api/auth/session`，拿到绑定当前环境的新 AT。
         """
         bundle = parse_session_bundle(raw)
-        if not bundle.session_token:
+        clean_st = str(bundle.session_token or "").replace("\r", "").replace("\n", "").strip()
+        if not clean_st:
             raise DomainError(
                 ErrorCode.INVALID_SESSION,
                 "跨区充值需要完整 Session（缺少 __Secure-next-auth.session-token）",
@@ -635,7 +667,7 @@ class ChatGPTClient:
         client = cls(
             access_token="",
             proxy=proxy,
-            session_token=bundle.session_token,
+            session_token=clean_st,
             refresh_token=bundle.refresh_token,
             device_id=device,
             user_agent=user_agent,
@@ -644,17 +676,40 @@ class ChatGPTClient:
             language=locale_for(country),
             timezone=timezone_for(country),
             extra_cookies=identity_cookies_for_reissue(
-                {session_cookie: bundle.session_token}
+                {session_cookie: clean_st}
             ),
             _strip_ambient=True,
         )
         try:
+            # 冷连接裸发 session-token 容易在边缘被判成异常：先在同一连接上
+            # 做一次匿名首页文档导航（不带 session-token 凭证），拿到当前出口 IP
+            # 对应的 __cf_bm / _cfuvid；若随机 SID 本身死隧道则直接抛传输错误，
+            # 此时尚未发送任何会话凭证，调用方可安全轮换一次新 SID。
+            if warmup_edge:
+                client.warmup(
+                    reject_unauthorized=False,
+                    anonymous=True,
+                    raise_on_transport_error=bool(proxy),
+                )
+                client._warm_wait((0.4, 1.0))
             # _strip_ambient=True already blocks echoed statsig overrides inside refresh_session.
             if not client.refresh_session(reject_unauthorized=True):
+                if client._last_refresh_transport_error is not None:
+                    raise DomainError(
+                        ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                        "重签发阶段出口代理连接中断（未确认会话失效），请稍后重试。",
+                        detail={
+                            "code": "proxy_tunnel_failed",
+                            "stage": "reissue",
+                            "credentials_sent": True,
+                        },
+                    )
                 raise DomainError(
                     ErrorCode.INVALID_SESSION,
                     f"无法在目标国家 {country} 用 session token 重签发 Session，请检查 session token 或该国家出口代理是否可用",
                 )
+            # 注：重颁完成到建单之间的拟人停顿由调用方（orders.py _human_pause_async /
+            # PlusHarProtocol warm_exit_session）统一执行，避免在线程池内重复背靠背 sleep。
             rotated = client.extra_cookies.get(session_cookie, "")
             if rotated:
                 client.session_token = rotated
@@ -707,13 +762,24 @@ class ChatGPTClient:
             client.close()
             raise
 
-    def _cookie_header(self) -> str:
-        values: Dict[str, str] = dict(self.extra_cookies)
-        if self.session_token:
-            values.setdefault("__Secure-next-auth.session-token", self.session_token)
+    def _cookie_header(self, *, include_session_token: bool = True) -> str:
+        values: Dict[str, str] = {}
+        for name, value in self.extra_cookies.items():
+            clean_name = str(name or "").replace("\r", "").replace("\n", "").strip()
+            if not clean_name or value is None:
+                continue
+            if not include_session_token and clean_name == "__Secure-next-auth.session-token":
+                continue
+            values[clean_name] = str(value).replace("\r", "").replace("\n", "").strip()
+        if include_session_token and self.session_token:
+            clean_st = str(self.session_token).replace("\r", "").replace("\n", "").strip()
+            if clean_st:
+                values.setdefault("__Secure-next-auth.session-token", clean_st)
         if self.device_id:
-            values["oai-did"] = self.device_id
-        return "; ".join(f"{name}={value}" for name, value in values.items() if name and value is not None)
+            clean_did = str(self.device_id).replace("\r", "").replace("\n", "").strip()
+            if clean_did:
+                values["oai-did"] = clean_did
+        return "; ".join(f"{name}={value}" for name, value in values.items() if name)
 
     @property
     def profile(self) -> dict:
@@ -792,29 +858,41 @@ class ChatGPTClient:
             self._http.headers.update(self._identity_headers())
 
     def _identity_headers(self) -> Dict[str, str]:
+        build = self.chrome_build
         headers = {
             "User-Agent": self.ua,
             "Accept": "*/*",
-            "Accept-Language": f"{self.language},{self.language.split('-')[0]};q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": _accept_language(self.language),
             "Authorization": f"Bearer {self.access_token}",
             "Origin": APP_BASE,
             "Referer": f"{APP_BASE}/",
             "Content-Type": "application/json",
+            "priority": "u=1, i",
             "oai-did": self.device_id,
             "oai-device-id": self.device_id,
             "oai-language": self.language,
-            "oai-telemetry": "production",
             "oai-session-id": self.oai_session_id,
-            "oai-client-version": self.client_version,
-            "oai-client-build-number": self.client_build_number,
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
             "sec-ch-ua": self.sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
+            # 高熵 Client Hints：真实 Chrome 在 chatgpt.com 的 API 请求上全部发送。
+            "sec-ch-ua-full-version": f'"{build}"',
+            "sec-ch-ua-full-version-list": (
+                f'"Google Chrome";v="{build}", "Chromium";v="{build}", '
+                f'"Not(A:Brand";v="24.0.0.0"'
+            ),
+            "sec-ch-ua-model": '""',
             **self.profile["hints"],
             "Cookie": self._cookie_header(),
         }
+        # 只在 warmup 真从页面解析到构建号时才发，避免把过期版本写死在指纹里。
+        if self.client_version:
+            headers["oai-client-version"] = self.client_version
+        if self.client_build_number:
+            headers["oai-client-build-number"] = self.client_build_number
         if not self.access_token:
             # 仅凭 session cookie 换 token 时不发空的 Bearer。
             headers.pop("Authorization")
@@ -825,24 +903,23 @@ class ChatGPTClient:
         return headers
 
     def _route_headers(self, route: str, *, page_url: str = "") -> Dict[str, str]:
-        headers = {
-            "Referer": page_url or f"{APP_BASE}/",
-            "x-openai-target-path": route,
-            "x-openai-target-route": route,
-        }
+        headers: Dict[str, str] = {"Referer": page_url or f"{APP_BASE}/"}
+        # 真实 HAR 的 payments/* 请求不带 `x-openai-target-*`；
+        # 其余非支付路由沿用旧契约（旧版本 SPA 确实发送）。
+        if not route.startswith("/backend-api/payments/"):
+            headers["x-openai-target-path"] = route
+            headers["x-openai-target-route"] = route
         if route.startswith("/backend-api/payments/"):
             headers.update(_CODEX_WEB_HEADERS)
+        if route == "/backend-api/payments/checkout":
+            headers["oai-telemetry"] = "[1,null]"
         if route.startswith("/backend-api/payments/") and self.attestation:
             headers["oai-web-deployment-attestation"] = self.attestation
-            headers["OAI-Web-Deployment-Attestation"] = self.attestation
-        if self.sentinel_token:
-            headers["openai-sentinel-token"] = self.sentinel_token
-            headers["OpenAI-Sentinel-Token"] = self.sentinel_token
-        if self.sentinel_so:
-            headers["openai-sentinel-so-token"] = self.sentinel_so
-            headers["OpenAI-Sentinel-SO-Token"] = self.sentinel_so
-        if self.purchase_attempt_id:
-            headers["X-GSS-Purchase-Attempt"] = self.purchase_attempt_id
+        if route.startswith("/backend-api/payments/"):
+            if self.sentinel_token:
+                headers["openai-sentinel-token"] = self.sentinel_token
+            if self.sentinel_so:
+                headers["openai-sentinel-so-token"] = self.sentinel_so
         return headers
 
     def _app_cookie_names(self) -> set[str]:
@@ -853,6 +930,21 @@ class ChatGPTClient:
             cookie.name for cookie in jar
             if cookie.domain in {"", "chatgpt.com", ".chatgpt.com"} and cookie.path == "/"
         }
+
+    def _clear_http_cookie_jar(self) -> None:
+        """Keep curl_cffi's CookieJar empty after harvesting Set-Cookie into extra_cookies."""
+        jar = getattr(self._http, "cookies", None)
+        cookie_store = getattr(jar, "jar", None)
+        if not isinstance(cookie_store, CookieJar):
+            return
+        try:
+            clear = getattr(jar, "clear", None)
+            if callable(clear):
+                clear()
+            else:
+                cookie_store.clear()
+        except Exception:
+            pass
 
     def _merge_cookies(self, previous_names: set[str] | None = None) -> None:
         jar = getattr(self.http, "cookies", None)
@@ -887,6 +979,7 @@ class ChatGPTClient:
         for name, value in gathered.items():
             if name and name not in removed and value is not None:
                 self.extra_cookies[str(name)] = str(value)
+        self._clear_http_cookie_jar()
         self.http.headers.update(self._identity_headers())
 
     def _sync_rotated_session_token(self, response: Any, payload: Dict[str, Any]) -> bool:
@@ -910,6 +1003,8 @@ class ChatGPTClient:
                     pass
             except Exception:  # noqa: BLE001
                 pass
+        if self._http is not None:
+            self._http.headers.update(self._identity_headers())
         logger.info("session_token_rotated")
         return True
 
@@ -923,14 +1018,15 @@ class ChatGPTClient:
         软失败：session-token 缺失/失效、上游报错都返回 False，调用方沿用原
         session 继续。建单方显式要求在 HTTP 401 时以脱敏诊断立即终止。刷新结果只在内存，不落库。
         """
+        self._last_refresh_transport_error = None
         if not self.session_token:
             return False
         # NextAuth /api/auth/session 仅凭 sessionToken Cookie 鉴权；
-        # 绝不携带旧/可能已被吊销的 Authorization Bearer，避免误触发 401。
+        # 绝不携带旧/可能已被吊销的 Authorization Bearer，也不在 GET 请求上发送 Origin/Content-Type。
         http_headers = getattr(self.http, "headers", None)
         prior_auth: list[tuple[str, Any]] = []
         if http_headers is not None and hasattr(http_headers, "pop"):
-            for auth_key in ("Authorization", "authorization"):
+            for auth_key in ("Authorization", "authorization", "Origin", "origin", "Content-Type", "content-type"):
                 old_val = http_headers.pop(auth_key, None)
                 if old_val is not None:
                     prior_auth.append((auth_key, old_val))
@@ -950,10 +1046,17 @@ class ChatGPTClient:
                 headers=self._route_headers("/api/auth/session"),
                 timeout=self.timeout,
             )
-        except Exception:
+        except Exception as exc:
             _restore_auth()
+            curl_code = getattr(exc, "code", None)
+            safe_code = curl_code if isinstance(curl_code, int) else None
+            self._last_refresh_transport_error = (type(exc).__name__, safe_code)
             # Exception strings can contain complete proxy URLs or request headers.
-            logger.warning("session_refresh_transport_error")
+            logger.warning(
+                "session_refresh_transport_error type=%s code=%s",
+                type(exc).__name__,
+                safe_code if safe_code is not None else "-",
+            )
             return False
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 401:
@@ -973,6 +1076,7 @@ class ChatGPTClient:
         self._sync_rotated_session_token(response, payload)
         token = str(payload.get("accessToken") or "").strip()
         if not token:
+            self._clear_http_cookie_jar()
             _restore_auth()
             # session-token 已失效时上游返回 200 + 空 accessToken。
             logger.warning("session 刷新未返回 accessToken（session-token 可能已失效），继续用原 session")
@@ -1063,19 +1167,67 @@ class ChatGPTClient:
         logger.info("oauth_refresh_ok rotated=%s", bool(rotated))
         return True
 
-    def warmup(self, *, page_url: str = "", reject_unauthorized: bool = False) -> None:
+    def warmup(
+        self,
+        *,
+        page_url: str = "",
+        reject_unauthorized: bool = False,
+        anonymous: bool = False,
+        raise_on_transport_error: bool = False,
+    ) -> None:
         url = page_url or f"{APP_BASE}/"
         headers = self._identity_headers()
-        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        if anonymous:
+            headers["Cookie"] = self._cookie_header(include_session_token=False)
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         headers["Referer"] = url
+        headers["sec-fetch-site"] = "none"
         headers["sec-fetch-dest"] = "document"
         headers["sec-fetch-mode"] = "navigate"
+        headers["sec-fetch-user"] = "?1"
         headers["upgrade-insecure-requests"] = "1"
         headers.pop("Content-Type", None)
+        headers.pop("Origin", None)
+        headers.pop("Authorization", None)
+        # curl_cffi merges per-request headers onto session.headers, so omit-only
+        # keys must be temporarily popped from session.headers during document GET.
+        http_headers = getattr(self.http, "headers", None)
+        saved_headers: list[tuple[str, Any]] = []
+        pop_keys: tuple[str, ...] = ("Authorization", "authorization", "Origin", "origin", "Content-Type", "content-type")
+        if anonymous:
+            pop_keys = pop_keys + ("Cookie", "cookie")
+        if http_headers is not None and hasattr(http_headers, "pop"):
+            for key in pop_keys:
+                old = http_headers.pop(key, None)
+                if old is not None:
+                    saved_headers.append((key, old))
         try:
             home = self.http.get(url, headers=headers, timeout=self.timeout)
-        except Exception:
+        except Exception as exc:
+            curl_code = getattr(exc, "code", None)
+            logger.warning(
+                "warmup_transport_error type=%s code=%s",
+                type(exc).__name__,
+                curl_code if isinstance(curl_code, int) else "-",
+            )
+            if raise_on_transport_error:
+                raise DomainError(
+                    ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                    "重签发前出口代理连通失败（未发送会话凭证），请稍后重试。",
+                    detail={
+                        "code": "proxy_tunnel_failed",
+                        "stage": "reissue",
+                        "credentials_sent": False,
+                    },
+                ) from None
             return
+        finally:
+            if http_headers is not None and saved_headers:
+                for key, old in saved_headers:
+                    try:
+                        http_headers[key] = old
+                    except Exception:  # noqa: BLE001
+                        pass
         if reject_unauthorized and getattr(home, "status_code", None) == 401:
             self._reject_unauthorized(home)
         html = str(getattr(home, "text", "") or "")
@@ -1089,6 +1241,9 @@ class ChatGPTClient:
         attestation = extract_attestation(html)
         if attestation:
             self.attestation = attestation
+        sentinel_version = extract_sentinel_version(html)
+        if sentinel_version:
+            self.sentinel_version = sentinel_version
         self._merge_cookies()
 
     def warm_account(self, *, full: bool = False) -> None:
@@ -1205,7 +1360,7 @@ class ChatGPTClient:
         self._merge_cookies()
         return _json(response)
 
-    def mint_sentinel(self, *, flow: str, page_url: str = "") -> None:
+    def mint_sentinel(self, *, flow: str, page_url: str = "", ping: bool = True) -> None:
         token = mint(
             flow=flow,
             device_id=self.device_id,
@@ -1219,6 +1374,7 @@ class ChatGPTClient:
             impersonate=self.impersonate,
             sec_ch_ua=self.sec_ch_ua,
             sec_ch_ua_platform=str(self.profile.get("hints", {}).get("sec-ch-ua-platform") or ""),
+            version=self.sentinel_version,
             **self.sentinel_profile,
         )
         value = header_value(token)
@@ -1231,6 +1387,71 @@ class ChatGPTClient:
             )
         self.sentinel_token = value
         self.sentinel_so = so_header_value(token)
+        # 真浏览器在 /sentinel/req 成功后由 iframe 立刻回一次 /sentinel/ping。
+        # plus_har 自己按 HAR 设备档案 ping，传 ping=False 避免同一 req 回两次。
+        if ping:
+            self._sentinel_ping(page_url=page_url or f"{APP_BASE}/")
+
+    def _sentinel_ping(self, *, page_url: str = "") -> None:
+        """对齐真实浏览器：签发令牌后补一次 `/backend-api/sentinel/ping`。
+
+        纯遥测补齐（受 GSS_HAR_TELEMETRY 控制），软失败且超时上限 5s，
+        绝不阻断建单；错误正文不记录。
+        """
+        if os.environ.get("GSS_HAR_TELEMETRY", "full").strip().lower() == "off":
+            return
+        omit_keys = (
+            "Authorization",
+            "authorization",
+            "Content-Type",
+            "content-type",
+            "chatgpt-account-id",
+            "oai-did",
+            "oai-device-id",
+            "oai-language",
+            "oai-session-id",
+            "oai-client-version",
+            "oai-client-build-number",
+        )
+        http_headers = None
+        saved_headers: list[tuple[str, Any]] = []
+        try:
+            http = self.http
+            headers = self._identity_headers()
+            headers["Accept"] = "*/*"
+            headers["Referer"] = page_url or f"{APP_BASE}/"
+            headers["cache-control"] = "no-cache"
+            headers["pragma"] = "no-cache"
+            # iframe 内的 ping 不带 Bearer、JSON Content-Type 及 SPA 业务头；
+            # curl_cffi 会将单次请求 headers 合并到 session.headers，因此必须临时弹出并恢复。
+            for key in omit_keys:
+                headers.pop(key, None)
+            if type(http).__module__.startswith("curl_cffi"):
+                # libcurl 对空 POST 默认补 application/x-www-form-urlencoded；传 None 彻底禁用。
+                headers["Content-Type"] = None  # type: ignore[assignment]
+            http_headers = getattr(http, "headers", None)
+            if http_headers is not None and hasattr(http_headers, "pop"):
+                for key in omit_keys:
+                    old = http_headers.pop(key, None)
+                    if old is not None:
+                        saved_headers.append((key, old))
+            timeout = max(1.0, min(float(self.timeout or 5.0), 5.0))
+            http.post(
+                f"{APP_BASE}/backend-api/sentinel/ping",
+                data=b"",
+                headers=headers,
+                timeout=timeout,
+            )
+            logger.info("sentinel_ping_ok")
+        except Exception:  # noqa: BLE001
+            logger.info("sentinel_ping_soft_failed")
+        finally:
+            if http_headers is not None and saved_headers:
+                for key, old in saved_headers:
+                    try:
+                        http_headers[key] = old
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def prepare_risk(self, *, flow: str, page_url: str = "", country: str = "") -> None:
         # 语言/时区跟随 Session 签发地（与出口 IP 同区）；没有 statsig 国家才用账单国。
@@ -1251,26 +1472,9 @@ class ChatGPTClient:
         self._check_credentials()
         if self._http is None:
             self._http = _new_session(proxy=self.proxy, timeout=self.timeout, impersonate=self.impersonate)
-            jar = getattr(self._http, "cookies", None)
-            setter = getattr(jar, "set", None) if jar is not None else None
-            if callable(setter):
-                cookies = dict(self.extra_cookies)
-                if self.session_token:
-                    cookies.setdefault("__Secure-next-auth.session-token", self.session_token)
-                if self.device_id:
-                    cookies["oai-did"] = self.device_id
-                for name, value in cookies.items():
-                    if not name or value is None:
-                        continue
-                    try:
-                        setter(str(name), str(value), domain="chatgpt.com")
-                    except TypeError:
-                        try:
-                            setter(str(name), str(value))
-                        except Exception:
-                            continue
-                    except Exception:
-                        continue
+            # Cookies are sent exclusively via _identity_headers()["Cookie"] (and
+            # any Set-Cookie captured in the jar is merged + cleared in _merge_cookies)
+            # so curl_cffi never emits duplicate Cookie headers on the wire.
             self._http.headers.update(self._identity_headers())
         return self._http
 
@@ -1279,14 +1483,25 @@ class ChatGPTClient:
         self._check_credentials()
         if self._stripe_http is None:
             self._stripe_http = _new_session(proxy=self.proxy, timeout=self.timeout, impersonate=self.impersonate)
-            self._stripe_http.headers.update(
-                {
-                    "User-Agent": self.ua,
-                    "Origin": "https://js.stripe.com",
-                    "Referer": "https://js.stripe.com/",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                }
-            )
+            stripe_headers = {
+                "User-Agent": self.ua,
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Accept-Language": _accept_language(self.language),
+                "Origin": "https://js.stripe.com",
+                "Referer": "https://js.stripe.com/",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "priority": "u=1, i",
+                "sec-ch-ua": self.sec_ch_ua,
+                "sec-ch-ua-mobile": "?0",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-site",
+            }
+            platform_hint = self.profile.get("hints", {}).get("sec-ch-ua-platform")
+            if platform_hint:
+                stripe_headers["sec-ch-ua-platform"] = platform_hint
+            self._stripe_http.headers.update(stripe_headers)
         return self._stripe_http
 
     def close(self) -> None:
@@ -1343,16 +1558,49 @@ class ChatGPTClient:
             detail[field + "_state"] = "accepted" if field in detail else ("filtered" if present else "not_found")
         return detail
 
-    def _reject_unauthorized(self, response: Any) -> NoReturn:
+    def _reject_unauthorized(
+        self,
+        response: Any,
+        *,
+        method: str = "GET",
+        url: str = "",
+        title: str = "账号鉴权校验",
+        stage: str = "session_auth",
+        request_json: Any = None,
+    ) -> NoReturn:
         # Pre-checkout account/bootstrap requests can fail before the checkout
         # POST exists. Preserve only this response, never its headers or body.
-        detail = self._checkout_response_detail(response, _json(response))
+        payload = _json(response)
+        detail = self._checkout_response_detail(response, payload)
         message = self._unauthorized_message(response)
         if detail.get("upstream_code") == "token_revoked":
             message = "Session 已被上游撤销（token_revoked），请重新登录 ChatGPT 后导出新 session"
-        raise DomainError(ErrorCode.INVALID_SESSION, message, detail=detail)
+        exc = DomainError(ErrorCode.INVALID_SESSION, message, detail=detail)
+        resolved_url = url or str(getattr(response, "url", "") or f"{APP_BASE}/backend-api/me")
+        exc._http_trace = build_redacted_http_trace(
+            title=title,
+            method=method,
+            url=resolved_url,
+            http_status=detail.get("upstream_status") or 401,
+            stage=stage,
+            request_json=request_json,
+            response_json=payload,
+            response_text=getattr(response, "text", ""),
+            cf_ray=detail.get("cf_ray"),
+            request_id=detail.get("request_id"),
+        )
+        raise exc
 
-    def _reject_checkout(self, response: Any, payload: Dict[str, Any], *, fallback: str = "") -> NoReturn:
+    def _reject_checkout(
+        self,
+        response: Any,
+        payload: Dict[str, Any],
+        *,
+        fallback: str = "",
+        request_body: Any = None,
+        url: str = "",
+        title: str = "Checkout 建单",
+    ) -> NoReturn:
         detail = self._checkout_response_detail(response, payload)
         status = detail.get("upstream_status")
         wire_code = detail.get("upstream_code")
@@ -1381,14 +1629,37 @@ class ChatGPTClient:
         else:
             message = f"上游拒绝创建结账（HTTP {status}）。" if status is not None else "上游拒绝创建结账。"
         logger.warning("upstream_error where=/backend-api/payments/checkout status=%s", status)
-        raise DomainError(code, message, detail=detail)
+        exc = DomainError(code, message, detail=detail)
+        exc._http_trace = build_redacted_http_trace(
+            title=title,
+            method="POST",
+            url=url or f"{APP_BASE}/backend-api/payments/checkout",
+            http_status=status,
+            stage="creating_checkout",
+            request_json=request_body,
+            response_json=payload,
+            response_text=getattr(response, "text", ""),
+            cf_ray=detail.get("cf_ray"),
+            request_id=detail.get("request_id"),
+        )
+        raise exc
 
-    def _raise(self, code: ErrorCode, response: Any, prefix: str) -> None:
+    def _raise(
+        self,
+        code: ErrorCode,
+        response: Any,
+        prefix: str,
+        *,
+        method: str = "POST",
+        url: str = "",
+        request_json: Any = None,
+    ) -> None:
         status = int(getattr(response, "status_code", 0) or 0)
         if status == 401:
-            self._reject_unauthorized(response)
+            self._reject_unauthorized(response, method=method, url=url, title=prefix, request_json=request_json)
         _log_upstream_failure(prefix, response)
-        body = redact_sensitive(str(getattr(response, "text", ""))[:500])
+        raw_text = str(getattr(response, "text", ""))
+        body = redact_sensitive(raw_text[:500])
         headers = getattr(response, "headers", {}) or {}
         detail = {
             "upstream_status": status,
@@ -1397,31 +1668,57 @@ class ChatGPTClient:
             "request_id": str(headers.get("x-request-id") or headers.get("X-Request-Id") or "")[:120],
         }
         detail = {key: value for key, value in detail.items() if value not in (None, "", "-")}
+        trace = build_redacted_http_trace(
+            title=prefix,
+            method=method,
+            url=url or str(getattr(response, "url", "") or f"{APP_BASE}/backend-api/payments/checkout"),
+            http_status=status or None,
+            stage="upstream_request",
+            request_json=request_json,
+            response_json=_json(response),
+            response_text=raw_text,
+            cf_ray=detail.get("cf_ray"),
+            request_id=detail.get("request_id"),
+        )
         lowered = body.lower()
         if "unusual activity" in lowered:
-            raise DomainError(
+            exc = DomainError(
                 ErrorCode.CHECKOUT_UPSTREAM_ERROR,
                 "ChatGPT 判定异常流量。请换一个同国家 SID 节点，"
                 "或用与账单国家相同网络导出的新 session 再试。",
                 detail=detail,
             )
+            exc._http_trace = trace
+            raise exc
         if "billing country must match" in lowered:
-            raise DomainError(
+            exc = DomainError(
                 ErrorCode.BILLING_COUNTRY_MISMATCH,
                 "账单国家必须与出口代理国家一致，请用所选地区的 SID 重试。",
             )
+            exc._http_trace = trace
+            raise exc
         if "already paid" in lowered:
-            raise DomainError(ErrorCode.ALREADY_SUBSCRIBED, f"{prefix}: 该账号已是付费订阅", detail=detail)
+            exc = DomainError(ErrorCode.ALREADY_SUBSCRIBED, f"{prefix}: 该账号已是付费订阅", detail=detail)
+            exc._http_trace = trace
+            raise exc
         if "only for internal checkout sessions" in lowered:
-            raise DomainError(
+            exc = DomainError(
                 code,
                 "ChatGPT 内部确认只接受 oaics_ 会话。当前是 Stripe cs_ 自定义结账，不能调用 /payments/checkout/confirm。",
             )
+            exc._http_trace = trace
+            raise exc
         if status == 403:
-            raise DomainError(code, f"{prefix}: 被拦截（HTTP 403），请检查出口代理是否可用", detail=detail)
+            exc = DomainError(code, f"{prefix}: 被拦截（HTTP 403），请检查出口代理是否可用", detail=detail)
+            exc._http_trace = trace
+            raise exc
         if status >= 500:
-            raise DomainError(code, f"{prefix}失败：ChatGPT 暂时返回 {status}，请换档位或稍后重试", detail=detail)
-        raise DomainError(code, f"{prefix}: HTTP {status} {body}", detail=detail)
+            exc = DomainError(code, f"{prefix}失败：ChatGPT 暂时返回 {status}，请换档位或稍后重试", detail=detail)
+            exc._http_trace = trace
+            raise exc
+        exc = DomainError(code, f"{prefix}: HTTP {status} {body}", detail=detail)
+        exc._http_trace = trace
+        raise exc
 
     def hydrate(self) -> None:
         if not self.account_id:
@@ -1496,11 +1793,12 @@ class ChatGPTClient:
             profile=verified_billing if hasattr(verified_billing, "verification_id") else None,
         )
         campaign_id = str(promo_campaign_id or "").strip()[:120]
-        page_url = (
-            f"{APP_BASE}/?promo_campaign={quote(campaign_id or 'plus-1-month-free', safe='')}"
-            if promo or campaign_id
-            else f"{APP_BASE}/"
-        )
+        # 真实 HAR：建单请求的 Referer 是定价弹窗页（?cta_tab=personal[&promo_campaign=…]），
+        # 与 cancel_url 同源同参，不再是裸首页。
+        page_query = "cta_tab=personal"
+        if promo or campaign_id:
+            page_query += "&promo_campaign=" + quote(campaign_id or "plus-1-month-free", safe="")
+        page_url = f"{APP_BASE}/?{page_query}"
         # Billing country is fixed and may differ from the exit; an upstream echo
         # of the selected exit region is not a payer-address conflict.
         self._billing_exit_country = country
@@ -1520,6 +1818,7 @@ class ChatGPTClient:
             workspace_name=workspace_name,
             seat_quantity=seat_quantity,
             price_interval=price_interval,
+            cancel_url=page_url,
         )
         logger.info(
             "checkout_payload plan=%s exit_country=%s billing_country=%s currency=%s keys=%s",
@@ -1532,18 +1831,32 @@ class ChatGPTClient:
             headers=self._route_headers("/backend-api/payments/checkout", page_url=page_url),
             timeout=self.timeout,
         )
+        # 单次风控令牌只服务这一次建单：后续 GET /checkout/... 与 /checkout/taxes
+        # 必须换成各自的令牌（HAR 里 taxes 完全不带 sentinel 头），
+        # 复用同一份 so/t 会被判成重放。
+        self.sentinel_token = ""
+        self.sentinel_so = ""
         response_status = int(getattr(response, "status_code", 0) or 0)
         if response_status == 401:
             _log_checkout_unauthorized(response, self.http.headers)
         payload = _json(response)
         if response_status >= 400:
-            self._reject_checkout(response, payload)
+            self._reject_checkout(response, payload, request_body=body, url=checkout_url)
         if billing is not None:
             try:
                 check_observed_billing(payload, billing,
                                        alternate_countries=(getattr(self, "_billing_exit_country", ""),))
             except DomainError as exc:
                 exc.detail = self._checkout_response_detail(response, payload)
+                exc._http_trace = build_redacted_http_trace(
+                    title="Checkout 建单",
+                    method="POST",
+                    url=checkout_url,
+                    http_status=response_status,
+                    stage="creating_checkout",
+                    request_json=body,
+                    response_json=payload,
+                )
                 raise
         raw_url = str(payload.get("url") or payload.get("checkout_url") or "").strip()
         checkout_id = public_checkout_id(
@@ -1554,13 +1867,13 @@ class ChatGPTClient:
         if hosted:
             url = hosted_checkout_url(raw_url, stripe_id or checkout_id)
             if not url:
-                self._reject_checkout(response, payload, fallback="未拿到 Team 托管长链")
+                self._reject_checkout(response, payload, fallback="未拿到 Team 托管长链", request_body=body, url=checkout_url)
             session_id = stripe_id or checkout_id
         else:
             # 官方晚间 SPA 常把 cs_live 放在顶层 id；内部 confirm 仍要 oaics_（若响应里有）。
             session_id = internal_id or checkout_id or stripe_id
             if not session_id:
-                self._reject_checkout(response, payload, fallback="结账响应缺少 session id")
+                self._reject_checkout(response, payload, fallback="结账响应缺少 session id", request_body=body, url=checkout_url)
             processor = str(payload.get("processor_entity") or _processor(country))
             path_id = stripe_id if (session_id.startswith("oaics_") and stripe_id) else session_id
             url = raw_url if raw_url.startswith("http") else f"{APP_BASE}/checkout/{processor}/{path_id}"

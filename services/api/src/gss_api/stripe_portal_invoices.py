@@ -72,14 +72,25 @@ def _host_matches(host: str, domains: Tuple[str, ...]) -> bool:
     return any(host == dom or host.endswith("." + dom) for dom in domains)
 
 
-def _safe_path_prefix(path: str) -> str:
+def _safe_path_prefix(path: str, *, max_segments: int = 5) -> str:
     parts: List[str] = []
-    for seg in [s for s in str(path or "").split("/") if s][:3]:
-        if len(seg) <= 24 and re.fullmatch(r"[A-Za-z0-9_-]+", seg) and not re.search(r"[0-9]{4,}|live_|test_|cs_|in_|bps_", seg):
+    for seg in [s for s in str(path or "").split("/") if s][:max_segments]:
+        if len(seg) <= 24 and re.fullmatch(r"[A-Za-z0-9_-]+", seg) and not re.search(r"[0-9]{4,}|live_|test_|cs_|in_|bps_|cus_|sub_", seg):
             parts.append(seg)
         else:
             parts.append("<id>")
     return "/" + "/".join(parts) if parts else "/"
+
+
+def _safe_query_keys(query: str) -> str:
+    if not query:
+        return ""
+    keys: List[str] = []
+    for part in query.split("&")[:10]:
+        key = unquote(part.split("=", 1)[0]).strip()
+        if key and re.fullmatch(r"[A-Za-z0-9_.\[\]-]{1,40}", key) and key not in keys:
+            keys.append(key)
+    return ",".join(keys)
 
 
 def safe_invoice_url(url: Any) -> Optional[str]:
@@ -143,33 +154,128 @@ def _looks_like_invoice_obj(item: Dict[str, Any]) -> bool:
     return bool(has_amount and has_currency and (has_time_or_link or has_status))
 
 
+_GENERIC_INVOICE_DESCRIPTIONS = frozenset({
+    "subscription creation",
+    "subscription update",
+    "subscription renewal",
+    "invoice",
+})
+_CREDIT_LINE_HINTS = (
+    "unused time",
+    "unused portion",
+    "credit for",
+    "proration credit",
+    "未使用时间",
+    "退还",
+)
+
+
+def _metadata_plan_values(meta: Any) -> List[str]:
+    if not isinstance(meta, dict):
+        return []
+    out: List[str] = []
+    for key in ("plan_type", "subscription_plan", "plan", "plan_id", "product_id", "tier", "sku", "lookup_key"):
+        val = meta.get(key)
+        if isinstance(val, str) and val.strip():
+            out.append(val.strip())
+    return out
+
+
+def _line_text_candidates(line: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+    # Check specific internal plan identifiers (lookup_key / plan id / metadata) BEFORE generic product display names
+    # so Pro Lite ($100) is distinguished from Pro ($200) when Stripe exposes a specific lookup_key or metadata.
+    candidates.extend(_metadata_plan_values(line.get("metadata")))
+    for container_key in ("price", "plan"):
+        price = line.get(container_key)
+        if not isinstance(price, dict):
+            continue
+        candidates.extend(_metadata_plan_values(price.get("metadata")))
+        for key in ("lookup_key", "nickname", "name", "id"):
+            val = price.get(key)
+            if isinstance(val, str) and val.strip():
+                candidates.append(val.strip())
+        prod = price.get("product")
+        if isinstance(prod, dict):
+            candidates.extend(_metadata_plan_values(prod.get("metadata")))
+            if isinstance(prod.get("name"), str) and prod["name"].strip():
+                candidates.append(prod["name"].strip())
+    for key in ("plan_name", "product_name", "description"):
+        val = line.get(key)
+        if isinstance(val, str) and val.strip():
+            candidates.append(val.strip())
+    return candidates
+
+
+def _line_numeric_amount(line: Dict[str, Any]) -> Optional[float]:
+    for key in ("amount", "amount_excluding_tax", "subtotal", "total"):
+        val = line.get(key)
+        if isinstance(val, bool) or val is None:
+            continue
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            try:
+                return float(val.strip())
+            except ValueError:
+                continue
+    return None
+
+
 def _line_description(item: Dict[str, Any]) -> str:
-    for key in ("plan_name", "plan", "subscription_plan", "product_name", "description"):
+    for key in ("plan_name", "plan", "subscription_plan", "product_name"):
         val = item.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
+    for val in _metadata_plan_values(item.get("metadata")):
+        if _parse_dom_plan(val):
+            return val
+
     lines = item.get("lines")
     line_items: List[Any] = []
     if isinstance(lines, dict) and isinstance(lines.get("data"), list):
         line_items = lines["data"]
     elif isinstance(lines, list):
         line_items = lines
-    for line in line_items:
+
+    # Proration upgrade invoices (e.g. Plus -> Pro) put the negative unused-time
+    # credit for the old plan first and the positive charge for the new plan second.
+    # Rank lines so the primary positive-amount plan charge always wins.
+    best_score: Optional[Tuple[int, int, int, float, int]] = None
+    best_label = ""
+    for idx, line in enumerate(line_items):
         if not isinstance(line, dict):
             continue
-        for key in ("description", "plan_name", "product_name"):
-            val = line.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-        price = line.get("price") or line.get("plan")
-        if isinstance(price, dict):
-            for key in ("nickname", "name"):
-                val = price.get(key)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-            prod = price.get("product")
-            if isinstance(prod, dict) and isinstance(prod.get("name"), str) and prod["name"].strip():
-                return prod["name"].strip()
+        candidates = _line_text_candidates(line)
+        if not candidates:
+            continue
+        # Prefer more-specific sub-tiers (pro_max / pro_lite) over generic "pro" when both appear on one line.
+        specific_plan = next((c for c in candidates if _parse_dom_plan(c) in {"pro_max", "pro_lite", "team", "go", "plus"}), "")
+        plan_candidate = specific_plan or next((c for c in candidates if _parse_dom_plan(c)), "")
+        label = plan_candidate or candidates[0]
+        raw_desc = str(line.get("description") or "").strip().lower()
+        amt = _line_numeric_amount(line)
+        is_negative = amt is not None and amt < 0
+        is_credit = is_negative or any(tok in raw_desc for tok in _CREDIT_LINE_HINTS)
+        has_plan = bool(plan_candidate)
+        is_positive = amt is not None and amt > 0
+        score = (
+            0 if is_credit else 1,
+            1 if has_plan else 0,
+            1 if is_positive else 0,
+            amt if amt is not None else 0.0,
+            idx,
+        )
+        if best_score is None or score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_label:
+        return best_label
+
+    desc = item.get("description")
+    if isinstance(desc, str) and desc.strip() and desc.strip().lower() not in _GENERIC_INVOICE_DESCRIPTIONS:
+        return desc.strip()
     return ""
 
 
@@ -184,17 +290,26 @@ def _normalize_stripe_invoice(item: Dict[str, Any]) -> Dict[str, Any]:
         or item.get("invoice_date")
         or item.get("created_at")
     )
+    status = str(item.get("status") or item.get("payment_status") or "").strip().lower()
+    if not status and (item.get("paid") is True or transitions.get("paid_at") or item.get("paid_at")):
+        status = "paid"
     amount = item.get("amount_paid")
+    # Voided / open / failed invoices have amount_paid == 0 while the billed amount lives in total/subtotal.
+    if status in {"void", "voided", "open", "uncollectible", "failed"} and (amount is None or amount == 0):
+        for fallback_key in ("total", "amount_due", "subtotal", "amount", "total_amount"):
+            candidate = item.get(fallback_key)
+            if candidate is not None and candidate != 0:
+                amount = candidate
+                break
     if amount is None:
         amount = item.get("total")
     if amount is None:
         amount = item.get("amount_due")
     if amount is None:
+        amount = item.get("subtotal")
+    if amount is None:
         amount = item.get("amount")
     currency = str(item.get("currency") or item.get("currency_code") or "").strip().upper()
-    status = str(item.get("status") or item.get("payment_status") or "").strip().lower()
-    if not status and (item.get("paid") is True or transitions.get("paid_at") or item.get("paid_at")):
-        status = "paid"
     url = safe_invoice_url(item.get("hosted_invoice_url") or item.get("invoice_pdf") or item.get("url"))
     out: Dict[str, Any] = {
         "id": str(item.get("id") or ""),
@@ -263,11 +378,18 @@ def _dedupe_raw_invoices(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return unique
 
 
-def extract_invoices_from_html(html_text: str) -> List[Dict[str, Any]]:
-    """Parse Stripe invoice JSON blobs embedded in portal HTML responses."""
+def _extract_invoices_from_html_with_meta(html_text: str) -> Tuple[List[Dict[str, Any]], bool]:
+    """Parse Stripe invoice JSON blobs embedded in portal HTML responses and track ``has_more``."""
     if not html_text:
-        return []
+        return [], False
     candidates: List[Dict[str, Any]] = []
+    has_more = False
+
+    def _consume(parsed: Any) -> None:
+        nonlocal has_more
+        candidates.extend(extract_invoices_from_json(parsed))
+        if _invoice_list_has_more(parsed) is True:
+            has_more = True
 
     # 1) <script type="application/json"...>{...}</script>
     for match in re.finditer(
@@ -279,10 +401,9 @@ def extract_invoices_from_html(html_text: str) -> List[Dict[str, Any]]:
         if not raw or len(raw) > 3_000_000:
             continue
         try:
-            parsed = json.loads(raw)
+            _consume(json.loads(raw))
         except ValueError:
             continue
-        candidates.extend(extract_invoices_from_json(parsed))
 
     # 2) data-initial-data="..." / data-state="..." attributes
     for match in re.finditer(
@@ -292,10 +413,9 @@ def extract_invoices_from_html(html_text: str) -> List[Dict[str, Any]]:
     ):
         raw = html_lib.unescape(match.group(1)).strip()
         try:
-            parsed = json.loads(raw)
+            _consume(json.loads(raw))
         except ValueError:
             continue
-        candidates.extend(extract_invoices_from_json(parsed))
 
     # 3) window.__INITIAL_STATE__ = {...} / __NEXT_DATA__ / similar JSON assignments
     for match in re.finditer(
@@ -307,12 +427,17 @@ def extract_invoices_from_html(html_text: str) -> List[Dict[str, Any]]:
         if len(raw) > 3_000_000:
             continue
         try:
-            parsed = json.loads(raw)
+            _consume(json.loads(raw))
         except ValueError:
             continue
-        candidates.extend(extract_invoices_from_json(parsed))
 
-    return _dedupe_raw_invoices(candidates)
+    return _dedupe_raw_invoices(candidates), has_more
+
+
+def extract_invoices_from_html(html_text: str) -> List[Dict[str, Any]]:
+    """Parse Stripe invoice JSON blobs embedded in portal HTML responses."""
+    items, _ = _extract_invoices_from_html_with_meta(html_text)
+    return items
 
 
 def _parse_dom_date(text: str) -> Optional[str]:
@@ -370,17 +495,17 @@ def _parse_dom_status(text: str) -> str:
 
 def _parse_dom_plan(text: str) -> str:
     low = (text or "").lower()
-    if "pro max" in low:
+    if any(tok in low for tok in ("pro max", "pro_max", "pro-max", "promax", "chatgptpromax")):
         return "pro_max"
-    if "pro lite" in low:
+    if any(tok in low for tok in ("pro lite", "pro_lite", "pro-lite", "prolite", "chatgptprolite", "pro standard", "pro 5x", "pro5")):
         return "pro_lite"
-    if "chatgpt pro" in low or re.search(r"\bpro\b", low):
+    if "chatgpt pro" in low or "chatgptpro" in low or re.search(r"\bpro\b", low):
         return "pro"
-    if "chatgpt team" in low or "chatgpt business" in low:
+    if "chatgpt team" in low or "chatgpt business" in low or "chatgptteam" in low:
         return "team"
-    if "chatgpt go" in low:
+    if "chatgpt go" in low or "chatgptgo" in low:
         return "go"
-    if "chatgpt plus" in low or re.search(r"\bplus\b", low):
+    if "chatgpt plus" in low or "chatgptplus" in low or re.search(r"\bplus\b", low):
         return "plus"
     return ""
 
@@ -430,7 +555,7 @@ def _playwright_proxy(proxy_url: Optional[str]) -> Optional[Dict[str, str]]:
 
 def _fetch_portal_invoices_http(
     portal_url: str, *, proxy: Optional[str], timeout: float
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], bool]:
     session = _new_session(proxy=proxy, timeout=min(float(timeout), 20.0))
     try:
         response = session.get(
@@ -446,30 +571,32 @@ def _fetch_portal_invoices_http(
         final_host = (urlsplit(str(getattr(response, "url", "") or "")).hostname or "").lower()
         if status >= 400:
             logger.info("account_detail_portal_http status=%s final_host=%s", status, final_host)
-            return []
+            return [], False
         content_type = str((getattr(response, "headers", None) or {}).get("content-type") or "").lower()
         if "json" in content_type:
             try:
-                items = _dedupe_raw_invoices(extract_invoices_from_json(response.json()))
+                parsed = response.json()
+                items = _dedupe_raw_invoices(extract_invoices_from_json(parsed))
+                has_more = _invoice_list_has_more(parsed) is True
                 logger.info(
-                    "account_detail_portal_http status=%s final_host=%s ctype=json count=%s",
-                    status, final_host, len(items),
+                    "account_detail_portal_http status=%s final_host=%s ctype=json count=%s has_more=%s",
+                    status, final_host, len(items), has_more,
                 )
-                return items
+                return items, has_more
             except Exception:  # noqa: BLE001
-                return []
+                return [], False
         text = str(getattr(response, "text", "") or "")
         if len(text) > 5_000_000:
-            return []
-        items = extract_invoices_from_html(text)
+            return [], False
+        items, has_more = _extract_invoices_from_html_with_meta(text)
         logger.info(
-            "account_detail_portal_http status=%s final_host=%s ctype=html len=%s count=%s",
-            status, final_host, len(text), len(items),
+            "account_detail_portal_http status=%s final_host=%s ctype=html len=%s count=%s has_more=%s",
+            status, final_host, len(text), len(items), has_more,
         )
-        return items
+        return items, has_more
     except Exception as exc:  # noqa: BLE001
         logger.info("account_detail_portal_http_error type=%s", type(exc).__name__)
-        return []
+        return [], False
     finally:
         close = getattr(session, "close", None)
         if callable(close):
@@ -552,6 +679,87 @@ def _launch_chromium(pw: Any) -> Any:
     return pw.chromium.launch(headless=True)
 
 
+def _invoice_list_has_more(payload: Any, *, depth: int = 0) -> Optional[bool]:
+    """Detect whether a Stripe invoice list object inside JSON reports ``has_more``."""
+    if depth > 7 or payload is None:
+        return None
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list) and "has_more" in payload:
+            if any(isinstance(el, dict) and _looks_like_invoice_obj(el) for el in data[:10]):
+                return bool(payload.get("has_more"))
+        for key in ("invoices", "invoice_history", "past_invoices", "customer_invoices"):
+            if key in payload:
+                found = _invoice_list_has_more(payload[key], depth=depth + 1)
+                if found is not None:
+                    return found
+        for key, value in payload.items():
+            if key in {"invoices", "invoice_history", "past_invoices", "customer_invoices"}:
+                continue
+            if isinstance(value, (dict, list)):
+                found = _invoice_list_has_more(value, depth=depth + 1)
+                if found is not None:
+                    return found
+    elif isinstance(payload, list):
+        for elem in payload[:20]:
+            if isinstance(elem, (dict, list)):
+                found = _invoice_list_has_more(elem, depth=depth + 1)
+                if found is not None:
+                    return found
+    return None
+
+
+_CLICK_VIEW_MORE_INVOICES_JS = """() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const isVisible = (el) => {
+    if (!el || el.disabled) return false;
+    if (el.getAttribute('aria-disabled') === 'true' || el.getAttribute('aria-hidden') === 'true' || el.hidden) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 1 && r.height > 1;
+  };
+  const allowedText = new Set([
+    'view more',
+    'show more',
+    'load more',
+    'see more',
+    'view all',
+    'show all',
+    'see all',
+    'view more invoices',
+    'show more invoices',
+    'load more invoices',
+    '查看更多',
+    '加载更多',
+    '展开更多',
+  ]);
+  const explicit = document.querySelector(
+    'button[data-testid*="view-more"], button[data-testid*="show-more"], button[data-testid*="load-more"], button[data-testid*="invoice"][data-testid*="more"]'
+  );
+  if (explicit && isVisible(explicit)) {
+    explicit.scrollIntoView({ block: 'center' });
+    explicit.click();
+    return 'testid:' + norm(explicit.innerText).slice(0, 40);
+  }
+  const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'));
+  for (const btn of buttons) {
+    if (!isVisible(btn)) continue;
+    if (btn.tagName === 'A') {
+      const href = (btn.getAttribute('href') || '').trim();
+      if (href && !href.startsWith('#') && !href.startsWith('javascript:')) continue;
+    }
+    const txt = norm(btn.innerText || btn.getAttribute('aria-label') || '');
+    if (allowedText.has(txt)) {
+      btn.scrollIntoView({ block: 'center' });
+      btn.click();
+      return 'text:' + txt;
+    }
+  }
+  return '';
+}"""
+
+
 def _fetch_portal_invoices_browser(
     portal_url: str, *, proxy: Optional[str], timeout: float
 ) -> Tuple[List[Dict[str, Any]], str]:
@@ -566,7 +774,9 @@ def _fetch_portal_invoices_browser(
     xhr_diag: List[str] = []
     portal_session_seen = False
     invoices_list_seen = False
+    latest_has_more: Optional[bool] = None
     first_invoice_ts: Optional[float] = None
+    last_invoice_ts: Optional[float] = None
     first_list_ts: Optional[float] = None
     pw = None
     browser = None
@@ -609,7 +819,8 @@ def _fetch_portal_invoices_browser(
         page = context.new_page()
 
         def _on_response(resp: Any) -> None:
-            nonlocal portal_session_seen, invoices_list_seen, first_invoice_ts, first_list_ts
+            nonlocal portal_session_seen, invoices_list_seen, latest_has_more
+            nonlocal first_invoice_ts, last_invoice_ts, first_list_ts
             try:
                 url = str(resp.url or "")
                 parsed = urlsplit(url)
@@ -635,19 +846,29 @@ def _fetch_portal_invoices_browser(
                             first_list_ts = time.monotonic()
                 if len(xhr_diag) < 12:
                     keys = sorted(data.keys())[:8] if isinstance(data, dict) else [type(data).__name__]
-                    xhr_diag.append(f"{host}{_safe_path_prefix(parsed.path)}:{status}:{','.join(keys)}")
+                    qkeys = _safe_query_keys(parsed.query)
+                    qpart = f"?keys={qkeys}" if qkeys else ""
+                    xhr_diag.append(f"{host}{_safe_path_prefix(parsed.path)}{qpart}:{status}:{','.join(keys)}")
+                resp_has_more = _invoice_list_has_more(data)
+                if resp_has_more is not None:
+                    latest_has_more = resp_has_more
                 extracted = extract_invoices_from_json(data)
                 if extracted:
                     xhr_invoices.extend(extracted)
+                    now_ts = time.monotonic()
                     if first_invoice_ts is None:
-                        first_invoice_ts = time.monotonic()
+                        first_invoice_ts = now_ts
+                    last_invoice_ts = now_ts
+                    if len(xhr_diag) < 12:
+                        statuses = ",".join(sorted({str(x.get("status") or "?") for x in extracted}))
+                        xhr_diag.append(f"invoices_found={len(extracted)}:statuses={statuses}:has_more={resp_has_more}")
             except Exception:  # noqa: BLE001
                 return
 
         page.on("response", _on_response)
         page.goto(portal_url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
 
-        # Actively wait for Stripe Portal XHR responses instead of blind fixed timeouts.
+        # Actively wait for Stripe Portal initial XHR responses.
         deadline = time.monotonic() + wait_budget_s
         while time.monotonic() < deadline:
             now_m = time.monotonic()
@@ -657,6 +878,36 @@ def _fetch_portal_invoices_browser(
                 break
             page.wait_for_timeout(250)
 
+        # Stripe Customer Portal initially fetches only 3 invoices (has_more=true)
+        # and renders a "View more" button to load up to 20+ historical bills.
+        pagination_clicks = 0
+        while (
+            xhr_invoices
+            and pagination_clicks < 3
+            and len(_dedupe_raw_invoices(xhr_invoices)) < 20
+            and latest_has_more is not False
+            and time.monotonic() < (deadline - 1.5)
+        ):
+            before_count = len(_dedupe_raw_invoices(xhr_invoices))
+            before_ts = last_invoice_ts
+            try:
+                clicked = str(page.evaluate(_CLICK_VIEW_MORE_INVOICES_JS) or "")
+            except Exception:  # noqa: BLE001
+                clicked = ""
+            if not clicked:
+                break
+            pagination_clicks += 1
+            page_deadline = min(deadline, time.monotonic() + 5.0)
+            while time.monotonic() < page_deadline:
+                if len(_dedupe_raw_invoices(xhr_invoices)) > before_count:
+                    page.wait_for_timeout(350)
+                    break
+                if latest_has_more is False and last_invoice_ts != before_ts:
+                    break
+                page.wait_for_timeout(200)
+            if len(_dedupe_raw_invoices(xhr_invoices)) <= before_count:
+                break
+
         final_parsed = urlsplit(str(getattr(page, "url", "") or ""))
         final_host = (final_parsed.hostname or "").lower()
         final_prefix = _safe_path_prefix(final_parsed.path)
@@ -664,8 +915,8 @@ def _fetch_portal_invoices_browser(
         if xhr_invoices:
             deduped = _dedupe_raw_invoices(xhr_invoices)
             logger.info(
-                "account_detail_portal_browser stage=browser_xhr final=%s%s count=%s xhr=%s",
-                final_host, final_prefix, len(deduped), xhr_diag[:6],
+                "account_detail_portal_browser stage=browser_xhr final=%s%s count=%s clicks=%s has_more=%s xhr=%s",
+                final_host, final_prefix, len(deduped), pagination_clicks, latest_has_more, xhr_diag[:6],
             )
             return deduped, "browser_xhr"
 
@@ -715,12 +966,16 @@ def fetch_portal_invoices(
     if not url:
         return [], "invalid_portal_url"
 
-    http_items = _fetch_portal_invoices_http(url, proxy=proxy, timeout=min(float(timeout), 15.0))
-    if http_items:
+    http_items, http_has_more = _fetch_portal_invoices_http(
+        url, proxy=proxy, timeout=min(float(timeout), 15.0)
+    )
+    if http_items and not http_has_more:
         logger.info("account_detail_portal_invoices stage=http count=%s", len(http_items))
         return http_items, "http"
 
     if os.environ.get("GSS_PORTAL_BROWSER_SCRAPE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        if http_items:
+            return http_items, "http"
         return [], "browser_disabled"
 
     browser_items, stage = _fetch_portal_invoices_browser(url, proxy=proxy, timeout=timeout)
@@ -729,6 +984,12 @@ def fetch_portal_invoices(
         next_proxy = retry_proxy if retry_proxy is not None else proxy
         logger.info("account_detail_portal_retry prev_stage=%s", stage)
         browser_items, stage = _fetch_portal_invoices_browser(url, proxy=next_proxy, timeout=timeout)
+    if http_items and len(browser_items) < len(http_items):
+        logger.info(
+            "account_detail_portal_invoices stage=http_fallback http_count=%s browser_count=%s",
+            len(http_items), len(browser_items),
+        )
+        return http_items, "http"
     logger.info("account_detail_portal_invoices stage=%s count=%s", stage, len(browser_items))
     return browser_items, stage
 

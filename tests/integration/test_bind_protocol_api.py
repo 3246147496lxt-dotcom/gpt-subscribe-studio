@@ -19,7 +19,7 @@ def legacy():
     context = {"protocol_flow": True}
     spec = {"account_id": "account_fixture", "country": "US", "promo": False,
             "expected_amount": "20.00", "expected_currency": "USD"}
-    card = {"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2040"}
+    card = {"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2040"}  # release-check: ignore
     billing = {"name": "Fixture", "email": "fixture@example.test", "country": "US", "state": "OR",
                "city": "Portland", "line1": "Fixture Street", "postal_code": "97211"}
     class Client:

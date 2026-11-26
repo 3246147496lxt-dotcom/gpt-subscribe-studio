@@ -208,12 +208,42 @@ def _sid_alphabet() -> str:
     return string.ascii_letters + string.digits if alnum else string.digits
 
 
+def cooling_sids() -> set[str]:
+    """仍处于冷却期（被上游风控标记过）的 SID 集合。
+
+    建单命中 unusual_activity / invalid_session 时会把该出口 SID 写进
+    ``proxy-leases.json`` 的 cooldowns；随机 SID 生成必须跳过它们，
+    否则新订单会立刻落回刚被拒绝的同一条出口。
+    """
+    try:
+        data = _lease_read(proxy_lease_path())
+    except Exception:  # noqa: BLE001
+        return set()
+    now = time.time()
+    cooling: set[str] = set()
+    for row in data.get("cooldowns") or []:
+        try:
+            until = float(row.get("until") or 0)
+        except (TypeError, ValueError):
+            continue
+        sid = str(row.get("sid") or "").strip()
+        if sid and until > now:
+            cooling.add(sid)
+    return cooling
+
+
 def new_proxy_sid() -> str:
     # GSS_PROXY_SID pins the sticky session (debugging / solver-IP alignment).
     pinned = os.environ.get("GSS_PROXY_SID", "").strip()
     if pinned:
         return pinned
     alphabet = _sid_alphabet()
+    cooling = cooling_sids()
+    if cooling:
+        for _ in range(20):
+            sid = "".join(secrets.choice(alphabet) for _ in range(8))
+            if sid not in cooling:
+                return sid
     return "".join(secrets.choice(alphabet) for _ in range(8))
 
 
@@ -253,11 +283,11 @@ def rewrite_proxy_exit(proxy: str, *, region: str = "", sid: str = "") -> str:
 
 def fresh_proxy_sid(exclude: set[str] | None = None) -> str:
     """Generate a SID even when GSS_PROXY_SID is pinned (checkout retry only)."""
-    exclude = {str(item) for item in (exclude or set())}
+    excluded = {str(item) for item in (exclude or set())} | cooling_sids()
     alphabet = _sid_alphabet()
     for _ in range(20):
         sid = "".join(secrets.choice(alphabet) for _ in range(8))
-        if sid not in exclude:
+        if sid not in excluded:
             return sid
     return "".join(secrets.choice(alphabet) for _ in range(12))
 
@@ -436,6 +466,7 @@ __all__ = [
     "configured_proxy",
     "route_username",
     "new_proxy_sid",
+    "cooling_sids",
     "rewrite_proxy_exit",
     "rotate_proxy_sid",
     "preflight_proxy",

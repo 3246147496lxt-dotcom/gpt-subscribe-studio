@@ -8,6 +8,19 @@ import { parseBatchSessions } from "../src/utils/batchSessions";
 import { detectCardBrand, formatCardNumber, isLuhnValid, stripCardDigits } from "../src/utils/cardFormat";
 import { computeQuickPayFlow, describeFailureDetail } from "../src/utils/quickPayProgress";
 import { inspectSession, maskEmail } from "../src/utils/sessionInspect";
+import {
+  autoRenewLabel,
+  buildTimingBreakdown,
+  deliveryStatusLabel,
+  formatDurationClock,
+  formatDurationMs,
+  formatMonthDayTime,
+  formatPreciseDuration,
+  hasFailureReason,
+  paymentStatusLabel,
+  simpleOrderStatus,
+  sourceLabel,
+} from "../src/utils/orderLedgerFormat";
 
 function makeJwt(claims: Record<string, unknown>): string {
   const encode = (obj: Record<string, unknown>) =>
@@ -104,6 +117,7 @@ test("parseBatchSessions supports single JSON, blank lines, --- dividers and lab
 
 test("buildOrderLedgerExportUrl omits default 'all' filters and encodes active filters", () => {
   assert.equal(buildOrderLedgerExportUrl({ status: "all", plan: "all" }), "/api/orders/export.csv");
+  assert.equal(buildOrderLedgerExportUrl({ status: "all", plan: "all", source: "all" }), "/api/orders/export.csv");
   const url = buildOrderLedgerExportUrl({
     status: "succeeded",
     plan: "plus",
@@ -115,6 +129,59 @@ test("buildOrderLedgerExportUrl omits default 'all' filters and encodes active f
     url,
     "/api/orders/export.csv?status=succeeded&plan=plus&search=ord-1&date_from=2026-01-01&date_to=2026-01-31",
   );
+  assert.equal(
+    buildOrderLedgerExportUrl({ source: "portal", status: "failed" }),
+    "/api/orders/export.csv?status=failed&source=portal",
+  );
+});
+
+test("orderLedgerFormat renders Chinese operational labels and human durations", () => {
+  assert.equal(sourceLabel("portal"), "用户门户");
+  assert.equal(sourceLabel("quick_pay"), "后台一键");
+  assert.equal(sourceLabel("step"), "分步调试");
+  assert.equal(paymentStatusLabel("succeeded"), "已支付");
+  assert.equal(paymentStatusLabel("unpaid"), "未支付");
+  assert.equal(deliveryStatusLabel("verify_delayed"), "延迟核验");
+  assert.equal(autoRenewLabel("manual_required"), "需人工关续费");
+  assert.equal(formatDurationMs(null), null);
+  assert.equal(formatDurationMs(420), "420ms");
+  assert.equal(formatDurationMs(5120), "5.1s");
+  assert.equal(formatDurationMs(125_000), "2m 5s");
+  assert.equal(formatDurationClock(null), null);
+  assert.equal(formatDurationClock(420), "00:01");
+  assert.equal(formatDurationClock(48_000), "00:48");
+  assert.equal(formatDurationClock(63_000), "01:03");
+  assert.match(formatMonthDayTime("2026-11-24T11:40:00Z"), /^\d{2}\/\d{2} \d{2}:\d{2}$/);
+  assert.deepEqual(simpleOrderStatus("delivered"), { label: "成功", tone: "success" });
+  assert.deepEqual(simpleOrderStatus("rejected"), { label: "失败", tone: "failed" });
+  assert.deepEqual(simpleOrderStatus("unknown"), { label: "待核对", tone: "warning" });
+  assert.deepEqual(simpleOrderStatus("awaiting_payment"), { label: "处理中", tone: "pending" });
+  assert.equal(hasFailureReason({ status: "delivered" }), false);
+  assert.equal(hasFailureReason({ status: "awaiting_payment" }), false);
+  assert.equal(hasFailureReason({ status: "rejected", failure_code: "unusual_activity" }), true);
+
+  // Timing breakdown avoids double-counting create_order_ms + create_checkout_ms
+  assert.equal(formatPreciseDuration(850), "850 ms");
+  assert.equal(formatPreciseDuration(12910), "12.91s");
+  const tb = buildTimingBreakdown({
+    total_ms: 16800,
+    auto_cancel_renew: true,
+    timings_ms: {
+      queue_ms: 5,
+      preflight_ms: 20,
+      create_checkout_ms: 12910,
+      create_order_ms: 12935,
+      payment_ms: 3100,
+      cancel_renew_ms: 750,
+      total_ms: 16800,
+    },
+  });
+  assert.equal(tb.totalMs, 16800);
+  const byKey = Object.fromEntries(tb.segments.map((s) => [s.key, s]));
+  assert.equal(byKey.create_checkout_ms.ms, 12910);
+  assert.equal(byKey.payment_ms.ms, 3100);
+  assert.equal(byKey.cancel_renew_ms.ms, 750);
+  assert.equal(byKey.other_ms, undefined);
 });
 
 test("isAbortError recognizes AbortError objects cleanly", () => {

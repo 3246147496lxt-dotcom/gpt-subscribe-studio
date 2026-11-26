@@ -10,8 +10,23 @@ export type OrderLedgerStats = {
   active_locks: number;
 };
 
+export type OrderLedgerDiagnostics = {
+  stage?: string;
+  upstream_status?: number;
+  upstream_code?: string;
+  cf_ray?: string;
+  request_id?: string;
+  [key: string]: unknown;
+};
+
 export type OrderLedgerItem = {
   id: string;
+  source?: "portal" | "quick_pay" | "step" | string;
+  account_email?: string | null;
+  masked_email?: string | null;
+  portal_username?: string | null;
+  account_tag?: string | null;
+  card_brand?: string | null;
   plan: string;
   billing_country: string;
   exit_country?: string | null;
@@ -20,17 +35,36 @@ export type OrderLedgerItem = {
   delivery_status: string;
   amount?: string | null;
   currency?: string | null;
+  tax_delta?: string | null;
   failure_code?: string | null;
   last_error?: string | null;
   purchase_attempt_id?: string | null;
   payment_intent_id?: string | null;
+  checkout_session_id?: string | null;
+  checkout_kind?: string | null;
+  route_profile?: string | null;
+  billing_mode?: string | null;
+  billing_verified?: boolean;
+  session_reissued?: boolean;
   auto_cancel_renew: boolean;
   auto_renew_status: string;
+  auto_renew_attempts?: number;
   auto_renew_canceled_at?: string | null;
   auto_renew_error?: string | null;
+  auto_renew_http_status?: number | null;
+  proxy_rotations?: number;
+  proxy_last_sid?: string | null;
+  proxy_last_exit_ip?: string | null;
   job_id?: string | null;
+  job_status?: string | null;
+  job_stage?: string | null;
+  job_attempts?: number;
   reconcile_attempts: number;
+  last_reconciled_at?: string | null;
   active_lock_id?: string | null;
+  total_ms?: number | null;
+  timings_ms?: Record<string, number>;
+  diagnostics?: OrderLedgerDiagnostics;
   created_at: string;
   updated_at: string;
   unknown_since?: string | null;
@@ -103,6 +137,7 @@ export type ReconcilerStatus = {
 export type OrderLedgerFilter = {
   status?: string;
   plan?: string;
+  source?: string;
   search?: string;
   date_from?: string;
   date_to?: string;
@@ -114,6 +149,7 @@ function buildLedgerQuery(params: OrderLedgerFilter): URLSearchParams {
   const query = new URLSearchParams();
   if (params.status && params.status !== "all") query.set("status", params.status);
   if (params.plan && params.plan !== "all") query.set("plan", params.plan);
+  if (params.source && params.source !== "all") query.set("source", params.source);
   if (params.search) query.set("search", params.search);
   if (params.date_from) query.set("date_from", params.date_from);
   if (params.date_to) query.set("date_to", params.date_to);
@@ -133,8 +169,39 @@ export function buildOrderLedgerExportUrl(params: Omit<OrderLedgerFilter, "limit
   return qs ? `/api/orders/export.csv?${qs}` : "/api/orders/export.csv";
 }
 
+export type OrderFailureExchange = {
+  title: string;
+  method?: string | null;
+  url?: string | null;
+  http_status?: number | null;
+  request?: unknown;
+  response?: unknown;
+  captured?: boolean;
+};
+
+export type OrderFailureDetail = {
+  order_id: string;
+  title: string;
+  summary: string;
+  error_code?: string | null;
+  stage?: string | null;
+  upstream_status?: number | null;
+  upstream_code?: string | null;
+  cf_ray?: string | null;
+  request_id?: string | null;
+  exchange?: OrderFailureExchange | null;
+  events: QuickPayEvent[];
+};
+
 export async function getOrderEvents(orderId: string, signal?: AbortSignal): Promise<QuickPayEvent[]> {
   return requestJson<QuickPayEvent[]>(`/api/orders/${encodeURIComponent(orderId)}/events`, {
+    cache: "no-store",
+    signal,
+  });
+}
+
+export async function getOrderFailureDetail(orderId: string, signal?: AbortSignal): Promise<OrderFailureDetail> {
+  return requestJson<OrderFailureDetail>(`/api/orders/${encodeURIComponent(orderId)}/failure-detail`, {
     cache: "no-store",
     signal,
   });

@@ -43,7 +43,7 @@ def test_roundtrip_persists_unknown_and_never_stores_secret_fields(tmp_path):
     columns = {row[1] for row in conn.execute("PRAGMA table_info(orders)")}
     assert not {"card", "cvc", "session", "session_token", "cookie"} & columns
     dump = "\n".join(conn.iterdump())
-    assert "4242424242424242" not in dump
+    assert "4242424242424242" not in dump  # release-check: ignore
     assert "super-secret-session" not in dump
     conn.close()
     db.close()

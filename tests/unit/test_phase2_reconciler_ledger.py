@@ -327,3 +327,265 @@ def test_ledger_locks_and_reconciler_endpoints(_isolated_phase2):
         health_resp = client.get("/api/health")
         assert health_resp.status_code == 200
         assert "reconciler" in health_resp.json()
+
+
+def test_ledger_enriched_fields_source_filter_search_and_csv_redaction(_isolated_phase2):
+    db, store = _isolated_phase2
+
+    # 1) Portal order (joined with quick_pay_jobs + portal_tasks + portal_users)
+    portal_fp = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    o_portal, v_portal = _seed_order(
+        store,
+        order_id="ord-portal-1",
+        status=OrderStatus.DELIVERED,
+        payment_status="succeeded",
+        delivery_status="delivered",
+        fingerprint=portal_fp,
+        auto_cancel_renew=True,
+    )
+    v_portal.exit_country = "JP"
+    v_portal.account_email = "alice@example.com"
+    v_portal.card_brand = "VISA"
+    v_portal.checkout_session_id = "cs_portal_abc123"
+    v_portal.checkout_kind = "custom"
+    v_portal.route_profile = "A"
+    v_portal.billing_verified = True
+    v_portal.session_reissued_for_country = True
+    v_portal.tax_delta = "0.00"
+    v_portal.auto_renew_status = "canceled"
+    v_portal.auto_renew_attempts = 1
+    v_portal.auto_renew_http_status = 200
+    v_portal.proxy_rotations = 2
+    v_portal.proxy_last_sid = "supersecretproxysid999"
+    v_portal.proxy_last_exit_ip = "203.0.113.42"
+    store.persist(o_portal.id)
+
+    db.create_portal_user(user_id="pu-1", username="alice_ops", password_hash="scrypt$fake")
+    job_portal = order_flow.QuickPayJob(
+        id="job-portal-1",
+        idempotency_key="idem-ord-portal-1",
+        account_fingerprint=portal_fp,
+        status="succeeded",
+        stage="succeeded",
+        order_id=o_portal.id,
+        amount="20.00",
+        currency="USD",
+        timings={"preflight_ms": 210, "payment_ms": 3400, "total_ms": 5120},
+    )
+    db.save_job(job_portal)
+    db.bind_portal_task(
+        job_id=job_portal.id,
+        owner_user_id="pu-1",
+        guest_token_hash=None,
+        guest_expires_at=None,
+        masked_email="al***@example.com",
+        plan="plus",
+        exit_country="JP",
+    )
+
+    # 2) Admin QuickPay order (job without portal_tasks) with upstream diagnostics
+    o_qp, v_qp = _seed_order(
+        store,
+        order_id="ord-qp-fail",
+        status=OrderStatus.REJECTED,
+        payment_status="unpaid",
+        delivery_status="pending",
+        plan=Plan.PRO,
+    )
+    v_qp.failure_code = "unusual_activity"
+    v_qp.last_error = "上游风控拒绝"
+    store.persist(o_qp.id)
+    job_qp = order_flow.QuickPayJob(
+        id="job-qp-fail",
+        idempotency_key="idem-ord-qp-fail",
+        account_fingerprint="fp-phase2",
+        status="failed",
+        stage="failed",
+        order_id=o_qp.id,
+        diagnostics={
+            "stage": "creating_checkout",
+            "upstream_status": 403,
+            "upstream_code": "unusual_activity",
+            "cf_ray": "abcdef0123456789-lax",
+            "secret_leak": "must-not-appear",
+        },
+        timings={"create_checkout_ms": 820, "total_ms": 1450},
+    )
+    db.save_job(job_qp)
+
+    # 3) Step-by-step order (no quick_pay_jobs)
+    _seed_order(
+        store,
+        order_id="ord-step-1",
+        status=OrderStatus.AWAITING_PAYMENT,
+        payment_status="unpaid",
+        delivery_status="pending",
+    )
+
+    with TestClient(main.create_app()) as client:
+        # Source filtering
+        assert [i["id"] for i in client.get("/api/orders?source=portal").json()["items"]] == ["ord-portal-1"]
+        assert [i["id"] for i in client.get("/api/orders?source=quick_pay").json()["items"]] == ["ord-qp-fail"]
+        assert [i["id"] for i in client.get("/api/orders?source=step").json()["items"]] == ["ord-step-1"]
+
+        # Enriched fields & strict redaction on portal item
+        portal_item = client.get("/api/orders?source=portal").json()["items"][0]
+        assert portal_item["source"] == "portal"
+        assert portal_item["account_email"] == "alice@example.com"
+        assert portal_item["card_brand"] == "VISA"
+        assert portal_item["portal_username"] == "alice_ops"
+        assert portal_item["masked_email"] == "al***@example.com"
+        assert portal_item["account_tag"] == "a1b2c3d4"
+        assert portal_item["checkout_session_id"] == "cs_portal_abc123"
+        assert portal_item["checkout_kind"] == "custom"
+        assert portal_item["route_profile"] == "A"
+        assert portal_item["billing_verified"] is True
+        assert portal_item["session_reissued"] is True
+        assert portal_item["tax_delta"] == "0.00"
+        assert portal_item["auto_renew_attempts"] == 1
+        assert portal_item["auto_renew_http_status"] == 200
+        assert portal_item["proxy_rotations"] == 2
+        assert portal_item["proxy_last_exit_ip"] == "203.0.113.42"
+        assert portal_item["proxy_last_sid"] is not None
+        assert "supersecretproxysid999" not in portal_item["proxy_last_sid"]
+        assert portal_item["total_ms"] == 5120
+        assert portal_item["timings_ms"]["payment_ms"] == 3400
+
+        # Enriched diagnostics with allowlist enforcement
+        qp_item = client.get("/api/orders?source=quick_pay").json()["items"][0]
+        assert qp_item["diagnostics"]["upstream_status"] == 403
+        assert qp_item["diagnostics"]["upstream_code"] == "unusual_activity"
+        assert qp_item["diagnostics"]["cf_ray"] == "abcdef0123456789-lax"
+        assert "secret_leak" not in qp_item["diagnostics"]
+
+        # Expanded search: email, card brand, username, checkout session id, job id, failure code
+        assert [i["id"] for i in client.get("/api/orders?search=alice@example.com").json()["items"]] == ["ord-portal-1"]
+        assert [i["id"] for i in client.get("/api/orders?search=VISA").json()["items"]] == ["ord-portal-1"]
+        assert [i["id"] for i in client.get("/api/orders?search=alice_ops").json()["items"]] == ["ord-portal-1"]
+        assert [i["id"] for i in client.get("/api/orders?search=al***@example.com").json()["items"]] == ["ord-portal-1"]
+        assert [i["id"] for i in client.get("/api/orders?search=cs_portal_abc123").json()["items"]] == ["ord-portal-1"]
+        assert [i["id"] for i in client.get("/api/orders?search=job-qp-fail").json()["items"]] == ["ord-qp-fail"]
+        assert [i["id"] for i in client.get("/api/orders?search=unusual_activity").json()["items"]] == ["ord-qp-fail"]
+
+        # CSV export includes enriched fields, supports source filter, and never leaks raw SID or password hash
+        csv_resp = client.get("/api/orders/export.csv?source=portal")
+        assert csv_resp.status_code == 200
+        csv_text = csv_resp.content.decode("utf-8-sig")
+        assert "source,account_email,portal_username,masked_email,account_tag,plan,card_brand" in csv_text
+        assert "alice@example.com" in csv_text
+        assert "VISA" in csv_text
+        assert "alice_ops" in csv_text
+        assert "al***@example.com" in csv_text
+        assert "ord-portal-1" in csv_text
+        assert "ord-qp-fail" not in csv_text
+        assert "supersecretproxysid999" not in csv_text
+        assert "scrypt$fake" not in csv_text
+
+
+def test_detect_and_normalize_card_brand():
+    from gss_api.public_payment import detect_card_brand, normalize_card_brand
+
+    assert detect_card_brand("4111-1111") == "VISA"
+    assert detect_card_brand("5200 1234") == "Mastercard"
+    assert detect_card_brand("2221 0000") == "Mastercard"
+    assert detect_card_brand("3782 8224") == "Amex"
+    assert detect_card_brand("6222 0200") == "UnionPay"
+    assert detect_card_brand("6011 1111") == "Discover"
+    assert detect_card_brand("3528 0000") == "JCB"
+    assert detect_card_brand("123") is None
+    assert normalize_card_brand("visa") == "VISA"
+    assert normalize_card_brand("mastercard") == "Mastercard"
+    assert normalize_card_brand("american express") == "Amex"
+
+
+def test_failure_detail_endpoint_redacts_captured_trace_and_supports_legacy_orders(_isolated_phase2):
+    from gss_core.failure_trace import build_redacted_http_trace
+
+    db, store = _isolated_phase2
+
+    # 1) New failed order with captured redacted HTTP trace (like Checkout 确认 -> subscription_limit)
+    o_cap, v_cap = _seed_order(
+        store,
+        order_id="ord-confirm-limit",
+        status=OrderStatus.REJECTED,
+        payment_status="unpaid",
+        delivery_status="pending",
+    )
+    v_cap.failure_code = "subscription_limit"
+    v_cap.last_error = "该账号已达到订阅数量上限"
+    v_cap.failure_trace = build_redacted_http_trace(
+        title="Checkout 确认",
+        method="POST",
+        url="https://chatgpt.com/backend-api/payments/checkout/confirm?secret=dropme",
+        http_status=200,
+        stage="payment_confirm",
+        request_json={
+            "checkout_session_id": "oaics_secret_1234567890",
+            "confirm_token": "ctoken_secret_abcdef1234",
+            "selected_payment_method_type": "card",
+            "client_secret": "pi_123_secret_xyz999",
+        },
+        response_json={"status": "subscription_limit"},
+    )
+    store.persist(o_cap.id)
+
+    # 2) Historical failed order without failure_trace_json
+    o_leg, v_leg = _seed_order(
+        store,
+        order_id="ord-legacy-fail",
+        status=OrderStatus.REJECTED,
+        payment_status="unpaid",
+        delivery_status="pending",
+    )
+    v_leg.failure_code = "unusual_activity"
+    v_leg.last_error = "上游报告异常流量，已停止建单。"
+    store.persist(o_leg.id)
+    job_leg = order_flow.QuickPayJob(
+        id="job-legacy-fail",
+        idempotency_key="idem-ord-legacy-fail",
+        account_fingerprint="fp-phase2",
+        status="failed",
+        stage="failed",
+        order_id=o_leg.id,
+        diagnostics={
+            "stage": "creating_checkout",
+            "upstream_status": 400,
+            "cf_ray": "abcdef0123456789-atl",
+        },
+    )
+    db.save_job(job_leg)
+
+    with TestClient(main.create_app()) as client:
+        r1 = client.get("/api/orders/ord-confirm-limit/failure-detail")
+        assert r1.status_code == 200
+        body1 = r1.json()
+        assert body1["title"] == "开通失败详情"
+        assert body1["error_code"] == "SUBSCRIPTION_LIMIT"
+        assert body1["stage"] == "payment_confirm"
+        ex1 = body1["exchange"]
+        assert ex1["captured"] is True
+        assert ex1["title"] == "Checkout 确认"
+        assert ex1["method"] == "POST"
+        assert ex1["url"] == "https://chatgpt.com/backend-api/payments/checkout/confirm"
+        assert ex1["http_status"] == 200
+        assert ex1["request"]["json"]["checkout_session_id"] == "[REDACTED]"
+        assert ex1["request"]["json"]["confirm_token"] == "[REDACTED]"
+        assert ex1["request"]["json"]["client_secret"] == "[REDACTED]"
+        assert ex1["request"]["json"]["selected_payment_method_type"] == "card"
+        assert ex1["response"] == {"status": "subscription_limit"}
+        raw1 = r1.text
+        assert "oaics_secret_1234567890" not in raw1
+        assert "ctoken_secret_abcdef1234" not in raw1
+        assert "pi_123_secret_xyz999" not in raw1
+        assert "dropme" not in raw1
+
+        r2 = client.get("/api/orders/ord-legacy-fail/failure-detail")
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["error_code"] == "UNUSUAL_ACTIVITY"
+        assert body2["stage"] == "creating_checkout"
+        assert body2["cf_ray"] == "abcdef0123456789-atl"
+        assert body2["exchange"]["captured"] is False
+        assert body2["exchange"]["title"] == "Checkout 建单"
+        assert body2["exchange"]["http_status"] == 400
+        assert body2["exchange"]["url"] == "https://chatgpt.com/backend-api/payments/checkout"

@@ -261,19 +261,26 @@ class StripeProtocol:
             if self.proxy:
                 proxies = {"http": self.proxy, "https": self.proxy}
             target_impersonate = impersonate_for_ua(self.ua)
+            base_headers = {
+                "User-Agent": self.ua,
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+            }
             try:
                 self._client = curl_requests.Session(
                     impersonate=target_impersonate,
                     proxies=proxies,
                     timeout=self.timeout,
-                    headers={"User-Agent": self.ua, "Accept": "application/json"},
+                    headers=base_headers,
+                    default_headers=False,
                 )
             except Exception:
                 self._client = curl_requests.Session(
                     impersonate="chrome150",
                     proxies=proxies,
                     timeout=self.timeout,
-                    headers={"User-Agent": self.ua, "Accept": "application/json"},
+                    headers=base_headers,
+                    default_headers=False,
                 )
             log(f"   使用 curl_cffi（Chrome TLS 指纹 {target_impersonate}）")
         return self._client

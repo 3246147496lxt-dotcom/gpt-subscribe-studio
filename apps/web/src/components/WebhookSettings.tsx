@@ -1,5 +1,5 @@
 import {
-  Alert, Badge, Button, Card, Checkbox, Code, Group, PasswordInput, Stack, Switch, Table, Text, TextInput, Title,
+  Alert, Button, Card, Checkbox, Code, Group, PasswordInput, Stack, Switch, Table, Text, TextInput, Title, Tooltip,
 } from "@mantine/core";
 import { IconBellRinging, IconCheck, IconRefresh, IconSend } from "@tabler/icons-react";
 import { useCallback, useEffect, useState } from "react";
@@ -11,6 +11,7 @@ import {
   type WebhookDelivery,
   type WebhookSettings,
 } from "../api/webhooks";
+import { formatMonthDayTime } from "../utils/orderLedgerFormat";
 
 const EVENT_LABELS: Record<string, string> = {
   succeeded: "充值成功（succeeded）",
@@ -111,7 +112,7 @@ export function WebhookSettings() {
         <Stack gap="md">
           <Group justify="space-between" align="flex-start" wrap="wrap">
             <div>
-              <Title order={2}>Webhook 事件告警设置</Title>
+              <Title order={2}>告警通知</Title>
               <Text c="dimmed" size="sm" mt={4}>
                 任务终态、需要 3DS/人工验证（requires_action）、账号加锁（unknown）与对账核销时异步推送脱敏通知（兼容通用 JSON、飞书、钉钉、Slack）。
               </Text>
@@ -181,32 +182,42 @@ export function WebhookSettings() {
           {deliveries.length === 0 ? (
             <Text size="sm" c="dimmed">暂无 Webhook 投递记录。</Text>
           ) : (
-            <Table verticalSpacing="xs" highlightOnHover withTableBorder fz="xs">
-              <Table.Thead>
-                <Table.Tr>
-                  <Table.Th>结果</Table.Th>
-                  <Table.Th>事件</Table.Th>
-                  <Table.Th>HTTP / 错误</Table.Th>
-                  <Table.Th>耗时 / 尝试</Table.Th>
-                  <Table.Th>时间</Table.Th>
-                </Table.Tr>
-              </Table.Thead>
-              <Table.Tbody>
-                {deliveries.map((d) => (
-                  <Table.Tr key={d.id}>
-                    <Table.Td>
-                      <Badge size="xs" color={d.ok ? "green" : "red"} variant="light">
-                        {d.ok ? "成功" : "失败"}
-                      </Badge>
-                    </Table.Td>
-                    <Table.Td><Code>{d.event}</Code></Table.Td>
-                    <Table.Td>{d.status_code ?? d.error ?? "-"}</Table.Td>
-                    <Table.Td>{d.elapsed_ms} ms · {d.attempts} 次</Table.Td>
-                    <Table.Td>{new Date(d.created_at).toLocaleString()}</Table.Td>
+            <Table.ScrollContainer minWidth={560}>
+              <Table className="ledger-clean-table" highlightOnHover={false}>
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>结果</Table.Th>
+                    <Table.Th>事件</Table.Th>
+                    <Table.Th>HTTP / 错误</Table.Th>
+                    <Table.Th>耗时 / 尝试</Table.Th>
+                    <Table.Th>投递时间</Table.Th>
                   </Table.Tr>
-                ))}
-              </Table.Tbody>
-            </Table>
+                </Table.Thead>
+                <Table.Tbody>
+                  {deliveries.map((d) => {
+                    const tone = d.ok ? "success" : "failed";
+                    return (
+                      <Table.Tr key={d.id}>
+                        <Table.Td>
+                          <span className={`ledger-pill ledger-pill--status-${tone}`}>
+                            <span className={`ledger-dot ledger-dot--${tone}`} />
+                            {d.ok ? "成功" : "失败"}
+                          </span>
+                        </Table.Td>
+                        <Table.Td><Code>{d.event}</Code></Table.Td>
+                        <Table.Td>{d.status_code ?? d.error ?? "-"}</Table.Td>
+                        <Table.Td><span className="ledger-time">{d.elapsed_ms} ms · {d.attempts} 次</span></Table.Td>
+                        <Table.Td>
+                          <Tooltip label={new Date(d.created_at).toLocaleString()} openDelay={250} withArrow>
+                            <span className="ledger-time">{formatMonthDayTime(d.created_at)}</span>
+                          </Tooltip>
+                        </Table.Td>
+                      </Table.Tr>
+                    );
+                  })}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
           )}
         </Stack>
       </Card>

@@ -11,6 +11,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 
@@ -36,6 +37,7 @@ from gss_contracts.errors import DomainError, ErrorCode
 from gss_account import FakeAccountAdapter
 from gss_checkout import FakeCheckoutAdapter
 from gss_core.checkout_diagnostics import safe_checkout_diagnostics
+from gss_core.failure_trace import load_redacted_http_trace
 from gss_core.billing import address_for
 from gss_core.fixed_billing import BILLING_COUNTRY
 from gss_core.config import ORDER_HTTP_TIMEOUT_S, load_settings, use_fake_adapters
@@ -59,6 +61,7 @@ from gss_core.proxies import (
     ProxyPreflightError,
     checkout_proxy_for,
     configured_exit_country,
+    cool_proxy,
     proxy_exit_sid,
     rotate_proxy_sid,
     verify_refresh_egress,
@@ -86,7 +89,7 @@ from gss_payment.adapter import FakePaymentAdapter, hosted_payment_result
 
 from ..runtime import build_pipeline
 from ..verified_billing import require_verified_billing
-from ..public_payment import issuer_action, read_text, receipt_view
+from ..public_payment import detect_card_brand, issuer_action, normalize_card_brand, read_text, receipt_view
 from ..schemas import (
     AddressedRequest,
     BillingIn,
@@ -94,6 +97,8 @@ from ..schemas import (
     ErrorOut,
     ModeIn,
     OrderCreateRequest,
+    OrderFailureDetailOut,
+    OrderFailureExchangeOut,
     OrderLedgerItemOut,
     OrderLedgerOut,
     OrderLedgerStatsOut,
@@ -105,7 +110,7 @@ from ..schemas import (
     TeamPrepareRequest,
     TeamQuoteRequest,
 )
-from ..persistence import get_db_optional
+from ..persistence import get_db_optional, load_checkout_diagnostics
 from ..store import store
 from .. import locks, purchase_claims
 from .events import notify_order_update
@@ -533,6 +538,44 @@ def _reissue_keep_ua() -> bool:
     return runtime_flags.get_bool("reissue_keep_ua")
 
 
+async def _human_pause_async(interval: tuple[float, float] = (1.5, 2.5)) -> None:
+    """重颁 → 建单之间的拟人停顿。
+
+    真人不会在拿到新 AT 的同一毫秒就去建单；0ms 抢跑是明显的脚本特征
+    （实测失败单 b08cc2ad）。``GSS_WARMUP_INTERVAL=0`` 供单测/离线模式零延迟。
+    """
+    configured = os.environ.get("GSS_WARMUP_INTERVAL", "").strip()
+    if configured:
+        try:
+            delay = max(0.0, float(configured))
+        except ValueError:
+            delay = random.uniform(*interval)
+    else:
+        delay = random.uniform(*interval)
+    if delay:
+        await asyncio.sleep(delay)
+
+
+def _quarantine_exit(exit_proxy: str | None, failure_code: str) -> None:
+    """把触发风控的出口 SID 放进冷却黑名单，避免下个订单立刻复用。
+
+    与 plus_har_protocol 的 ``_note_exit_rejection`` 保持同一处置口径：
+    绝不重试本单，只隔离这条出口。
+    """
+    if not exit_proxy:
+        return
+    try:
+        seconds = int(os.environ.get("GSS_PROXY_COOLDOWN_SECONDS", "1800") or 1800)
+    except ValueError:
+        seconds = 1800
+    try:
+        result = cool_proxy(exit_proxy, reason=f"checkout:{failure_code}", seconds=max(1, seconds))
+    except Exception:  # noqa: BLE001
+        logger.warning("checkout_proxy_cooldown_failed code=%s", failure_code)
+        return
+    logger.info("checkout_proxy_cooled code=%s cooled=%s", failure_code, bool(result.get("cooled")))
+
+
 def _mark(progress: Callable[[str], None] | None, stage: str) -> None:
     if progress is not None:
         try:
@@ -628,10 +671,122 @@ def _csv_safe(value: Any) -> str:
     return text
 
 
+_HEX_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{16,64}$")
+_TIMING_KEY_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def _derive_order_source(row: dict[str, Any]) -> str:
+    if row.get("portal_task_job_id"):
+        return "portal"
+    if row.get("job_id"):
+        return "quick_pay"
+    return "step"
+
+
+def _safe_account_tag(fingerprint: Optional[str]) -> Optional[str]:
+    fp = (fingerprint or "").strip().lower()
+    if _HEX_FINGERPRINT_RE.fullmatch(fp):
+        return fp[:8]
+    return None
+
+
+def _parse_timings_ms(raw: Any) -> dict[str, int]:
+    data = raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except Exception:
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in data.items():
+        if isinstance(k, str) and _TIMING_KEY_RE.fullmatch(k) and isinstance(v, (int, float)) and not isinstance(v, bool):
+            ival = int(v)
+            if 0 <= ival <= 86_400_000:
+                out[k] = ival
+    return out
+
+
+def _compute_total_ms(row: dict[str, Any], timings_ms: dict[str, int]) -> Optional[int]:
+    if "total_ms" in timings_ms:
+        return timings_ms["total_ms"]
+    start_raw = row.get("created_at")
+    end_raw = row.get("finished_at") or row.get("job_finished_at")
+    if not start_raw or not end_raw:
+        return None
+    try:
+        start = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+        end = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+        delta_ms = int((end - start).total_seconds() * 1000)
+        return delta_ms if 0 <= delta_ms <= 86_400_000 else None
+    except Exception:
+        return None
+
+
+def _ledger_item_from_row(row: dict[str, Any]) -> OrderLedgerItemOut:
+    timings_ms = _parse_timings_ms(row.get("timings_json"))
+    diagnostics = load_checkout_diagnostics(row.get("diagnostics_json"))
+    raw_http = row.get("auto_renew_http_status")
+    auto_renew_http = int(raw_http) if isinstance(raw_http, int) and not isinstance(raw_http, bool) else None
+    return OrderLedgerItemOut(
+        id=row["id"],
+        source=_derive_order_source(row),
+        account_email=row.get("account_email") or None,
+        masked_email=row.get("masked_email") or None,
+        portal_username=row.get("portal_username") or None,
+        account_tag=_safe_account_tag(row.get("account_fingerprint")),
+        card_brand=normalize_card_brand(row.get("card_brand")),
+        plan=row["plan"],
+        billing_country=row["billing_country"],
+        exit_country=row.get("exit_country"),
+        status=row["status"],
+        payment_status=row.get("payment_status") or "unpaid",
+        delivery_status=row.get("delivery_status") or "pending",
+        amount=row.get("amount"),
+        currency=row.get("currency"),
+        tax_delta=row.get("tax_delta"),
+        failure_code=row.get("failure_code"),
+        last_error=row.get("last_error"),
+        purchase_attempt_id=row.get("purchase_attempt_id"),
+        payment_intent_id=row.get("payment_intent_id"),
+        checkout_session_id=row.get("checkout_session_id"),
+        checkout_kind=row.get("checkout_kind"),
+        route_profile=row.get("route_profile"),
+        billing_mode=row.get("billing_mode"),
+        billing_verified=bool(row.get("billing_verified")),
+        session_reissued=bool(row.get("session_reissued")),
+        auto_cancel_renew=bool(row.get("auto_cancel_renew")),
+        auto_renew_status=row.get("auto_renew_status") or "disabled",
+        auto_renew_attempts=int(row.get("auto_renew_attempts") or 0),
+        auto_renew_canceled_at=row.get("auto_renew_canceled_at"),
+        auto_renew_error=row.get("auto_renew_error"),
+        auto_renew_http_status=auto_renew_http,
+        proxy_rotations=int(row.get("proxy_rotations") or 0),
+        proxy_last_sid=mask_sid(row.get("proxy_last_sid")),
+        proxy_last_exit_ip=row.get("proxy_last_exit_ip"),
+        job_id=row.get("job_id"),
+        job_status=row.get("job_status"),
+        job_stage=row.get("job_stage"),
+        job_attempts=int(row.get("job_attempts") or 0),
+        reconcile_attempts=int(row.get("reconcile_attempts") or 0),
+        last_reconciled_at=row.get("last_reconciled_at"),
+        active_lock_id=row.get("active_lock_id"),
+        total_ms=_compute_total_ms(row, timings_ms),
+        timings_ms=timings_ms,
+        diagnostics=diagnostics,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        unknown_since=row.get("unknown_since"),
+        finished_at=row.get("finished_at") or row.get("job_finished_at"),
+    )
+
+
 @router.get("/orders", response_model=OrderLedgerOut)
 async def list_orders_ledger(
     status_filter: str = Query(default="all", alias="status", max_length=40),
     plan: str = Query(default="all", max_length=40),
+    source: str = Query(default="all", max_length=24),
     search: str = Query(default="", max_length=80),
     date_from: str = Query(default="", max_length=40),
     date_to: str = Query(default="", max_length=40),
@@ -643,39 +798,11 @@ async def list_orders_ledger(
     if db is None:
         return OrderLedgerOut(stats=OrderLedgerStatsOut(), total=0, limit=limit, offset=offset, items=[])
     rows, total = db.list_orders_page(
-        status=status_filter, plan=plan, search=search,
+        status=status_filter, plan=plan, source=source, search=search,
         date_from=date_from, date_to=date_to, limit=limit, offset=offset,
     )
     stats = OrderLedgerStatsOut(**db.order_summary_stats())
-    items = [
-        OrderLedgerItemOut(
-            id=row["id"],
-            plan=row["plan"],
-            billing_country=row["billing_country"],
-            exit_country=row.get("exit_country"),
-            status=row["status"],
-            payment_status=row.get("payment_status") or "unpaid",
-            delivery_status=row.get("delivery_status") or "pending",
-            amount=row.get("amount"),
-            currency=row.get("currency"),
-            failure_code=row.get("failure_code"),
-            last_error=row.get("last_error"),
-            purchase_attempt_id=row.get("purchase_attempt_id"),
-            payment_intent_id=row.get("payment_intent_id"),
-            auto_cancel_renew=bool(row.get("auto_cancel_renew")),
-            auto_renew_status=row.get("auto_renew_status") or "disabled",
-            auto_renew_canceled_at=row.get("auto_renew_canceled_at"),
-            auto_renew_error=row.get("auto_renew_error"),
-            job_id=row.get("job_id"),
-            reconcile_attempts=int(row.get("reconcile_attempts") or 0),
-            active_lock_id=row.get("active_lock_id"),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            unknown_since=row.get("unknown_since"),
-            finished_at=row.get("finished_at"),
-        )
-        for row in rows
-    ]
+    items = [_ledger_item_from_row(row) for row in rows]
     return OrderLedgerOut(stats=stats, total=total, limit=limit, offset=offset, items=items)
 
 
@@ -683,6 +810,7 @@ async def list_orders_ledger(
 async def export_orders_csv(
     status_filter: str = Query(default="all", alias="status", max_length=40),
     plan: str = Query(default="all", max_length=40),
+    source: str = Query(default="all", max_length=24),
     search: str = Query(default="", max_length=80),
     date_from: str = Query(default="", max_length=40),
     date_to: str = Query(default="", max_length=40),
@@ -691,24 +819,47 @@ async def export_orders_csv(
     db = get_db_optional()
     rows = (
         db.export_orders_rows(
-            status=status_filter, plan=plan, search=search,
+            status=status_filter, plan=plan, source=source, search=search,
             date_from=date_from, date_to=date_to,
         )
         if db is not None
         else []
     )
     columns = (
-        "id", "plan", "billing_country", "exit_country", "status",
-        "payment_status", "delivery_status", "amount", "currency",
-        "failure_code", "purchase_attempt_id", "payment_intent_id",
-        "auto_renew_status", "created_at", "updated_at", "finished_at",
+        "created_at", "finished_at", "total_ms",
+        "id", "source", "account_email", "portal_username", "masked_email", "account_tag",
+        "plan", "card_brand", "exit_country", "billing_country", "checkout_kind", "route_profile",
+        "billing_verified", "session_reissued",
+        "amount", "currency", "tax_delta",
+        "status", "payment_status", "delivery_status",
+        "auto_renew_status", "auto_renew_attempts", "auto_renew_canceled_at",
+        "proxy_rotations", "proxy_last_sid", "proxy_last_exit_ip",
+        "failure_code", "upstream_status", "upstream_code",
+        "job_id", "purchase_attempt_id", "checkout_session_id", "payment_intent_id",
+        "reconcile_attempts", "active_lock_id", "updated_at",
     )
     buf = io.StringIO()
     buf.write("\ufeff")
     writer = csv.writer(buf)
     writer.writerow(columns)
     for row in rows:
-        writer.writerow([_csv_safe(row.get(col)) for col in columns])
+        timings_ms = _parse_timings_ms(row.get("timings_json"))
+        diag = load_checkout_diagnostics(row.get("diagnostics_json"))
+        enriched = {
+            **row,
+            "finished_at": row.get("finished_at") or row.get("job_finished_at"),
+            "total_ms": _compute_total_ms(row, timings_ms),
+            "source": _derive_order_source(row),
+            "account_email": row.get("account_email") or None,
+            "card_brand": normalize_card_brand(row.get("card_brand")),
+            "account_tag": _safe_account_tag(row.get("account_fingerprint")),
+            "billing_verified": "true" if row.get("billing_verified") else "false",
+            "session_reissued": "true" if row.get("session_reissued") else "false",
+            "proxy_last_sid": mask_sid(row.get("proxy_last_sid")),
+            "upstream_status": diag.get("upstream_status"),
+            "upstream_code": diag.get("upstream_code"),
+        }
+        writer.writerow([_csv_safe(enriched.get(col)) for col in columns])
     content = buf.getvalue().encode("utf-8")
     return StreamingResponse(
         iter([content]),
@@ -726,6 +877,157 @@ async def get_order_events(order_id: str) -> list[QuickPayEventOut]:
     if db is None:
         return []
     return [QuickPayEventOut(**ev) for ev in db.list_events(order_id=order_id)]
+
+
+_FAILURE_SUMMARY_BY_CODE: Dict[str, str] = {
+    "subscription_limit": "充值账单未通过确认（账号已达订阅上限），本次尚未提交付款。",
+    "already_subscribed": "当前账号已存在有效订阅，本次未创建新账单也未提交付款。",
+    "unusual_activity": "上游风控判定异常流量并拒绝了本次请求，尚未提交付款。请更换同地区出口节点或重新导出 Session 后重试。",
+    "invalid_session": "账号 Session 已失效或被撤销，本次尚未提交付款。请重新登录 ChatGPT 导出完整 Session 后重试。",
+    "session_expired": "账号 Session 已过期，本次尚未提交付款。请重新登录 ChatGPT 导出最新 Session。",
+    "card_declined": "发卡行或 Stripe 拒绝了本次扣款，请核对卡片状态、余额或更换卡片后重试。",
+    "insufficient_funds": "卡片可用余额不足，Stripe 未完成扣款，请充值或更换卡片后重试。",
+    "sentinel_challenge_failed": "上游安全验证未通过，系统已熔断停止，本次未继续扣款。",
+    "proxy_tunnel_failed": "出口代理连接失败，请求未送达上游，请检查代理节点可用性后重试。",
+    "proxy_authentication_failed": "出口代理认证失败，请检查代理账号密码与地区配置。",
+    "billing_country_mismatch": "上游校验账单国家与预期不一致，本次尚未提交付款。",
+    "browser_decode_unavailable": "浏览器解码环境不可用，已停止建单，请检查 Chromium / Playwright 配置。",
+    "checkout_upstream_error": "结账请求未获上游确认，本次尚未提交付款，请核对下方上游返回信息。",
+    "payment_unknown_state": "支付确认结果暂未明确，系统已自动加锁防止重复扣款，请先执行只读对账或核对银行账单。",
+    "upstream_timeout": "上游响应超时，请勿立即重复扣款，请先核对订单状态或执行只读对账。",
+}
+
+_STAGE_ENDPOINT_DEFAULTS: Dict[str, tuple[str, str, str]] = {
+    "creating_checkout": ("Checkout 建单", "POST", "https://chatgpt.com/backend-api/payments/checkout"),
+    "checkout": ("Checkout 建单", "POST", "https://chatgpt.com/backend-api/payments/checkout"),
+    "payment_confirm": ("Checkout 确认", "POST", "https://chatgpt.com/backend-api/payments/checkout/confirm"),
+    "confirming_payment": ("Checkout 确认", "POST", "https://chatgpt.com/backend-api/payments/checkout/confirm"),
+    "payment": ("Checkout 确认", "POST", "https://chatgpt.com/backend-api/payments/checkout/confirm"),
+    "payment_tokenize": ("Stripe 卡片令牌化", "POST", "https://api.stripe.com/v1/confirmation_tokens"),
+    "reissuing": ("Session 跨区重签发", "GET", "https://chatgpt.com/api/auth/session"),
+    "session_refresh": ("Session 刷新", "GET", "https://chatgpt.com/api/auth/session"),
+    "session_auth": ("账号鉴权校验", "GET", "https://chatgpt.com/backend-api/me"),
+    "preflight": ("前置自动体检", "CHECK", "local://preflight"),
+}
+
+
+@router.get("/orders/{order_id}/failure-detail", response_model=OrderFailureDetailOut)
+async def get_order_failure_detail(order_id: str) -> OrderFailureDetailOut:
+    """Admin-only structured failure diagnostics with strictly redacted request/response payloads."""
+    db = get_db_optional()
+    if db is None:
+        raise HTTPException(404, detail={"code": "not_found", "message": "订单账本未就绪"})
+    row = db.get_order_failure_row(order_id)
+    if row is None:
+        raise HTTPException(404, detail={"code": "not_found", "message": "订单不存在"})
+
+    events_raw = db.list_events(order_id=order_id)
+    events = [QuickPayEventOut(**ev) for ev in events_raw]
+    diag = load_checkout_diagnostics(row.get("diagnostics_json"))
+    trace = load_redacted_http_trace(row.get("failure_trace_json"))
+
+    raw_code = (
+        row.get("failure_code")
+        or row.get("job_failure_code")
+        or diag.get("upstream_code")
+        or None
+    )
+    code_norm = str(raw_code).strip().lower() if raw_code else ""
+    error_code_display = str(raw_code).strip().upper() if raw_code else None
+
+    stage = (
+        (trace or {}).get("stage")
+        or diag.get("stage")
+        or next(
+            (ev["stage"] for ev in reversed(events_raw) if ev.get("stage") and ev["stage"] not in {"failed", "unknown"}),
+            None,
+        )
+        or (row.get("job_stage") if row.get("job_stage") not in {None, "", "failed"} else None)
+        or ("creating_checkout" if not row.get("checkout_kind") else "payment_confirm")
+    )
+
+    upstream_status = (
+        (trace or {}).get("http_status")
+        or diag.get("upstream_status")
+        or row.get("auto_renew_http_status")
+    )
+    cf_ray = (trace or {}).get("cf_ray") or diag.get("cf_ray")
+    request_id = (trace or {}).get("request_id") or diag.get("request_id")
+
+    base_summary = _FAILURE_SUMMARY_BY_CODE.get(code_norm)
+    recorded_error = (row.get("last_error") or row.get("job_message") or row.get("auto_renew_error") or "").strip()
+    if base_summary:
+        summary = base_summary
+    elif recorded_error:
+        summary = recorded_error
+    else:
+        summary = "该订单未成功完成，请结合下方请求与响应信息排查。"
+
+    if trace is not None:
+        exchange = OrderFailureExchangeOut(
+            title=trace["title"],
+            method=trace.get("method"),
+            url=trace.get("url"),
+            http_status=trace.get("http_status") or upstream_status,
+            request=trace.get("request"),
+            response=trace.get("response"),
+            captured=True,
+        )
+    else:
+        step_title, step_method, step_url = _STAGE_ENDPOINT_DEFAULTS.get(
+            str(stage or ""),
+            ("上游请求", "POST", "https://chatgpt.com/backend-api/payments/checkout"),
+        )
+        req_params: dict[str, Any] = {
+            "plan": row.get("plan"),
+            "billing_country": row.get("billing_country"),
+        }
+        if row.get("exit_country"):
+            req_params["exit_country"] = row.get("exit_country")
+        if row.get("route_profile"):
+            req_params["route_profile"] = row.get("route_profile")
+        if row.get("billing_mode"):
+            req_params["billing_mode"] = row.get("billing_mode")
+        if row.get("checkout_kind"):
+            req_params["checkout_kind"] = row.get("checkout_kind")
+
+        resp_summary: dict[str, Any] = {}
+        if diag.get("upstream_code"):
+            resp_summary["code"] = diag["upstream_code"]
+        elif raw_code:
+            resp_summary["code"] = str(raw_code)
+        if recorded_error:
+            resp_summary["message"] = recorded_error
+        if cf_ray:
+            resp_summary["cf_ray"] = cf_ray
+        if request_id:
+            resp_summary["request_id"] = request_id
+        if not resp_summary:
+            resp_summary["status"] = row.get("status") or "failed"
+
+        exchange = OrderFailureExchangeOut(
+            title=step_title,
+            method=step_method,
+            url=step_url,
+            http_status=int(upstream_status) if isinstance(upstream_status, int) else None,
+            request={"json": req_params},
+            response=resp_summary,
+            captured=False,
+        )
+
+    return OrderFailureDetailOut(
+        order_id=row["id"],
+        title="开通失败详情",
+        summary=summary,
+        error_code=error_code_display,
+        stage=stage,
+        upstream_status=int(upstream_status) if isinstance(upstream_status, int) else None,
+        upstream_code=diag.get("upstream_code"),
+        cf_ray=cf_ray,
+        request_id=request_id,
+        exchange=exchange,
+        events=events,
+    )
 
 
 @router.post("/orders/{order_id}/reconcile", response_model=ReconcileResultOut)
@@ -980,12 +1282,26 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         store.create_order(order, idempotency_key)
         view = store.view(order.id)
         view.account_fingerprint = fingerprint
+        try:
+            view.account_email = (
+                email_from_access_token(parse_session(snapshot))
+                or email_from_access_token(bundle.access_token)
+                or None
+            )
+        except Exception:
+            view.account_email = email_from_access_token(bundle.access_token) or None
         view.auto_cancel_renew = bool(payload.auto_cancel_renew)
         view.auto_renew_status = "pending" if payload.auto_cancel_renew else "disabled"
         view.create_request_tag = tag
         view.purchase_attempt_id = order.purchase_attempt_id
         view.session_reissued_for_country = session_reissued
         view.exit_country = exit_country
+        # 记录实际命中的出口 SID（输出层统一经 mask_sid() 打码），
+        # 便于排查是哪批 SID 触发风控。
+        try:
+            view.proxy_last_sid = proxy_exit_sid(exit_proxy)
+        except Exception:  # noqa: BLE001
+            view.proxy_last_sid = None
         store.persist(order.id)
         return item
 
@@ -1014,19 +1330,38 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                 _release_create_failure(claim_dir, order.id, idempotency_key)
                 raise _error(503, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "会话请求中断，已停止。") from None
         elif use_clean_st_reissue:
-            reauth_kwargs: Dict[str, Any] = {"proxy": exit_proxy, "country": exit_country}
-            if _reissue_keep_ua():
-                reauth_kwargs["preserve_user_agent"] = True
-            try:
-                client = await asyncio.to_thread(
-                    ChatGPTClient.reauthorize_for_country, raw_session, **reauth_kwargs,
-                )
-            except DomainError as exc:
+            client = None
+            for reauth_attempt in range(2):
+                reauth_kwargs: Dict[str, Any] = {"proxy": exit_proxy, "country": exit_country}
+                if _reissue_keep_ua():
+                    reauth_kwargs["preserve_user_agent"] = True
+                try:
+                    client = await asyncio.to_thread(
+                        ChatGPTClient.reauthorize_for_country, raw_session, **reauth_kwargs,
+                    )
+                    break
+                except DomainError as exc:
+                    detail = exc.detail if isinstance(exc.detail, dict) else {}
+                    # 仅在匿名边缘握手阶段（未发送任何会话凭证）遇代理断连时换一次新 SID；
+                    # 一旦已向 /api/auth/session 发送过凭证，绝不自动重放。
+                    if (
+                        reauth_attempt == 0
+                        and exit_proxy
+                        and runtime_flags.get_bool("checkout_rotate")
+                        and exc.code is ErrorCode.CHECKOUT_UPSTREAM_ERROR
+                        and detail.get("credentials_sent") is False
+                    ):
+                        logger.warning("reissue_warmup_proxy_rotating code=proxy_tunnel_failed")
+                        exit_proxy = rotate_proxy_sid(exit_proxy, force=True)
+                        continue
+                    _release_create_failure(claim_dir, order.id, idempotency_key)
+                    raise _from_domain(exc, nonteam=plan is not Plan.TEAM)
+                except Exception:
+                    _release_create_failure(claim_dir, order.id, idempotency_key)
+                    raise _error(503, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "会话请求中断，已停止。") from None
+            if client is None:
                 _release_create_failure(claim_dir, order.id, idempotency_key)
-                raise _from_domain(exc, nonteam=plan is not Plan.TEAM)
-            except Exception:
-                _release_create_failure(claim_dir, order.id, idempotency_key)
-                raise _error(503, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "会话请求中断，已停止。") from None
+                raise _error(503, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "会话请求中断，已停止。")
         else:
             client = ChatGPTClient.from_raw_session(raw_session, proxy=exit_proxy, strip_ambient=True)
             client.language = locale_for(exit_country)
@@ -1052,17 +1387,17 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                     })
             resolved_ua = getattr(client, "user_agent", "") or getattr(client, "ua", "")
             item = remember(raw_session, resolved_ua, client.device_id)
-            if cross_country and runtime_flags.get_bool("warm_account"):
+            if runtime_flags.get_bool("warm_account"):
                 # Optional lab warm-up. Default off keeps the proven 00331ce
                 # main path free of extra account-endpoint requests.
-                await asyncio.sleep(random.uniform(1.0, 1.5))
+                await _human_pause_async((1.0, 1.5))
                 try:
                     await asyncio.to_thread(client.warm_account)
                 except DomainError as exc:
-                    store.update_status(order.id, OrderStatus.REJECTED)
                     store.view(order.id).last_error = exc.message
+                    store.update_status(order.id, OrderStatus.REJECTED)
                     _release_create_failure(claim_dir, order.id, idempotency_key)
-                    raise _from_domain(exc, session_reissued=True, nonteam=plan is not Plan.TEAM)
+                    raise _from_domain(exc, session_reissued=session_reissued, nonteam=plan is not Plan.TEAM)
                 except Exception:
                     logger.warning("warm_account_failed_continue")
                 raw_session = _session_json(client, exit_country)
@@ -1132,6 +1467,9 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                 vault.put(order.id, item)
         logger.info("stage_timing stage=browser_decode duration_ms=%.1f", (time.perf_counter() - decode_started) * 1000)
         _mark(progress, "browser_decoded" if browser_context is not None else "browser_decode_skipped")
+    # 重颁完成到发起建单之间保持拟人节奏（默认 1.5–2.5s，可被 GSS_WARMUP_INTERVAL 覆盖）。
+    if (need_st_reissue or need_oauth_reissue) and not use_fake_adapters():
+        await _human_pause_async()
     store.add_job(Job(order_id=order.id, stage="checkout"))
     item.profile = profile_from_session_ua(item.user_agent) or _pick_profile(item.device_id)
     if verified is not None:
@@ -1209,6 +1547,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                             finally:
                                 if reissued_client is not None:
                                     reissued_client.close()
+                            await _human_pause_async()
                     item.proxy = exit_proxy
                     item.session = raw_session
                     vault.put(order.id, item)
@@ -1228,10 +1567,14 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         logger.info("stage_timing stage=create_checkout duration_ms=%.1f", (time.perf_counter() - checkout_started) * 1000)
         view = store.view(order.id)
         view.failure_code = _checkout_failure_code(exc)
+        if isinstance(getattr(exc, "_http_trace", None), dict):
+            view.failure_trace = exc._http_trace
         if view.failure_code == "already_subscribed":
             error = _error(400, ErrorCode.ALREADY_SUBSCRIBED, "该账号已有订阅，已停止建单。",
                            session_reissued=session_reissued, diagnostics=exc.detail)
         elif view.failure_code in {"unusual_activity", "invalid_session"}:
+            # 该出口已被上游按风控拒绝：隔离 SID，但绝不重试本单。
+            _quarantine_exit(exit_proxy, view.failure_code)
             # Never persist upstream prose or advice to replay a rejected session.
             invalid = view.failure_code == "invalid_session"
             error = _error(401 if invalid else 400,
@@ -1637,6 +1980,10 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
             return observed  # The hosted page may have paid without first polling this API.
 
         if payload.card is not None:
+            detected_brand = detect_card_brand(payload.card.number)
+            if detected_brand:
+                store.view(order_id).card_brand = detected_brand
+                store.persist(order_id)
             started = time.monotonic()
             client = _leased_team_client(order_id, secrets, address.get("country", ""))
             try:
@@ -2071,6 +2418,11 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
 
     pm_id = resolve_protocol_payment_method(payload)
     card = payload.card.model_dump() if payload.card else {}
+    if payload.card is not None:
+        detected_brand = detect_card_brand(payload.card.number)
+        if detected_brand:
+            view.card_brand = detected_brand
+            store.persist(order_id)
     if verified is not None:
         billing = dict(verified)
     else:
@@ -2118,6 +2470,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
             try:
                 return hp.pay_from_url()
             finally:
+                if isinstance(getattr(hp, "last_http_trace", None), dict):
+                    view.failure_trace = hp.last_http_trace
                 hp.close()
         if is_custom_checkout:
             # 输入框模式：浏览器已换好 pm_，服务端只做确认，不接触卡号
@@ -2181,6 +2535,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         await _mark_payment_unknown(order)
         raise
     except DomainError as exc:
+        if isinstance(getattr(exc, "_http_trace", None), dict):
+            view.failure_trace = exc._http_trace
         if exc.code is ErrorCode.PAYMENT_DECLINED:
             store.update_status(order_id, OrderStatus.FAILED)
             _set_payment_status(order_id, "failed")

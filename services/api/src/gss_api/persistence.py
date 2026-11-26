@@ -111,6 +111,8 @@ class Persistence:
                 id TEXT PRIMARY KEY,
                 idempotency_key TEXT UNIQUE,
                 account_fingerprint TEXT,
+                account_email TEXT,
+                card_brand TEXT,
                 purchase_attempt_id TEXT UNIQUE,
                 plan TEXT NOT NULL,
                 billing_country TEXT NOT NULL,
@@ -147,7 +149,8 @@ class Persistence:
                 proxy_last_sid TEXT,
                 proxy_last_exit_ip TEXT,
                 unknown_since TEXT,
-                finished_at TEXT
+                finished_at TEXT,
+                failure_trace_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
             CREATE INDEX IF NOT EXISTS idx_orders_payment ON orders(payment_status);
@@ -274,6 +277,9 @@ class Persistence:
             "ALTER TABLE orders ADD COLUMN proxy_rotations INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE orders ADD COLUMN proxy_last_sid TEXT",
             "ALTER TABLE orders ADD COLUMN proxy_last_exit_ip TEXT",
+            "ALTER TABLE orders ADD COLUMN account_email TEXT",
+            "ALTER TABLE orders ADD COLUMN card_brand TEXT",
+            "ALTER TABLE orders ADD COLUMN failure_trace_json TEXT",
         ):
             try:
                 self._conn.execute(statement)
@@ -310,7 +316,7 @@ class Persistence:
         payload = {
             name: getattr(view, name)
             for name in (
-                "purchase_attempt_id", "route_profile", "failure_code", "checkout_url",
+                "purchase_attempt_id", "account_email", "card_brand", "route_profile", "failure_code", "checkout_url",
                 "checkout_session_id", "publishable_key", "billing", "billing_verified",
                 "amount", "currency", "last_error", "quote_error", "next_action",
                 "checkout_kind", "seat_quantity", "workspace_name", "promo_code",
@@ -371,6 +377,7 @@ class Persistence:
     def save_order(self, order: Order, view: "OrderView", *, account_fingerprint: Optional[str] = None) -> None:
         payload = (
             order.id, order.idempotency_key or None, account_fingerprint,
+            view.account_email or None, view.card_brand or None,
             order.purchase_attempt_id or None, str(order.plan), order.billing_country,
             view.exit_country or None, str(order.mode.account_source),
             str(order.mode.card_source), str(order.mode.billing_mode),
@@ -386,11 +393,15 @@ class Persistence:
             self._view_to_json(view), order.created_at.isoformat(), _utcnow(),
             view.unknown_since if hasattr(view, "unknown_since") else None,
             view.finished_at if hasattr(view, "finished_at") else None,
+            json.dumps(view.failure_trace, ensure_ascii=False)
+            if isinstance(getattr(view, "failure_trace", None), dict)
+            else None,
         )
         with self._lock:
             self._conn.execute(
                 """INSERT INTO orders(
-                    id, idempotency_key, account_fingerprint, purchase_attempt_id, plan,
+                    id, idempotency_key, account_fingerprint, account_email, card_brand,
+                    purchase_attempt_id, plan,
                     billing_country, exit_country, account_source, card_source, billing_mode,
                     risk_acknowledged, status, payment_status, delivery_status, amount, cost,
                     currency, payment_intent_id, checkout_session_id, checkout_kind, failure_code,
@@ -398,11 +409,13 @@ class Persistence:
                     auto_cancel_renew, auto_renew_status, auto_renew_attempts,
                     auto_renew_canceled_at, auto_renew_error, auto_renew_http_status,
                     proxy_rotations, proxy_last_sid, proxy_last_exit_ip,
-                    view_json, created_at, updated_at, unknown_since, finished_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    view_json, created_at, updated_at, unknown_since, finished_at, failure_trace_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     idempotency_key=excluded.idempotency_key,
                     account_fingerprint=excluded.account_fingerprint,
+                    account_email=COALESCE(NULLIF(excluded.account_email,''), orders.account_email),
+                    card_brand=COALESCE(NULLIF(excluded.card_brand,''), orders.card_brand),
                     purchase_attempt_id=excluded.purchase_attempt_id,
                     exit_country=excluded.exit_country,
                     status=excluded.status,
@@ -431,7 +444,8 @@ class Persistence:
                     proxy_last_exit_ip=excluded.proxy_last_exit_ip,
                     updated_at=excluded.updated_at,
                     unknown_since=excluded.unknown_since,
-                    finished_at=excluded.finished_at""",
+                    finished_at=excluded.finished_at,
+                    failure_trace_json=COALESCE(NULLIF(excluded.failure_trace_json,''), orders.failure_trace_json)""",
                 payload,
             )
             self._conn.commit()
@@ -465,6 +479,10 @@ class Persistence:
                 setattr(view, key, value)
         if not view.exit_country and row["exit_country"]:
             view.exit_country = row["exit_country"]
+        if not view.account_email and row["account_email"]:
+            view.account_email = row["account_email"]
+        if not view.card_brand and row["card_brand"]:
+            view.card_brand = row["card_brand"]
         return order, view, row["account_fingerprint"]
 
     def load_orders(self, *, limit: Optional[int] = None) -> list[tuple[Order, "OrderView", Optional[str]]]:
@@ -768,11 +786,38 @@ class Persistence:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def get_order_failure_row(self, order_id: str) -> Optional[dict[str, Any]]:
+        """Fetch redacted order failure metadata and stored HTTP trace for admin diagnostics."""
+        if not order_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT o.id, o.plan, o.billing_country, o.exit_country, o.billing_mode,
+                          o.status, o.payment_status, o.delivery_status, o.amount, o.currency,
+                          o.checkout_kind, o.route_profile, o.billing_verified, o.session_reissued,
+                          o.failure_code, o.last_error, o.auto_renew_status, o.auto_renew_error,
+                          o.auto_renew_http_status, o.failure_trace_json,
+                          o.created_at, o.updated_at,
+                          j.id AS job_id, j.stage AS job_stage, j.status AS job_status,
+                          j.failure_code AS job_failure_code, j.message AS job_message,
+                          j.diagnostics_json AS diagnostics_json
+                   FROM orders o
+                   LEFT JOIN quick_pay_jobs j
+                     ON j.id = (SELECT j2.id FROM quick_pay_jobs j2
+                                WHERE j2.order_id = o.id
+                                ORDER BY j2.created_at DESC, j2.rowid DESC LIMIT 1)
+                   WHERE o.id = ?
+                   LIMIT 1""",
+                (order_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def list_orders_page(
         self,
         *,
         status: str = "",
         plan: str = "",
+        source: str = "",
         search: str = "",
         date_from: str = "",
         date_to: str = "",
@@ -783,26 +828,59 @@ class Persistence:
         capped = max(1, min(int(limit), 100))
         skip = max(0, int(offset))
         where_sql, params = self._orders_filter_sql(
-            status=status, plan=plan, search=search, date_from=date_from, date_to=date_to,
+            status=status, plan=plan, source=source, search=search,
+            date_from=date_from, date_to=date_to,
         )
         with self._lock:
             total = int(
                 self._conn.execute(f"SELECT COUNT(*) FROM orders o {where_sql}", params).fetchone()[0]
             )
             rows = self._conn.execute(
-                f"""SELECT o.id, o.plan, o.billing_country, o.exit_country, o.status,
-                           o.payment_status, o.delivery_status, o.amount, o.currency,
-                           o.failure_code, o.last_error, o.purchase_attempt_id,
-                           o.payment_intent_id, o.auto_cancel_renew, o.auto_renew_status,
-                           o.auto_renew_canceled_at, o.auto_renew_error,
-                           o.created_at, o.updated_at, o.unknown_since, o.finished_at,
-                           (SELECT j.id FROM quick_pay_jobs j WHERE j.order_id = o.id ORDER BY j.created_at DESC LIMIT 1) AS job_id,
-                           (SELECT j.reconcile_attempts FROM quick_pay_jobs j WHERE j.order_id = o.id ORDER BY j.created_at DESC LIMIT 1) AS reconcile_attempts,
-                           (SELECT l.id FROM account_locks l WHERE l.order_id = o.id AND l.state = 'held' LIMIT 1) AS active_lock_id
-                    FROM orders o
-                    {where_sql}
-                    ORDER BY o.created_at DESC
-                    LIMIT ? OFFSET ?""",
+                f"""WITH page_orders AS (
+                        SELECT o.id, o.account_fingerprint,
+                               COALESCE(
+                                   NULLIF(o.account_email, ''),
+                                   CASE WHEN o.billing_verified = 0 THEN json_extract(o.view_json, '$.billing.email') END
+                               ) AS account_email,
+                               COALESCE(NULLIF(o.card_brand, ''), json_extract(o.view_json, '$.receipt.card.brand')) AS card_brand,
+                               o.plan, o.billing_country, o.exit_country,
+                               o.account_source, o.card_source, o.billing_mode, o.status,
+                               o.payment_status, o.delivery_status, o.amount, o.cost, o.currency,
+                               o.failure_code, o.last_error, o.purchase_attempt_id,
+                               o.payment_intent_id, o.checkout_session_id, o.checkout_kind,
+                               o.tax_delta, o.route_profile, o.billing_verified, o.session_reissued,
+                               o.auto_cancel_renew, o.auto_renew_status, o.auto_renew_attempts,
+                               o.auto_renew_canceled_at, o.auto_renew_error, o.auto_renew_http_status,
+                               o.proxy_rotations, o.proxy_last_sid, o.proxy_last_exit_ip,
+                               o.created_at, o.updated_at, o.unknown_since, o.finished_at,
+                               (SELECT j.id FROM quick_pay_jobs j
+                                WHERE j.order_id = o.id
+                                ORDER BY j.created_at DESC, j.rowid DESC LIMIT 1) AS latest_job_id,
+                               (SELECT l.id FROM account_locks l
+                                WHERE l.order_id = o.id AND l.state = 'held' LIMIT 1) AS active_lock_id
+                        FROM orders o
+                        {where_sql}
+                        ORDER BY o.created_at DESC
+                        LIMIT ? OFFSET ?
+                    )
+                    SELECT po.*,
+                           j.id AS job_id,
+                           j.status AS job_status,
+                           j.stage AS job_stage,
+                           j.attempts AS job_attempts,
+                           j.reconcile_attempts AS reconcile_attempts,
+                           j.last_reconciled_at AS last_reconciled_at,
+                           j.timings_json AS timings_json,
+                           j.diagnostics_json AS diagnostics_json,
+                           j.finished_at AS job_finished_at,
+                           pt.job_id AS portal_task_job_id,
+                           pt.masked_email AS masked_email,
+                           pu.username AS portal_username
+                    FROM page_orders po
+                    LEFT JOIN quick_pay_jobs j ON j.id = po.latest_job_id
+                    LEFT JOIN portal_tasks pt ON pt.job_id = po.latest_job_id
+                    LEFT JOIN portal_users pu ON pu.id = pt.owner_user_id
+                    ORDER BY po.created_at DESC""",
                 [*params, capped, skip],
             ).fetchall()
         return [dict(row) for row in rows], total
@@ -812,6 +890,7 @@ class Persistence:
         *,
         status: str = "",
         plan: str = "",
+        source: str = "",
         search: str = "",
         date_from: str = "",
         date_to: str = "",
@@ -835,11 +914,45 @@ class Persistence:
         if plan_norm and plan_norm != "all":
             clauses.append("o.plan = ?")
             params.append(plan_norm)
+        source_norm = (source or "").strip().lower()
+        if source_norm and source_norm != "all":
+            if source_norm == "portal":
+                clauses.append(
+                    "EXISTS (SELECT 1 FROM quick_pay_jobs j "
+                    "JOIN portal_tasks pt ON pt.job_id = j.id WHERE j.order_id = o.id)"
+                )
+            elif source_norm == "quick_pay":
+                clauses.append(
+                    "EXISTS (SELECT 1 FROM quick_pay_jobs j WHERE j.order_id = o.id) "
+                    "AND NOT EXISTS (SELECT 1 FROM quick_pay_jobs j "
+                    "JOIN portal_tasks pt ON pt.job_id = j.id WHERE j.order_id = o.id)"
+                )
+            elif source_norm == "step":
+                clauses.append("NOT EXISTS (SELECT 1 FROM quick_pay_jobs j WHERE j.order_id = o.id)")
         search_norm = (search or "").strip()
         if search_norm:
             like = f"%{search_norm}%"
-            clauses.append("(o.id LIKE ? OR COALESCE(o.purchase_attempt_id,'') LIKE ? OR COALESCE(o.payment_intent_id,'') LIKE ?)")
-            params.extend([like, like, like])
+            clauses.append(
+                "("
+                "o.id LIKE ?"
+                " OR COALESCE(o.account_email,'') LIKE ?"
+                " OR (o.billing_verified = 0 AND COALESCE(json_extract(o.view_json, '$.billing.email'),'') LIKE ?)"
+                " OR COALESCE(o.card_brand,'') LIKE ?"
+                " OR COALESCE(o.purchase_attempt_id,'') LIKE ?"
+                " OR COALESCE(o.payment_intent_id,'') LIKE ?"
+                " OR COALESCE(o.checkout_session_id,'') LIKE ?"
+                " OR COALESCE(o.failure_code,'') LIKE ?"
+                " OR EXISTS (SELECT 1 FROM quick_pay_jobs j WHERE j.order_id = o.id AND j.id LIKE ?)"
+                " OR EXISTS ("
+                "     SELECT 1 FROM quick_pay_jobs j"
+                "     JOIN portal_tasks pt ON pt.job_id = j.id"
+                "     LEFT JOIN portal_users pu ON pu.id = pt.owner_user_id"
+                "     WHERE j.order_id = o.id"
+                "       AND (COALESCE(pt.masked_email,'') LIKE ? OR COALESCE(pu.username,'') LIKE ?)"
+                " )"
+                ")"
+            )
+            params.extend([like, like, like, like, like, like, like, like, like, like, like])
         df = (date_from or "").strip()
         if df:
             clauses.append("o.created_at >= ?")
@@ -856,6 +969,7 @@ class Persistence:
         *,
         status: str = "",
         plan: str = "",
+        source: str = "",
         search: str = "",
         date_from: str = "",
         date_to: str = "",
@@ -863,18 +977,50 @@ class Persistence:
     ) -> list[dict[str, Any]]:
         capped = max(1, min(int(limit), 5000))
         where_sql, params = self._orders_filter_sql(
-            status=status, plan=plan, search=search, date_from=date_from, date_to=date_to,
+            status=status, plan=plan, source=source, search=search,
+            date_from=date_from, date_to=date_to,
         )
         with self._lock:
             rows = self._conn.execute(
-                f"""SELECT o.id, o.plan, o.billing_country, o.exit_country, o.status,
-                           o.payment_status, o.delivery_status, o.amount, o.currency,
-                           o.failure_code, o.purchase_attempt_id, o.payment_intent_id,
-                           o.auto_renew_status, o.created_at, o.updated_at, o.finished_at
-                    FROM orders o
-                    {where_sql}
-                    ORDER BY o.created_at DESC
-                    LIMIT ?""",
+                f"""WITH export_orders AS (
+                        SELECT o.id, o.account_fingerprint,
+                               COALESCE(
+                                   NULLIF(o.account_email, ''),
+                                   CASE WHEN o.billing_verified = 0 THEN json_extract(o.view_json, '$.billing.email') END
+                               ) AS account_email,
+                               COALESCE(NULLIF(o.card_brand, ''), json_extract(o.view_json, '$.receipt.card.brand')) AS card_brand,
+                               o.plan, o.billing_country, o.exit_country,
+                               o.billing_mode, o.status, o.payment_status, o.delivery_status,
+                               o.amount, o.currency, o.tax_delta, o.failure_code,
+                               o.purchase_attempt_id, o.payment_intent_id, o.checkout_session_id,
+                               o.checkout_kind, o.route_profile, o.billing_verified, o.session_reissued,
+                               o.auto_renew_status, o.auto_renew_attempts, o.auto_renew_canceled_at,
+                               o.proxy_rotations, o.proxy_last_sid, o.proxy_last_exit_ip,
+                               o.created_at, o.updated_at, o.finished_at,
+                               (SELECT j.id FROM quick_pay_jobs j
+                                WHERE j.order_id = o.id
+                                ORDER BY j.created_at DESC, j.rowid DESC LIMIT 1) AS latest_job_id,
+                               (SELECT l.id FROM account_locks l
+                                WHERE l.order_id = o.id AND l.state = 'held' LIMIT 1) AS active_lock_id
+                        FROM orders o
+                        {where_sql}
+                        ORDER BY o.created_at DESC
+                        LIMIT ?
+                    )
+                    SELECT eo.*,
+                           j.id AS job_id,
+                           j.reconcile_attempts AS reconcile_attempts,
+                           j.timings_json AS timings_json,
+                           j.diagnostics_json AS diagnostics_json,
+                           j.finished_at AS job_finished_at,
+                           pt.job_id AS portal_task_job_id,
+                           pt.masked_email AS masked_email,
+                           pu.username AS portal_username
+                    FROM export_orders eo
+                    LEFT JOIN quick_pay_jobs j ON j.id = eo.latest_job_id
+                    LEFT JOIN portal_tasks pt ON pt.job_id = eo.latest_job_id
+                    LEFT JOIN portal_users pu ON pu.id = pt.owner_user_id
+                    ORDER BY eo.created_at DESC""",
                 [*params, capped],
             ).fetchall()
         return [dict(row) for row in rows]
