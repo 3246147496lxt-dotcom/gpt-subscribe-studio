@@ -79,7 +79,7 @@ export function PlanPicker({ plan, onPlan, country, onCountry, team, onTeam, dis
             }))}
           />
           <Text size="xs" c="dimmed" mt={6}>
-            Pro 三档是官方 Standard / More / Max。标的是美国价，其它地区以结账金额为准。
+            Pro 三档对应官方 Pro100 / Pro200 / Pro500（$100 / $200 / $500）。标的是美国价，其它地区以结账金额为准。
           </Text>
         </div>
       )}

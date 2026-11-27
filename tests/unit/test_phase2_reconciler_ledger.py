@@ -589,3 +589,109 @@ def test_failure_detail_endpoint_redacts_captured_trace_and_supports_legacy_orde
         assert body2["exchange"]["title"] == "Checkout 建单"
         assert body2["exchange"]["http_status"] == 400
         assert body2["exchange"]["url"] == "https://chatgpt.com/backend-api/payments/checkout"
+
+
+def test_manual_verdict_endpoint_handles_delivered_failed_refunded_and_safety_guards(_isolated_phase2):
+    db, store = _isolated_phase2
+
+    # 1) Verifying / paid_pending_delivery order -> manual delivered + auto_renew canceled + resolves held lock
+    o_ver, v_ver = _seed_order(
+        store,
+        order_id="ord-manual-verifying",
+        status=OrderStatus.VERIFYING,
+        payment_status="succeeded",
+        delivery_status="verify_delayed",
+    )
+    v_ver.auto_renew_status = "manual_required"
+    store.persist(o_ver.id)
+    held_ver = locks.hold_unknown(fingerprint="fp-phase2", order_id=o_ver.id, job_id="job-ver", reason="verify_delayed")
+    assert held_ver is not None
+    job_ver = order_flow.QuickPayJob(
+        id="job-ver",
+        idempotency_key="idem-job-ver",
+        account_fingerprint="fp-phase2",
+        status="paid_pending_delivery",
+        stage="paid_pending_delivery",
+        order_id=o_ver.id,
+        lock_id=held_ver["id"],
+    )
+    db.save_job(job_ver)
+
+    # 2) Unknown order with held lock -> requires confirm_no_charge for failed
+    o_unk, _ = _seed_order(
+        store,
+        order_id="ord-manual-unknown",
+        status=OrderStatus.UNKNOWN,
+        payment_status="processing",
+        delivery_status="pending",
+    )
+    v_unk = store.view(o_unk.id)
+    v_unk.account_fingerprint = "fp-unknown-2"
+    store.persist(o_unk.id)
+    held_unk = locks.hold_unknown(fingerprint="fp-unknown-2", order_id=o_unk.id, reason="unknown_payment")
+    assert held_unk is not None
+
+    with TestClient(main.create_app()) as client:
+        # Paid verifying order MUST NOT be marked failed
+        r_refuse = client.post(
+            "/api/orders/ord-manual-verifying/manual-verdict",
+            json={"verdict": "failed", "confirm_no_charge": True, "note": "误操作测试"},
+        )
+        assert r_refuse.status_code == 409
+
+        # Mark verifying order delivered + auto_renew canceled
+        r_deliv = client.post(
+            "/api/orders/ord-manual-verifying/manual-verdict",
+            json={
+                "verdict": "delivered",
+                "note": "已核查账号 Pro Lite 权益到账并手动关闭续费",
+                "operator": "ops-admin",
+                "mark_auto_renew_canceled": True,
+            },
+        )
+        assert r_deliv.status_code == 200, r_deliv.text
+        b_deliv = r_deliv.json()
+        assert b_deliv["previous_status"] == "verifying"
+        assert b_deliv["order_status"] == "delivered"
+        assert b_deliv["payment_status"] == "succeeded"
+        assert b_deliv["delivery_status"] == "delivered"
+        assert b_deliv["auto_renew_status"] == "canceled"
+        assert b_deliv["job_status"] == "succeeded"
+        assert b_deliv["lock_state"] == "resolved"
+
+        # Unknown order without confirm_no_charge -> 409
+        r_need_confirm = client.post(
+            "/api/orders/ord-manual-unknown/manual-verdict",
+            json={"verdict": "failed", "note": "测试未勾选"},
+        )
+        assert r_need_confirm.status_code == 409
+
+        # Unknown order with confirm_no_charge=True -> failed + lock released
+        r_fail = client.post(
+            "/api/orders/ord-manual-unknown/manual-verdict",
+            json={
+                "verdict": "failed",
+                "confirm_no_charge": True,
+                "note": "核对银行账单确认未扣款",
+                "operator": "ops-admin",
+            },
+        )
+        assert r_fail.status_code == 200, r_fail.text
+        b_fail = r_fail.json()
+        assert b_fail["order_status"] == "failed"
+        assert b_fail["lock_state"] == "released"
+
+        # Delivered order can be marked refunded
+        r_refund = client.post(
+            "/api/orders/ord-manual-verifying/manual-verdict",
+            json={"verdict": "refunded", "note": "已通过 Stripe 办理全额退款", "operator": "ops-admin"},
+        )
+        assert r_refund.status_code == 200, r_refund.text
+        b_refund = r_refund.json()
+        assert b_refund["order_status"] == "refunded"
+        assert b_refund["payment_status"] == "refunded"
+        assert b_refund["delivery_status"] == "revoked"
+
+        # Verify audit events were recorded
+        evs = client.get("/api/orders/ord-manual-verifying/events").json()
+        assert any(ev["stage"] == "manual_verdict" and "ops-admin" in ev["message"] for ev in evs)

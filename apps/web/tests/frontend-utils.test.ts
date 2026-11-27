@@ -4,7 +4,8 @@ import test from "node:test";
 import { isAbortError } from "../src/api/http";
 import { buildOrderLedgerExportUrl } from "../src/api/ledger";
 import type { QuickPayJob } from "../src/api/quickPay";
-import { parseBatchSessions } from "../src/utils/batchSessions";
+import { planLabel } from "../src/plans";
+import { detectDuplicateDevices, parseBatchSessions } from "../src/utils/batchSessions";
 import { detectCardBrand, formatCardNumber, isLuhnValid, stripCardDigits } from "../src/utils/cardFormat";
 import { computeQuickPayFlow, describeFailureDetail } from "../src/utils/quickPayProgress";
 import { inspectSession, maskEmail } from "../src/utils/sessionInspect";
@@ -18,6 +19,7 @@ import {
   formatPreciseDuration,
   hasFailureReason,
   paymentStatusLabel,
+  planPillTone,
   simpleOrderStatus,
   sourceLabel,
 } from "../src/utils/orderLedgerFormat";
@@ -115,6 +117,30 @@ test("parseBatchSessions supports single JSON, blank lines, --- dividers and lab
   assert.equal(multi[2].label, "账号 #3");
 });
 
+test("inspectSession and detectDuplicateDevices extract masked oai-did prefixes and flag shared browser devices", () => {
+  const sharedDid = "9f1a2b3c-dead-4bee-8000-112233445566";
+  const otherDid = "aa44bb55-1234-4abc-9999-abcdef012345";
+  const s1 = JSON.stringify({ accessToken: "t1", deviceId: sharedDid });
+  const s2 = JSON.stringify({ accessToken: "t2", cookies: { "oai-did": sharedDid } });
+  const s3 = JSON.stringify({ accessToken: "t3", statsigContext: { deviceId: otherDid } });
+
+  const info1 = inspectSession(s1);
+  assert.equal(info1.deviceIdPrefix, "9f1a2b3c…");
+  assert.ok(!JSON.stringify(info1).includes(sharedDid));
+
+  const audit = detectDuplicateDevices([
+    { label: "账号A", session: s1 },
+    { label: "账号B", session: s2 },
+    { label: "账号C", session: s3 },
+  ]);
+  assert.equal(audit.conflicts.length, 1);
+  assert.equal(audit.conflicts[0].deviceIdPrefix, "9f1a2b3c…");
+  assert.deepEqual(audit.conflicts[0].labels, ["账号A", "账号B"]);
+  assert.deepEqual(audit.byIndex[0].duplicateLabels, ["账号B"]);
+  assert.deepEqual(audit.byIndex[1].duplicateLabels, ["账号A"]);
+  assert.deepEqual(audit.byIndex[2].duplicateLabels, []);
+});
+
 test("buildOrderLedgerExportUrl omits default 'all' filters and encodes active filters", () => {
   assert.equal(buildOrderLedgerExportUrl({ status: "all", plan: "all" }), "/api/orders/export.csv");
   assert.equal(buildOrderLedgerExportUrl({ status: "all", plan: "all", source: "all" }), "/api/orders/export.csv");
@@ -159,6 +185,19 @@ test("orderLedgerFormat renders Chinese operational labels and human durations",
   assert.equal(hasFailureReason({ status: "delivered" }), false);
   assert.equal(hasFailureReason({ status: "awaiting_payment" }), false);
   assert.equal(hasFailureReason({ status: "rejected", failure_code: "unusual_activity" }), true);
+
+  assert.equal(planLabel("go"), "Go");
+  assert.equal(planLabel("plus"), "Plus");
+  assert.equal(planLabel("pro_lite"), "Pro100");
+  assert.equal(planLabel("pro"), "Pro200");
+  assert.equal(planLabel("pro_max"), "Pro500");
+  assert.equal(planLabel("team"), "Team");
+  assert.equal(planPillTone("go"), "go");
+  assert.equal(planPillTone("plus"), "plus");
+  assert.equal(planPillTone("pro_lite"), "pro100");
+  assert.equal(planPillTone("pro"), "pro200");
+  assert.equal(planPillTone("pro_max"), "pro500");
+  assert.equal(planPillTone("team"), "other");
 
   // Timing breakdown avoids double-counting create_order_ms + create_checkout_ms
   assert.equal(formatPreciseDuration(850), "850 ms");

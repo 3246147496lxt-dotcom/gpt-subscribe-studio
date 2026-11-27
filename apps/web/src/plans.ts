@@ -10,9 +10,9 @@ export const FAMILIES: { id: Family; label: string; hint: string }[] = [
 ];
 
 export const PRO_TIERS: { id: Plan; label: string; hint: string }[] = [
-  { id: "pro_lite", label: "Standard", hint: "$100" },
-  { id: "pro", label: "More", hint: "$200" },
-  { id: "pro_max", label: "Max", hint: "$500" },
+  { id: "pro_lite", label: "Pro100", hint: "$100" },
+  { id: "pro", label: "Pro200", hint: "$200" },
+  { id: "pro_max", label: "Pro500", hint: "$500" },
 ];
 
 export const SEAT_PRESETS = [2, 3, 5, 8, 10];
@@ -58,7 +58,7 @@ export function familyOf(value: Plan): Family {
 
 export function planLabel(value: string): string {
   const tier = PRO_TIERS.find((item) => item.id === value);
-  if (tier) return `Pro ${tier.label}`;
+  if (tier) return tier.label;
   const family = FAMILIES.find((item) => item.id === value);
   return family ? family.label : value;
 }

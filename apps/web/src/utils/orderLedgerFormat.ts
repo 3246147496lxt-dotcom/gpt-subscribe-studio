@@ -29,6 +29,7 @@ export const DELIVERY_STATUS_LABEL: Record<string, string> = {
   verify_delayed: "延迟核验",
   delivered: "已交付",
   failed: "未交付",
+  revoked: "已回收",
   skipped: "已跳过",
 };
 
@@ -130,6 +131,9 @@ export function simpleOrderStatus(status: string): { label: string; tone: Simple
   if (status === "active" || status === "delivered") {
     return { label: "成功", tone: "success" };
   }
+  if (status === "refunded") {
+    return { label: "已退款", tone: "pending" };
+  }
   if (status === "failed" || status === "rejected") {
     return { label: "失败", tone: "failed" };
   }
@@ -139,10 +143,15 @@ export function simpleOrderStatus(status: string): { label: string; tone: Simple
   return { label: "处理中", tone: "pending" };
 }
 
-export function planPillTone(plan: string): "plus" | "pro" | "other" {
+export type PlanPillTone = "go" | "plus" | "pro100" | "pro200" | "pro500" | "other";
+
+export function planPillTone(plan: string): PlanPillTone {
   const norm = (plan || "").toLowerCase();
-  if (norm.startsWith("pro")) return "pro";
+  if (norm === "go") return "go";
   if (norm === "plus") return "plus";
+  if (norm === "pro_lite" || norm === "pro100" || norm === "pro_100") return "pro100";
+  if (norm === "pro_max" || norm === "pro500" || norm === "pro_500") return "pro500";
+  if (norm === "pro" || norm === "pro200" || norm === "pro_200" || norm.startsWith("pro")) return "pro200";
   return "other";
 }
 

@@ -594,9 +594,9 @@ export function QuickPay({
               data={[
                 { value: "plus", label: "Plus" },
                 { value: "go", label: "Go" },
-                { value: "pro_lite", label: "Pro Standard" },
-                { value: "pro", label: "Pro More" },
-                { value: "pro_max", label: "Pro Max" },
+                { value: "pro_lite", label: "Pro100" },
+                { value: "pro", label: "Pro200" },
+                { value: "pro_max", label: "Pro500" },
               ]}
             />
             <Select

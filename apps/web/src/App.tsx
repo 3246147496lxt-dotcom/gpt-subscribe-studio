@@ -494,7 +494,12 @@ export function App() {
           <ErrorBoundary title="管理后台发生异常">
             <div style={{ display: view === "overview" ? "block" : "none" }}>
               <ErrorBoundary title="运维总览加载失败">
-                <OpsOverviewPanel active={view === "overview"} onNavigate={navigate} onHealthUpdate={setHealth} />
+                <OpsOverviewPanel
+                  active={view === "overview"}
+                  onNavigate={navigate}
+                  onHealthUpdate={setHealth}
+                  onLocksChanged={notifyLocksChanged}
+                />
               </ErrorBoundary>
             </div>
 
@@ -502,7 +507,7 @@ export function App() {
               <div style={{ display: view === "diagnostics" ? "block" : "none" }}>
                 <ErrorBoundary title="系统自检加载失败">
                   <Suspense fallback={<PanelFallback />}>
-                    <SystemDiagnosticsPanel active={view === "diagnostics"} />
+                    <SystemDiagnosticsPanel active={view === "diagnostics"} onNavigate={navigate} />
                   </Suspense>
                 </ErrorBoundary>
               </div>

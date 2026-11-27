@@ -450,6 +450,28 @@ class ReconcileResultOut(BaseModel):
     message: str = ""
 
 
+class OrderManualVerdictRequest(BaseModel):
+    verdict: Literal["delivered", "failed", "refunded"]
+    note: str = Field(..., min_length=1, max_length=500)
+    operator: str = Field(default="web-operator", max_length=80)
+    confirm_no_charge: bool = False
+    mark_auto_renew_canceled: bool = False
+
+
+class OrderManualVerdictOut(BaseModel):
+    order_id: str
+    previous_status: str
+    order_status: str
+    payment_status: str
+    delivery_status: str
+    auto_renew_status: str
+    job_status: Optional[str] = None
+    lock_state: Optional[str] = None
+    operator: str
+    note: str
+    message: str
+
+
 class ReconcilerStatusOut(BaseModel):
     enabled: bool
     running: bool

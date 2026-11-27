@@ -24,6 +24,7 @@ export const STAGE_LABEL: Record<string, string> = {
   succeeded: "充值成功",
   failed: "任务未完成",
   unknown: "扣款结果待核对",
+  manual_verdict: "人工判定",
 };
 
 export const FAILURE_LABEL: Record<string, string> = {
@@ -49,6 +50,7 @@ export const FAILURE_LABEL: Record<string, string> = {
   preflight_failed: "前置自动体检未通过，已停止提交",
   unsupported_country: "所选国家或地区暂不支持",
   invalid_request: "请求参数无效，未提交",
+  manual_failed: "已人工判定为未扣款 / 失败",
   unknown_upstream: "未分类上游错误；请保留订单号和阶段日志排查",
 };
 

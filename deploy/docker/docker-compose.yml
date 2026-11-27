@@ -29,7 +29,8 @@ services:
       GSS_BIND_PORT: "18120"
     volumes:
       - /opt/gss/data:/data
-      - /opt/gss/config:/config:ro
+      - /opt/gss/config:/config
+      - /opt/gss/config/container-auth.json:/config/container-auth.json:ro
     # 让容器能访问宿主机的 LLM 打码求解服务（127.0.0.1:8197）
     extra_hosts:
       - "host.docker.internal:host-gateway"

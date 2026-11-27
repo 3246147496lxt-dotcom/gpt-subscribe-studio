@@ -37,6 +37,11 @@ export function SessionPreviewBar({
             导出端：{info.detectedOs}
           </Badge>
         )}
+        {info.deviceIdPrefix && (
+          <Badge size="xs" color="grape" variant="light">
+            oai-did：{info.deviceIdPrefix}
+          </Badge>
+        )}
         {info.hasRefreshCredential && <Badge size="xs" color="teal" variant="light">含刷新凭证</Badge>}
         {info.hasCookies && <Badge size="xs" color="cyan" variant="light">含 Cookies</Badge>}
         <Text size="xs" c={info.state === "invalid" || (info.state === "expired" && !info.hasRefreshCredential) ? "red" : "dimmed"}>

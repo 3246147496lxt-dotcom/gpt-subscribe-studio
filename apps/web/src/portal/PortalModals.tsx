@@ -35,9 +35,9 @@ function formatPlanName(plan?: string | null): string {
   const m: Record<string, string> = {
     go: "ChatGPT Go",
     plus: "ChatGPT Plus",
-    pro_lite: "ChatGPT Pro 100",
-    pro: "ChatGPT Pro 200",
-    pro_max: "ChatGPT Pro 500",
+    pro_lite: "ChatGPT Pro100",
+    pro: "ChatGPT Pro200",
+    pro_max: "ChatGPT Pro500",
   };
   return (plan && m[plan]) || plan || "ChatGPT";
 }

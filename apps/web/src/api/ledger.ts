@@ -214,6 +214,51 @@ export async function reconcileOrder(orderId: string): Promise<ReconcileResult> 
   });
 }
 
+export type OrderManualVerdictValue = "delivered" | "failed" | "refunded";
+
+export type OrderManualVerdictInput = {
+  verdict: OrderManualVerdictValue;
+  note: string;
+  operator?: string;
+  confirm_no_charge?: boolean;
+  mark_auto_renew_canceled?: boolean;
+};
+
+export type OrderManualVerdictResult = {
+  order_id: string;
+  previous_status: string;
+  order_status: string;
+  payment_status: string;
+  delivery_status: string;
+  auto_renew_status: string;
+  job_status?: string | null;
+  lock_state?: string | null;
+  operator: string;
+  note: string;
+  message: string;
+};
+
+export async function submitOrderManualVerdict(
+  orderId: string,
+  input: OrderManualVerdictInput,
+): Promise<OrderManualVerdictResult> {
+  return requestJson<OrderManualVerdictResult>(
+    `/api/orders/${encodeURIComponent(orderId)}/manual-verdict`,
+    {
+      method: "POST",
+      body: {
+        verdict: input.verdict,
+        note: input.note.trim(),
+        operator: (input.operator || "web-operator").trim() || "web-operator",
+        confirm_no_charge: Boolean(input.confirm_no_charge),
+        mark_auto_renew_canceled: Boolean(input.mark_auto_renew_canceled),
+      },
+      timeoutMs: 20_000,
+      fallbackError: "提交人工判定失败",
+    },
+  );
+}
+
 export async function getPaymentLocks(
   params: { state?: string; limit?: number; offset?: number } = {},
   signal?: AbortSignal,

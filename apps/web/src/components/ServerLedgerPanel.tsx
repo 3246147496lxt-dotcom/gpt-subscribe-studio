@@ -1,23 +1,25 @@
 import {
+  ActionIcon,
   Alert,
   Badge,
   Button,
-  Card,
   Group,
-  Modal,
+  Menu,
   SegmentedControl,
   Select,
   Stack,
   Table,
   Text,
   TextInput,
-  Title,
   Tooltip,
 } from "@mantine/core";
 import {
   IconAlertCircle,
+  IconCheck,
   IconClock,
+  IconDotsVertical,
   IconDownload,
+  IconGavel,
   IconListDetails,
   IconRefresh,
   IconRotate2,
@@ -38,6 +40,7 @@ import {
   type OrderFailureDetail,
   type OrderLedgerItem,
   type OrderLedgerPage,
+  type OrderManualVerdictResult,
 } from "../api/ledger";
 import type { QuickPayEvent } from "../api/quickPay";
 import { planLabel } from "../plans";
@@ -48,11 +51,12 @@ import {
   planPillTone,
   simpleOrderStatus,
 } from "../utils/orderLedgerFormat";
+import { AdminPageHeader } from "./AdminPageHeader";
 import { CopyIdBadge } from "./CopyIdBadge";
 import { HistoryTable } from "./HistoryTable";
-import { JsonCodeBlock } from "./JsonCodeBlock";
+import { OrderFailureDetailModal } from "./OrderFailureDetailModal";
 import { OrderLedgerDetailModal } from "./OrderLedgerDetailModal";
-import { FAILURE_LABEL } from "./quick-pay/constants";
+import { OrderManualVerdictModal } from "./OrderManualVerdictModal";
 
 const PAGE_SIZE = 20;
 
@@ -60,9 +64,9 @@ const PLAN_FILTER_OPTIONS = [
   { value: "all", label: "全部套餐" },
   { value: "plus", label: "Plus" },
   { value: "go", label: "Go" },
-  { value: "pro_lite", label: "Pro Standard" },
-  { value: "pro", label: "Pro More" },
-  { value: "pro_max", label: "Pro Max" },
+  { value: "pro_lite", label: "Pro100" },
+  { value: "pro", label: "Pro200" },
+  { value: "pro_max", label: "Pro500" },
   { value: "team", label: "Team" },
 ];
 
@@ -72,6 +76,16 @@ const SOURCE_FILTER_OPTIONS = [
   { value: "quick_pay", label: "后台一键" },
   { value: "step", label: "分步调试" },
 ];
+
+function needsManualAttention(item: OrderLedgerItem): boolean {
+  return (
+    item.status === "unknown"
+    || item.status === "verifying"
+    || item.status === "paid_pending_delivery"
+    || item.status === "awaiting_payment"
+    || item.status === "requires_action"
+  );
+}
 
 export function ServerLedgerPanel({
   active = true,
@@ -103,6 +117,7 @@ export function ServerLedgerPanel({
   const [detailOrder, setDetailOrder] = useState<OrderLedgerItem | null>(null);
   const [detailEvents, setDetailEvents] = useState<QuickPayEvent[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [verdictOrder, setVerdictOrder] = useState<OrderLedgerItem | null>(null);
 
   const loadControllerRef = useRef<AbortController | null>(null);
   const wasActiveRef = useRef(active);
@@ -158,6 +173,7 @@ export function ServerLedgerPanel({
 
   async function openFailureDetail(item: OrderLedgerItem) {
     setDetailOrder(null);
+    setVerdictOrder(null);
     setFailureModalOrder(item);
     setFailureDetail(null);
     setFailureFetchError(null);
@@ -175,6 +191,7 @@ export function ServerLedgerPanel({
   async function openDetail(item: OrderLedgerItem) {
     setFailureModalOrder(null);
     setFailureDetail(null);
+    setVerdictOrder(null);
     setDetailOrder(item);
     setDetailEvents([]);
     setDetailLoading(true);
@@ -186,6 +203,12 @@ export function ServerLedgerPanel({
     } finally {
       setDetailLoading(false);
     }
+  }
+
+  function openManualVerdict(item: OrderLedgerItem) {
+    setDetailOrder(null);
+    setFailureModalOrder(null);
+    setVerdictOrder(item);
   }
 
   async function handleReconcile(orderId: string) {
@@ -202,6 +225,15 @@ export function ServerLedgerPanel({
     } finally {
       setReconcilingId(null);
     }
+  }
+
+  async function handleManualVerdictDone(res: OrderManualVerdictResult) {
+    setVerdictOrder(null);
+    setNotice(
+      `订单 ${res.order_id.slice(0, 8)} ${res.message}（${res.previous_status} → ${res.order_status} · 操作员 ${res.operator}）。`,
+    );
+    await load();
+    onLocksChanged?.();
   }
 
   function resetFilters() {
@@ -236,55 +268,65 @@ export function ServerLedgerPanel({
   });
 
   return (
-    <Stack gap="lg">
-      <Card withBorder radius="lg" p="lg" className="workspace-panel">
-        <Stack gap="md">
-          {/* 精简头部：标题 + 一行安静的汇总数据 + 导出/刷新 */}
-          <Group justify="space-between" align="center" wrap="wrap" gap="sm">
-            <Group gap="md" align="baseline" wrap="wrap">
-              <Title order={2}>订单记录</Title>
-              {stats && (
-                <Group gap="xs" wrap="wrap">
-                  <Text size="xs" c="dimmed">
-                    共 <strong>{stats.total}</strong> 笔 · 成功 <strong style={{ color: "var(--studio-green)" }}>{stats.delivered}</strong> · 失败 <strong>{stats.failed}</strong>
-                  </Text>
-                  {stats.paid_pending_delivery > 0 && (
-                    <Badge size="xs" variant="light" color="cyan">待交付 {stats.paid_pending_delivery}</Badge>
-                  )}
-                  {stats.unknown > 0 && (
-                    <Badge size="xs" variant="light" color="orange">待核对 {stats.unknown}</Badge>
-                  )}
-                  {stats.active_locks > 0 && (
-                    <Badge size="xs" variant="filled" color="red">资金锁 {stats.active_locks}</Badge>
-                  )}
-                </Group>
+    <Stack gap="md">
+      <AdminPageHeader
+        title="订单记录"
+        badge={
+          stats ? (
+            <Group gap={6} wrap="wrap">
+              <Badge size="sm" variant="light" color="gray">共 {stats.total} 笔</Badge>
+              <Badge size="sm" variant="light" color="green">成功 {stats.delivered}</Badge>
+              {stats.paid_pending_delivery > 0 && (
+                <Badge size="sm" variant="light" color="cyan">待交付 {stats.paid_pending_delivery}</Badge>
+              )}
+              {stats.unknown > 0 && (
+                <Badge size="sm" variant="light" color="orange">待核对 {stats.unknown}</Badge>
+              )}
+              {stats.active_locks > 0 && (
+                <Badge size="sm" variant="filled" color="red">资金锁 {stats.active_locks}</Badge>
               )}
             </Group>
-            <Group gap="xs">
-              <Button
-                component="a"
-                href={exportUrl}
-                download
-                variant="subtle"
-                color="gray"
-                size="xs"
-                leftSection={<IconDownload size={14} />}
-              >
-                导出 CSV
-              </Button>
-              <Button
-                variant="subtle"
-                color="gray"
-                size="xs"
-                leftSection={<IconRefresh size={14} />}
-                loading={loading}
-                onClick={() => void load()}
-              >
-                刷新
-              </Button>
-            </Group>
-          </Group>
+          ) : null
+        }
+        subtitle="点击任意行即可查看订单详情与耗时细分；待核对或滞留单支持只读对账与留痕人工判定。"
+        actions={
+          <>
+            <Button
+              component="a"
+              href={exportUrl}
+              download
+              variant="default"
+              size="xs"
+              leftSection={<IconDownload size={14} />}
+            >
+              导出 CSV
+            </Button>
+            <Button
+              variant="default"
+              size="xs"
+              leftSection={<IconRefresh size={14} />}
+              loading={loading}
+              onClick={() => void load()}
+            >
+              刷新
+            </Button>
+          </>
+        }
+      />
 
+      {notice && (
+        <Alert color="teal" radius="md" icon={<IconCheck size={16} />} title="处理结果" withCloseButton onClose={() => setNotice(null)}>
+          {notice}
+        </Alert>
+      )}
+      {error && (
+        <Alert color="red" radius="md" title="加载失败" withCloseButton onClose={() => setError(null)}>
+          {error}
+        </Alert>
+      )}
+
+      <section className="ops-panel">
+        <Stack gap="md">
           {/* 精简筛选栏 */}
           <Group justify="space-between" wrap="wrap" gap="xs">
             <SegmentedControl
@@ -353,20 +395,17 @@ export function ServerLedgerPanel({
             </Group>
           </Group>
 
-          {notice && <Alert color="blue" title="对账提示" withCloseButton onClose={() => setNotice(null)}>{notice}</Alert>}
-          {error && <Alert color="red" title="加载失败">{error}</Alert>}
-
           {!page || page.items.length === 0 ? (
             <Text c="dimmed" ta="center" py="xl" size="sm">
-              {loading ? "正在加载订单记录..." : "当前筛选条件下暂无订单记录。"}
+              {loading ? "正在加载订单记录…" : "当前筛选条件下暂无订单记录。"}
             </Text>
           ) : (
             <>
-              <Table.ScrollContainer minWidth={980}>
+              <Table.ScrollContainer minWidth={940}>
                 <Table className="ledger-clean-table" highlightOnHover={false}>
                   <Table.Thead>
                     <Table.Tr>
-                      <Table.Th style={{ width: 54 }}>序号</Table.Th>
+                      <Table.Th style={{ width: 48 }}>序号</Table.Th>
                       <Table.Th>订单号</Table.Th>
                       <Table.Th>账号</Table.Th>
                       <Table.Th>套餐</Table.Th>
@@ -375,7 +414,7 @@ export function ServerLedgerPanel({
                       <Table.Th>金额</Table.Th>
                       <Table.Th>总耗时</Table.Th>
                       <Table.Th>创建时间</Table.Th>
-                      <Table.Th style={{ textAlign: "right" }}>操作</Table.Th>
+                      <Table.Th style={{ width: 120, textAlign: "right" }}>操作</Table.Th>
                     </Table.Tr>
                   </Table.Thead>
                   <Table.Tbody>
@@ -386,24 +425,26 @@ export function ServerLedgerPanel({
                       const statusInfo = simpleOrderStatus(item.status);
                       const durationClock = formatDurationClock(item.total_ms);
                       const hasFail = hasFailureReason(item);
+                      const attention = needsManualAttention(item);
                       const canReconcile =
                         item.status === "unknown"
                         || (item.payment_status === "succeeded" && item.delivery_status !== "delivered");
                       const planTone = planPillTone(item.plan);
 
                       return (
-                        <Table.Tr key={item.id}>
-                          {/* 1. 序号（最新在顶部，从 1 往下排） */}
+                        <Table.Tr
+                          key={item.id}
+                          className="ops-clickable-row"
+                          onClick={() => void openDetail(item)}
+                        >
                           <Table.Td>
                             <span className="ledger-seq">{seq}</span>
                           </Table.Td>
 
-                          {/* 2. 订单号 */}
-                          <Table.Td>
+                          <Table.Td onClick={(e) => e.stopPropagation()}>
                             <CopyIdBadge value={item.id} prefixLength={8} />
                           </Table.Td>
 
-                          {/* 3. 邮箱账号 */}
                           <Table.Td>
                             {emailText ? (
                               <Tooltip label={emailText} openDelay={300} withArrow>
@@ -414,14 +455,12 @@ export function ServerLedgerPanel({
                             )}
                           </Table.Td>
 
-                          {/* 4. 套餐（仅展示套餐类型） */}
                           <Table.Td>
                             <span className={`ledger-pill ledger-pill--plan ledger-pill--plan-${planTone}`}>
                               {planLabel(item.plan)}
                             </span>
                           </Table.Td>
 
-                          {/* 5. 状态（成功 / 失败 / 待核对 / 处理中） */}
                           <Table.Td>
                             <span className={`ledger-pill ledger-pill--status-${statusInfo.tone}`}>
                               <span className={`ledger-dot ledger-dot--${statusInfo.tone}`} />
@@ -429,7 +468,6 @@ export function ServerLedgerPanel({
                             </span>
                           </Table.Td>
 
-                          {/* 6. 卡片（如 VISA / Mastercard） */}
                           <Table.Td>
                             {item.card_brand ? (
                               <span className="ledger-pill ledger-pill--card">{item.card_brand}</span>
@@ -438,7 +476,6 @@ export function ServerLedgerPanel({
                             )}
                           </Table.Td>
 
-                          {/* 7. 金额（仅金额，不标注免税或其他） */}
                           <Table.Td>
                             {amountText ? (
                               <span className="ledger-amount">{amountText}</span>
@@ -447,7 +484,6 @@ export function ServerLedgerPanel({
                             )}
                           </Table.Td>
 
-                          {/* 8. 总耗时 */}
                           <Table.Td>
                             {durationClock ? (
                               <span className="ledger-duration">
@@ -459,45 +495,93 @@ export function ServerLedgerPanel({
                             )}
                           </Table.Td>
 
-                          {/* 9. 创建时间（仅月日时分 MM/DD HH:mm） */}
                           <Table.Td>
                             <span className="ledger-time">{formatMonthDayTime(item.created_at)}</span>
                           </Table.Td>
 
-                          {/* 10. 操作（失败原因在详情左侧） */}
-                          <Table.Td>
-                            <Group gap={6} justify="flex-end" wrap="nowrap">
-                              <Button
-                                size="xs"
-                                variant={hasFail ? "light" : "subtle"}
-                                color={hasFail ? "red" : "gray"}
-                                disabled={!hasFail}
-                                leftSection={<IconAlertCircle size={13} />}
-                                onClick={() => void openFailureDetail(item)}
-                              >
-                                失败原因
-                              </Button>
-                              <Button
-                                size="xs"
-                                variant="subtle"
-                                color="gray"
-                                leftSection={<IconListDetails size={13} />}
-                                onClick={() => void openDetail(item)}
-                              >
-                                详情
-                              </Button>
-                              {canReconcile && (
+                          {/* 统一整齐的操作列：每行固定 1 个场景主按钮 + 1 个右对齐 ⋯ 更多菜单 */}
+                          <Table.Td style={{ textAlign: "right" }} onClick={(e) => e.stopPropagation()}>
+                            <Group gap={4} justify="flex-end" wrap="nowrap">
+                              {attention ? (
                                 <Button
-                                  size="xs"
+                                  size="compact-xs"
                                   variant="light"
                                   color="orange"
-                                  leftSection={<IconShieldCheck size={13} />}
-                                  loading={reconcilingId === item.id}
-                                  onClick={() => void handleReconcile(item.id)}
+                                  miw={64}
+                                  onClick={() => openManualVerdict(item)}
                                 >
-                                  对账
+                                  人工判定
+                                </Button>
+                              ) : hasFail ? (
+                                <Button
+                                  size="compact-xs"
+                                  variant="light"
+                                  color="red"
+                                  miw={64}
+                                  onClick={() => void openFailureDetail(item)}
+                                >
+                                  失败诊断
+                                </Button>
+                              ) : (
+                                <Button
+                                  size="compact-xs"
+                                  variant="subtle"
+                                  color="gray"
+                                  miw={64}
+                                  onClick={() => void openDetail(item)}
+                                >
+                                  查看详情
                                 </Button>
                               )}
+
+                              <Menu position="bottom-end" withinPortal shadow="md" width={164}>
+                                <Menu.Target>
+                                  <ActionIcon
+                                    size="sm"
+                                    variant="subtle"
+                                    color="gray"
+                                    aria-label="更多订单操作"
+                                    loading={reconcilingId === item.id}
+                                  >
+                                    <IconDotsVertical size={15} />
+                                  </ActionIcon>
+                                </Menu.Target>
+                                <Menu.Dropdown>
+                                  <Menu.Item
+                                    leftSection={<IconListDetails size={14} />}
+                                    onClick={() => void openDetail(item)}
+                                  >
+                                    订单详情与耗时
+                                  </Menu.Item>
+                                  {hasFail && (
+                                    <Menu.Item
+                                      color="red"
+                                      leftSection={<IconAlertCircle size={14} />}
+                                      onClick={() => void openFailureDetail(item)}
+                                    >
+                                      失败诊断详情
+                                    </Menu.Item>
+                                  )}
+                                  {canReconcile && (
+                                    <Menu.Item
+                                      color="orange"
+                                      leftSection={<IconShieldCheck size={14} />}
+                                      disabled={reconcilingId === item.id}
+                                      onClick={() => void handleReconcile(item.id)}
+                                    >
+                                      执行只读对账
+                                    </Menu.Item>
+                                  )}
+                                  <Menu.Divider />
+                                  <Menu.Item
+                                    color="blue"
+                                    leftSection={<IconGavel size={14} />}
+                                    onClick={() => openManualVerdict(item)}
+                                  >
+                                    人工判定状态…
+                                  </Menu.Item>
+                                </Menu.Dropdown>
+                              </Menu>
                             </Group>
                           </Table.Td>
                         </Table.Tr>
@@ -533,7 +617,7 @@ export function ServerLedgerPanel({
             </>
           )}
         </Stack>
-      </Card>
+      </section>
 
       {localHistory.length > 0 && (
         <details className="studio-help">
@@ -544,151 +628,21 @@ export function ServerLedgerPanel({
         </details>
       )}
 
-      {/* 开通失败详情弹窗（延续后台精致 UI 风格 + 结构化接口诊断内容） */}
-      <Modal
-        opened={failureModalOrder !== null}
+      {/* 共享结构化失败诊断弹窗 */}
+      <OrderFailureDetailModal
+        order={failureModalOrder}
+        detail={failureDetail}
+        loading={failureLoading}
+        fetchError={failureFetchError}
         onClose={() => {
           setFailureModalOrder(null);
           setFailureDetail(null);
           setFailureFetchError(null);
         }}
-        title={
-          failureModalOrder && (
-            <Group gap="xs" align="center" wrap="nowrap">
-              <span className="failure-modal-icon" aria-hidden="true">
-                <IconAlertCircle size={17} stroke={2} />
-              </span>
-              <Text fw={700} size="md">
-                {failureDetail?.title || "开通失败详情"}
-              </Text>
-              <span className={`ledger-pill ledger-pill--plan ledger-pill--plan-${planPillTone(failureModalOrder.plan)}`}>
-                {planLabel(failureModalOrder.plan)}
-              </span>
-            </Group>
-          )
-        }
-        size="lg"
-        radius="lg"
-        padding="lg"
-        centered
-      >
-        {failureModalOrder && (
-          <Stack gap="md">
-            {/* 顶部柔红强调摘要卡 */}
-            <div className="failure-summary-banner">
-              <div className="failure-detail-summary">
-                {failureLoading
-                  ? "正在加载结构化失败诊断..."
-                  : failureDetail?.summary
-                    || failureModalOrder.last_error
-                    || (failureModalOrder.failure_code ? FAILURE_LABEL[failureModalOrder.failure_code] : null)
-                    || "该订单未成功完成，请结合下方请求与响应排查。"}
-              </div>
-              <div className="failure-detail-meta">
-                <span className="failure-meta-chip">
-                  错误码 <code>{failureDetail?.error_code || (failureModalOrder.failure_code || "UNKNOWN").toUpperCase()}</code>
-                </span>
-                <span className="failure-meta-chip">
-                  阶段 <code>{failureDetail?.stage || failureModalOrder.diagnostics?.stage || failureModalOrder.job_stage || "-"}</code>
-                </span>
-                {failureDetail?.cf_ray && (
-                  <span className="failure-meta-chip">
-                    CF-Ray <code>{failureDetail.cf_ray}</code>
-                  </span>
-                )}
-                {failureDetail?.request_id && (
-                  <span className="failure-meta-chip">
-                    Request-ID <code>{failureDetail.request_id}</code>
-                  </span>
-                )}
-              </div>
-            </div>
+        onOpenAuditDetail={(ord) => void openDetail(ord)}
+      />
 
-            {failureFetchError && (
-              <Alert color="red" title="加载接口诊断失败">
-                <Text size="xs">{failureFetchError}</Text>
-              </Alert>
-            )}
-
-            {/* 结构化上游接口请求与响应卡片 */}
-            {!failureLoading && failureDetail?.exchange && (
-              <div className="failure-exchange-card">
-                <div className="failure-exchange-header">
-                  <div className="failure-exchange-head">
-                    <span className="failure-exchange-title">{failureDetail.exchange.title}</span>
-                    {failureDetail.exchange.http_status != null && (
-                      <Badge
-                        size="sm"
-                        radius="sm"
-                        variant="light"
-                        color={
-                          failureDetail.exchange.http_status >= 500
-                            ? "red"
-                            : failureDetail.exchange.http_status >= 400
-                              ? "orange"
-                              : "teal"
-                        }
-                      >
-                        HTTP {failureDetail.exchange.http_status}
-                      </Badge>
-                    )}
-                  </div>
-                  {(failureDetail.exchange.method || failureDetail.exchange.url) && (
-                    <div className="failure-exchange-url-row">
-                      {failureDetail.exchange.method && (
-                        <span className="failure-method-tag">{failureDetail.exchange.method}</span>
-                      )}
-                      {failureDetail.exchange.url && (
-                        <span className="failure-exchange-url">{failureDetail.exchange.url}</span>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                <Stack gap="sm" className="failure-exchange-body">
-                  {failureDetail.exchange.request != null && (
-                    <JsonCodeBlock label="请求参数" value={failureDetail.exchange.request} />
-                  )}
-
-                  {failureDetail.exchange.response != null && (
-                    <JsonCodeBlock label="响应内容" value={failureDetail.exchange.response} />
-                  )}
-
-                  {failureDetail.exchange.captured === false && (
-                    <Text size="xs" c="dimmed">
-                      注：该笔为旧版历史记录，当前展示为已落库的非敏感摘要；新产生的失败订单将自动记录完整脱敏后的上游请求参数与响应内容。
-                    </Text>
-                  )}
-                </Stack>
-              </div>
-            )}
-
-            <Group justify="space-between" align="center" wrap="wrap" gap="xs" pt={4}>
-              <Group gap={6}>
-                <Text size="xs" c="dimmed">请求编号</Text>
-                <CopyIdBadge value={failureModalOrder.id} prefixLength={14} />
-              </Group>
-              <Group gap="xs">
-                <Button size="xs" variant="light" onClick={() => void openDetail(failureModalOrder)}>
-                  查看完整审计详情
-                </Button>
-                <Button
-                  size="xs"
-                  variant="default"
-                  onClick={() => {
-                    setFailureModalOrder(null);
-                    setFailureDetail(null);
-                  }}
-                >
-                  关闭
-                </Button>
-              </Group>
-            </Group>
-          </Stack>
-        )}
-      </Modal>
-
-      {/* 全新易读「订单详情」弹窗（含总耗时细分条与清晰分组信息） */}
+      {/* 订单详情弹窗（含人工判定与只读对账入口） */}
       <OrderLedgerDetailModal
         order={detailOrder}
         events={detailEvents}
@@ -697,6 +651,14 @@ export function ServerLedgerPanel({
         onClose={() => setDetailOrder(null)}
         onReconcile={(id) => void handleReconcile(id)}
         onOpenFailureDetail={(item) => void openFailureDetail(item)}
+        onManualVerdict={(item) => openManualVerdict(item)}
+      />
+
+      {/* 人工判定状态弹窗 */}
+      <OrderManualVerdictModal
+        order={verdictOrder}
+        onClose={() => setVerdictOrder(null)}
+        onSuccess={(res) => void handleManualVerdictDone(res)}
       />
     </Stack>
   );

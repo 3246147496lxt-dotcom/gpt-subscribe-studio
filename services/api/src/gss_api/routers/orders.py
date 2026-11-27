@@ -107,6 +107,8 @@ from ..schemas import (
     OrderLedgerItemOut,
     OrderLedgerOut,
     OrderLedgerStatsOut,
+    OrderManualVerdictOut,
+    OrderManualVerdictRequest,
     OrderOut,
     OrderPayRequest,
     QuickPayEventOut,
@@ -1059,6 +1061,199 @@ async def reconcile_order_endpoint(order_id: str) -> ReconcileResultOut:
     if result.get("outcome") == "order_not_found":
         raise HTTPException(404, detail={"code": "not_found", "message": "订单不存在"})
     return ReconcileResultOut(**result)
+
+
+@router.post("/orders/{order_id}/manual-verdict", response_model=OrderManualVerdictOut)
+async def manual_verdict_order(order_id: str, payload: OrderManualVerdictRequest) -> OrderManualVerdictOut:
+    """Apply an explicit, audit-logged operator verdict to an order and synchronize its job/lock."""
+    from datetime import datetime, timezone
+    from .. import locks
+    from ..services import order_flow, reconciler
+
+    note = (payload.note or "").strip()
+    if not note:
+        raise HTTPException(400, detail={"code": "invalid_request", "message": "人工判定备注不能为空"})
+    operator = (payload.operator or "").strip() or "web-operator"
+
+    async with reconciler._order_lock(order_id):
+        order = store.get_order(order_id)
+        if order is None:
+            raise HTTPException(404, detail={"code": "not_found", "message": "订单不存在"})
+
+        db = get_db_optional()
+        view = store.view(order_id)
+        job = reconciler._load_or_attach_job(None, order_id)
+        if job is not None and job.status in {"queued", "running"}:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "order_in_progress",
+                    "message": "该订单仍有正在执行中的后台任务，请等待任务结束后再进行人工判定",
+                },
+            )
+
+        held_lock_id = ""
+        if job is not None and job.lock_id:
+            row = db.get_lock(job.lock_id) if db else None
+            if row and row.get("state") == "held":
+                held_lock_id = str(row["id"])
+        if not held_lock_id:
+            fp = (view.account_fingerprint or "") or (job.account_fingerprint if job else "") or ""
+            held = locks.find_active_lock(fp) if fp else None
+            if held and held.get("order_id") == order_id and held.get("state") == "held":
+                held_lock_id = str(held["id"])
+
+        prev_status = str(order.status)
+        now_dt = datetime.now(timezone.utc)
+        now_iso = now_dt.isoformat()
+        verdict = payload.verdict
+
+        if verdict == "failed":
+            if order.status in {OrderStatus.ACTIVE, OrderStatus.DELIVERED} or view.payment_status == "succeeded":
+                raise HTTPException(
+                    409,
+                    detail={
+                        "code": "manual_verdict_refused",
+                        "message": "该订单已确认扣款成功，不能判定为未扣款失败；如已退款请选择「已退款」",
+                    },
+                )
+            needs_confirm = (
+                order.status is OrderStatus.UNKNOWN
+                or view.payment_status == "processing"
+                or bool(held_lock_id)
+            )
+            if needs_confirm and not payload.confirm_no_charge:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "code": "confirm_no_charge_required",
+                        "message": "请明确勾选确认已核对银行或 Stripe 账单未扣款后再判定为失败",
+                    },
+                )
+
+        lock_state: Optional[str] = None
+        if verdict == "delivered":
+            view.payment_status = "succeeded"
+            view.delivery_status = "delivered"
+            view.failure_code = None
+            view.last_error = None
+            view.finished_at = view.finished_at or now_iso
+            if payload.mark_auto_renew_canceled:
+                view.auto_renew_status = "canceled"
+                view.auto_renew_canceled_at = view.auto_renew_canceled_at or now_iso
+                view.auto_renew_error = None
+            store.update_status(order_id, OrderStatus.DELIVERED)
+            if held_lock_id:
+                ok, _msg, updated = locks.resolve_paid(
+                    held_lock_id,
+                    note=f"人工判定已交付：{note}",
+                    operator=operator,
+                )
+                lock_state = str(updated.get("state")) if ok and updated else None
+            verdict_msg = "已人工判定为成功交付"
+            if payload.mark_auto_renew_canceled:
+                verdict_msg += "（并标记自动续费已关闭）"
+        elif verdict == "failed":
+            view.payment_status = "unpaid" if view.payment_status == "unpaid" else "failed"
+            view.delivery_status = "failed"
+            if not view.failure_code:
+                view.failure_code = "manual_failed"
+            view.last_error = f"人工判定失败：{note}"
+            view.finished_at = now_iso
+            store.update_status(order_id, OrderStatus.FAILED)
+            if held_lock_id:
+                ok, _msg, updated = locks.release(
+                    held_lock_id,
+                    confirm_no_charge=True,
+                    note=f"人工判定未扣款失败：{note}",
+                    operator=operator,
+                )
+                lock_state = str(updated.get("state")) if ok and updated else None
+            verdict_msg = "已人工判定为未扣款 / 失败"
+        else:  # refunded
+            view.payment_status = "refunded"
+            view.delivery_status = "revoked"
+            view.last_error = f"人工判定已退款：{note}"
+            view.finished_at = now_iso
+            store.update_status(order_id, OrderStatus.REFUNDED)
+            if held_lock_id and db is not None:
+                if db.release_lock(held_lock_id, released_by=operator, note=f"人工判定已退款：{note}"):
+                    lock_state = "released"
+            verdict_msg = "已人工判定为已退款"
+
+        job_status: Optional[str] = None
+        if job is not None:
+            if verdict == "delivered":
+                job.status = "succeeded"
+                job.stage = "succeeded"
+                job.failure_code = None
+                job.message = f"人工判定已交付（{operator}）：{note}"
+                if payload.mark_auto_renew_canceled:
+                    job.auto_renew_status = "canceled"
+            elif verdict == "failed":
+                job.status = "failed"
+                job.stage = "failed"
+                job.failure_code = view.failure_code or "manual_failed"
+                job.message = f"人工判定失败（{operator}）：{note}"
+            else:
+                job.status = "failed"
+                job.stage = "failed"
+                job.failure_code = "refunded"
+                job.message = f"人工判定已退款（{operator}）：{note}"
+            job.finished_at = job.finished_at or now_dt.timestamp()
+            order_flow._jobs[job.id] = job
+            job_status = job.status
+            if db is not None:
+                try:
+                    db.save_job(job)
+                    db.save_idempotency(
+                        job.idempotency_key,
+                        "quick_pay",
+                        order_id=order_id,
+                        job_id=job.id,
+                        state=job.status,
+                    )
+                except Exception:
+                    logger.warning("manual_verdict_job_persist_failed order=%s job=%s", order_id, job.id)
+
+        if db is not None:
+            try:
+                db.add_event(
+                    stage="manual_verdict",
+                    event=f"manual_{verdict}",
+                    order_id=order_id,
+                    job_id=job.id if job else "",
+                    code=f"manual_{verdict}",
+                    message=f"[{operator}] {prev_status} → {order.status}：{note}",
+                    metadata={
+                        "operator": operator,
+                        "previous_status": prev_status,
+                        "verdict": verdict,
+                        "confirm_no_charge": bool(payload.confirm_no_charge),
+                        "mark_auto_renew_canceled": bool(payload.mark_auto_renew_canceled),
+                        "lock_state": lock_state,
+                    },
+                )
+            except Exception:
+                logger.warning("manual_verdict_event_write_failed order=%s", order_id)
+
+        logger.info(
+            "manual_verdict_applied order=%s prev=%s next=%s operator=%s lock_state=%s",
+            order_id, prev_status, str(order.status), operator, lock_state or "-",
+        )
+        return OrderManualVerdictOut(
+            order_id=order_id,
+            previous_status=prev_status,
+            order_status=str(order.status),
+            payment_status=view.payment_status,
+            delivery_status=view.delivery_status,
+            auto_renew_status=view.auto_renew_status,
+            job_status=job_status,
+            lock_state=lock_state,
+            operator=operator,
+            note=note,
+            message=verdict_msg,
+        )
 
 
 @router.post(

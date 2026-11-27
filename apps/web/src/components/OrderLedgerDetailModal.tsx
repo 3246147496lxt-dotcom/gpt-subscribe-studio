@@ -11,6 +11,7 @@ import {
 import {
   IconAlertCircle,
   IconClock,
+  IconGavel,
   IconReceipt,
   IconShieldCheck,
 } from "@tabler/icons-react";
@@ -61,6 +62,7 @@ export function OrderLedgerDetailModal({
   onClose,
   onReconcile,
   onOpenFailureDetail,
+  onManualVerdict,
 }: {
   order: OrderLedgerItem | null;
   events: QuickPayEvent[];
@@ -69,6 +71,7 @@ export function OrderLedgerDetailModal({
   onClose: () => void;
   onReconcile: (orderId: string) => void;
   onOpenFailureDetail: (item: OrderLedgerItem) => void;
+  onManualVerdict?: (item: OrderLedgerItem) => void;
 }) {
   if (!order) {
     return <Modal opened={false} onClose={onClose} title="订单详情" size="lg" centered />;
@@ -373,6 +376,17 @@ export function OrderLedgerDetailModal({
         </section>
 
         <Group justify="flex-end" gap="xs" pt={2}>
+          {onManualVerdict && (
+            <Button
+              size="xs"
+              variant="light"
+              color="blue"
+              leftSection={<IconGavel size={14} />}
+              onClick={() => onManualVerdict(order)}
+            >
+              人工判定
+            </Button>
+          )}
           {canReconcile && (
             <Button
               size="xs"

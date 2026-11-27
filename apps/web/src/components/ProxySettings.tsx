@@ -2,9 +2,7 @@ import {
   Alert,
   Badge,
   Button,
-  Card,
   Code,
-  Divider,
   Group,
   Modal,
   Paper,
@@ -12,11 +10,11 @@ import {
   Stack,
   Switch,
   Text,
-  Title,
 } from "@mantine/core";
 import {
   IconAlertCircle,
   IconCheck,
+  IconNetwork,
   IconPlugConnected,
   IconRefresh,
   IconTrash,
@@ -32,6 +30,7 @@ import {
   testProxy,
   type ProxyInfo,
 } from "../api/client";
+import { AdminPageHeader } from "./AdminPageHeader";
 
 function Facts({ info }: { info: ProxyInfo }) {
   return (
@@ -99,21 +98,22 @@ export function ProxySettings() {
   const configured = Boolean(saved?.host);
 
   return (
-    <Card withBorder radius="lg" p="lg" className="workspace-panel">
-      <Stack gap="lg">
-        <Group justify="space-between" align="flex-start" wrap="wrap" gap="sm">
-          <div>
-            <Group gap="xs" align="center">
-              <Title order={2}>代理网关</Title>
-              <Badge color={configured ? (saved?.enabled ? "green" : "gray") : "gray"} variant="light" size="sm">
-                {configured ? (saved?.enabled ? "已启用" : "已停用") : "未配置"}
-              </Badge>
-            </Group>
-            <Text size="sm" c="dimmed" mt={4}>
-              自动解析代理账号中的地区与 SID 参数，每笔订单按目标地区分配独立随机 SID 并保持单笔出口一致。
-            </Text>
-          </div>
-          <Group gap="xs">
+    <Stack gap="md">
+      <AdminPageHeader
+        title="代理网关"
+        badge={
+          <span
+            className={`ops-live-pill ${
+              configured ? (saved?.enabled ? "ops-live-pill--ok" : "ops-live-pill--warn") : "ops-live-pill--warn"
+            }`}
+          >
+            <span className="ops-pulse-dot" aria-hidden="true" />
+            {configured ? (saved?.enabled ? "已启用" : "已停用") : "未配置"}
+          </span>
+        }
+        subtitle="自动解析代理账号中的地区与 SID 参数，每笔订单按目标地区分配独立随机 SID 并保持单笔出口一致。"
+        actions={
+          <>
             <Button
               size="xs"
               variant="default"
@@ -134,81 +134,91 @@ export function ProxySettings() {
             </Button>
             <Button
               size="xs"
-              variant="subtle"
-              color="gray"
+              variant="default"
               leftSection={<IconRefresh size={14} />}
               loading={loading}
               onClick={() => void load()}
             >
               刷新
             </Button>
-          </Group>
-        </Group>
+          </>
+        }
+      />
 
-        {message && (
-          <Alert
-            color={message.color}
-            variant="light"
-            withCloseButton
-            onClose={() => setMessage(null)}
-            icon={message.color === "green" ? <IconCheck size={16} /> : <IconAlertCircle size={16} />}
-          >
-            {message.text}
-          </Alert>
-        )}
+      {message && (
+        <Alert
+          color={message.color}
+          radius="md"
+          variant="light"
+          withCloseButton
+          onClose={() => setMessage(null)}
+          icon={message.color === "green" ? <IconCheck size={16} /> : <IconAlertCircle size={16} />}
+        >
+          {message.text}
+        </Alert>
+      )}
 
-        <Paper withBorder p="md" radius="md">
-          <Stack gap="sm">
-            <Group justify="space-between" align="center" wrap="wrap" gap="sm">
-              <Text fw={600} size="sm">当前已保存网关</Text>
-              {configured && saved && (
-                <Group gap="sm" align="center" wrap="nowrap">
-                  <Switch
-                    size="sm"
-                    label={saved.enabled ? "已启用" : "已停用"}
-                    checked={saved.enabled}
-                    disabled={busy !== null}
-                    onChange={(event) => {
-                      const nextEnabled = event.currentTarget.checked;
-                      void run("toggle", async () => {
-                        const next = await setProxyEnabled(nextEnabled);
-                        setSaved(next);
-                        setMessage({
-                          color: "green",
-                          text: nextEnabled
-                            ? "出口代理已启用，对后续新建订单生效。"
-                            : "出口代理已停用（已保留网关地址与凭据，可随时重新开启）。",
-                        });
-                      });
-                    }}
-                  />
-                  <Button
-                    size="xs"
-                    variant="subtle"
-                    color="red"
-                    leftSection={<IconTrash size={13} />}
-                    disabled={busy !== null}
-                    onClick={() => setClearModalOpen(true)}
-                  >
-                    清空配置
-                  </Button>
-                </Group>
-              )}
+      {/* 当前已保存网关卡 */}
+      <section className="ops-panel">
+        <div className="ops-panel-head">
+          <div className="ops-panel-title-wrap">
+            <IconNetwork size={16} stroke={1.9} />
+            <h3 className="ops-panel-title">当前已保存网关</h3>
+          </div>
+          {configured && saved && (
+            <Group gap="sm" align="center" wrap="nowrap">
+              <Switch
+                size="sm"
+                label={saved.enabled ? "已启用" : "已停用"}
+                checked={saved.enabled}
+                disabled={busy !== null}
+                onChange={(event) => {
+                  const nextEnabled = event.currentTarget.checked;
+                  void run("toggle", async () => {
+                    const next = await setProxyEnabled(nextEnabled);
+                    setSaved(next);
+                    setMessage({
+                      color: "green",
+                      text: nextEnabled
+                        ? "出口代理已启用，对后续新建订单生效。"
+                        : "出口代理已停用（已保留网关地址与凭据，可随时重新开启）。",
+                    });
+                  });
+                }}
+              />
+              <Button
+                size="xs"
+                variant="subtle"
+                color="red"
+                leftSection={<IconTrash size={13} />}
+                disabled={busy !== null}
+                onClick={() => setClearModalOpen(true)}
+              >
+                清空配置
+              </Button>
             </Group>
-            {configured && saved ? (
-              <Facts info={saved} />
-            ) : (
-              <Text size="sm" c="dimmed">
-                尚未保存代理网关；可在下方粘贴代理串解析并保存。
-              </Text>
-            )}
-          </Stack>
-        </Paper>
+          )}
+        </div>
 
-        <Divider />
+        {configured && saved ? (
+          <Facts info={saved} />
+        ) : (
+          <Text size="sm" c="dimmed">
+            尚未保存代理网关；可在下方粘贴代理串解析并保存。
+          </Text>
+        )}
+      </section>
+
+      {/* 添加 / 替换网关卡 */}
+      <section className="ops-panel">
+        <div className="ops-panel-head">
+          <div className="ops-panel-title-wrap">
+            <h3 className="ops-panel-title">{configured ? "替换代理网关" : "添加代理网关"}</h3>
+          </div>
+          <span className="ops-panel-sub">认证密码仅落盘于本地受保护配置，绝不明文回显</span>
+        </div>
 
         <Stack gap="sm" maw={760}>
-          <Text fw={600} size="sm">{configured ? "替换代理网关" : "添加代理网关"}</Text>
           <PasswordInput
             label="代理地址"
             description="一行即可。支持 http://账号:密码@主机:端口、账号:密码@主机:端口、主机:端口:账号:密码、socks5://…。账号需含地区和 SID 参数，例如 acct-region-US-sid-abc123。"
@@ -275,7 +285,7 @@ export function ProxySettings() {
             </Paper>
           )}
         </Stack>
-      </Stack>
+      </section>
 
       <Modal
         opened={clearModalOpen}
@@ -311,6 +321,6 @@ export function ProxySettings() {
           </Group>
         </Stack>
       </Modal>
-    </Card>
+    </Stack>
   );
 }

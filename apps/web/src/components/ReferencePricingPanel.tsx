@@ -29,9 +29,9 @@ type PlanMeta = {
 const PLAN_ROWS: PlanMeta[] = [
   { id: "go", label: "Go", desc: "轻量日常高频使用", baseUsd: 8 },
   { id: "plus", label: "Plus", desc: "个人进阶主力订阅", baseUsd: 20 },
-  { id: "pro_lite", label: "Pro 100", desc: "10x Plus 额度 · 专业研发", baseUsd: 100 },
-  { id: "pro", label: "Pro 200", desc: "20x Plus 额度 · 深度推理", baseUsd: 200 },
-  { id: "pro_max", label: "Pro 500", desc: "顶配算力 · Ultrafast 极速", baseUsd: 500 },
+  { id: "pro_lite", label: "Pro100", desc: "10x Plus 额度 · 专业研发", baseUsd: 100 },
+  { id: "pro", label: "Pro200", desc: "20x Plus 额度 · 深度推理", baseUsd: 200 },
+  { id: "pro_max", label: "Pro500", desc: "顶配算力 · Ultrafast 极速", baseUsd: 500 },
 ];
 
 type RegionMeta = {

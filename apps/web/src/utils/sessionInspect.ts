@@ -4,26 +4,103 @@ export type SessionInspection = {
   maskedEmail?: string;
   accountPrefix?: string;
   detectedOs?: "macOS" | "Windows" | "Linux";
+  deviceIdPrefix?: string;
+  deviceFingerprint?: string;
   hasRefreshCredential: boolean;
   hasCookies: boolean;
   expiresInSeconds?: number;
 };
 
-function detectOsFromJson(obj: Record<string, unknown>): "macOS" | "Windows" | "Linux" | undefined {
-  const statsigRaw = obj.statsigContext ?? obj.statsig_context ?? obj.statsig;
-  let statsig: Record<string, unknown> | null = null;
-  if (statsigRaw && typeof statsigRaw === "object" && !Array.isArray(statsigRaw)) {
-    statsig = statsigRaw as Record<string, unknown>;
-  } else if (typeof statsigRaw === "string" && statsigRaw.trim().startsWith("{")) {
+function fnv1aHex(input: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+function parseStatsigObj(raw: unknown): Record<string, unknown> | null {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  if (typeof raw === "string" && raw.trim().startsWith("{")) {
     try {
-      const parsed = JSON.parse(statsigRaw);
+      const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        statsig = parsed as Record<string, unknown>;
+        return parsed as Record<string, unknown>;
       }
     } catch {
-      statsig = null;
+      return null;
     }
   }
+  return null;
+}
+
+function extractDeviceIdFromJson(obj: Record<string, unknown>): {
+  deviceIdPrefix?: string;
+  deviceFingerprint?: string;
+} {
+  const statsig = parseStatsigObj(obj.statsigContext ?? obj.statsig_context ?? obj.statsig);
+  const directCandidates: unknown[] = [
+    obj.deviceId,
+    obj.device_id,
+    obj["oai-did"],
+    obj.oai_did,
+    statsig?.deviceId,
+    statsig?.device_id,
+    statsig?.["oai-did"],
+  ];
+
+  let found = "";
+  for (const item of directCandidates) {
+    if (typeof item === "string" && item.trim().length >= 8) {
+      found = item.trim();
+      break;
+    }
+  }
+
+  if (!found && obj.cookies) {
+    if (typeof obj.cookies === "object" && !Array.isArray(obj.cookies)) {
+      const val = (obj.cookies as Record<string, unknown>)["oai-did"];
+      if (typeof val === "string" && val.trim().length >= 8) {
+        found = val.trim();
+      }
+    } else if (Array.isArray(obj.cookies)) {
+      for (const c of obj.cookies) {
+        if (
+          c && typeof c === "object"
+          && (c as Record<string, unknown>).name === "oai-did"
+          && typeof (c as Record<string, unknown>).value === "string"
+        ) {
+          const val = String((c as Record<string, unknown>).value).trim();
+          if (val.length >= 8) {
+            found = val;
+            break;
+          }
+        }
+      }
+    } else if (typeof obj.cookies === "string") {
+      const m = obj.cookies.match(/(?:^|;\s*)oai-did=([^;\s]+)/i);
+      if (m && m[1] && m[1].length >= 8) found = m[1].trim();
+    }
+  }
+
+  if (!found && typeof obj.cookie === "string") {
+    const m = obj.cookie.match(/(?:^|;\s*)oai-did=([^;\s]+)/i);
+    if (m && m[1] && m[1].length >= 8) found = m[1].trim();
+  }
+
+  if (!found) return {};
+  const normalized = found.toLowerCase();
+  return {
+    deviceIdPrefix: `${found.slice(0, 8)}…`,
+    deviceFingerprint: `${fnv1aHex(normalized)}-${fnv1aHex(`${normalized}:${normalized.length}`)}`,
+  };
+}
+
+function detectOsFromJson(obj: Record<string, unknown>): "macOS" | "Windows" | "Linux" | undefined {
+  const statsig = parseStatsigObj(obj.statsigContext ?? obj.statsig_context ?? obj.statsig);
   const candidates = [
     statsig?.userAgent, statsig?.user_agent, statsig?.ua,
     obj.userAgent, obj.user_agent, obj.ua,
@@ -110,6 +187,8 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
   let accessToken = "";
   let email = "";
   let detectedOs: "macOS" | "Windows" | "Linux" | undefined;
+  let deviceIdPrefix: string | undefined;
+  let deviceFingerprint: string | undefined;
   let hasRefreshCredential = false;
   let hasCookies = false;
 
@@ -140,6 +219,9 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
       accessToken = tokenCandidate.trim();
     }
     detectedOs = detectOsFromJson(obj);
+    const dev = extractDeviceIdFromJson(obj);
+    deviceIdPrefix = dev.deviceIdPrefix;
+    deviceFingerprint = dev.deviceFingerprint;
     const userObj = obj.user && typeof obj.user === "object" ? (obj.user as Record<string, unknown>) : null;
     if (userObj && typeof userObj.email === "string") {
       email = userObj.email.trim();
@@ -185,6 +267,8 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
           summary: "未包含 accessToken，但检测到刷新凭证，建单时将尝试自动刷新",
           maskedEmail: email ? maskEmail(email) : undefined,
           detectedOs,
+          deviceIdPrefix,
+          deviceFingerprint,
           hasRefreshCredential,
           hasCookies,
         };
@@ -194,6 +278,8 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
         summary: "JSON 中缺少 accessToken（也未找到刷新凭证），请重新导出完整 Session",
         maskedEmail: email ? maskEmail(email) : undefined,
         detectedOs,
+        deviceIdPrefix,
+        deviceFingerprint,
         hasRefreshCredential: false,
         hasCookies,
       };
@@ -230,6 +316,8 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
       summary: "已识别 accessToken（非标准 JWT 结构，将在提交时由服务端核验）",
       maskedEmail: email ? maskEmail(email) : undefined,
       detectedOs,
+      deviceIdPrefix,
+      deviceFingerprint,
       hasRefreshCredential,
       hasCookies,
     };
@@ -257,6 +345,8 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
         maskedEmail,
         accountPrefix,
         detectedOs,
+        deviceIdPrefix,
+        deviceFingerprint,
         hasRefreshCredential,
         hasCookies,
         expiresInSeconds: Math.round(remaining),
@@ -269,6 +359,8 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
         maskedEmail,
         accountPrefix,
         detectedOs,
+        deviceIdPrefix,
+        deviceFingerprint,
         hasRefreshCredential,
         hasCookies,
         expiresInSeconds: Math.round(remaining),
@@ -280,6 +372,8 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
       maskedEmail,
       accountPrefix,
       detectedOs,
+      deviceIdPrefix,
+      deviceFingerprint,
       hasRefreshCredential,
       hasCookies,
       expiresInSeconds: Math.round(remaining),
@@ -292,6 +386,8 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
     maskedEmail,
     accountPrefix,
     detectedOs,
+    deviceIdPrefix,
+    deviceFingerprint,
     hasRefreshCredential,
     hasCookies,
   };

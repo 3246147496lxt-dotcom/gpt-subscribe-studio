@@ -1,17 +1,16 @@
 import {
   ActionIcon,
   Alert,
+  Badge,
   Button,
-  Card,
-  Divider,
   Group,
   Paper,
   SimpleGrid,
+  Skeleton,
   Stack,
   Text,
   Textarea,
   TextInput,
-  Title,
 } from "@mantine/core";
 import {
   IconAlertCircle,
@@ -19,11 +18,14 @@ import {
   IconArrowUp,
   IconCheck,
   IconExternalLink,
+  IconLink,
   IconPlus,
   IconRefresh,
+  IconSpeakerphone,
   IconTrash,
+  IconWorld,
 } from "@tabler/icons-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   getAdminPortalSite,
@@ -32,9 +34,38 @@ import {
   type PortalSiteConfig,
 } from "../api/adminOps";
 import { isAbortError } from "../api/http";
+import { AdminPageHeader } from "./AdminPageHeader";
+
+function editableSnapshot(cfg: PortalSiteConfig | null): string {
+  if (!cfg) return "";
+  return JSON.stringify({
+    brand_name: cfg.brand_name,
+    brand_name_en: cfg.brand_name_en,
+    footer_slogan: cfg.footer_slogan,
+    footer_slogan_en: cfg.footer_slogan_en,
+    hero_title: cfg.hero_title,
+    hero_title_en: cfg.hero_title_en,
+    hero_subtitle_1: cfg.hero_subtitle_1,
+    hero_subtitle_1_en: cfg.hero_subtitle_1_en,
+    hero_subtitle_2: cfg.hero_subtitle_2,
+    hero_subtitle_2_en: cfg.hero_subtitle_2_en,
+    card_shop_url: cfg.card_shop_url,
+    card_shop_label: cfg.card_shop_label,
+    card_shop_label_en: cfg.card_shop_label_en,
+    support_url: cfg.support_url,
+    support_label: cfg.support_label,
+    support_label_en: cfg.support_label_en,
+    support_note: cfg.support_note,
+    support_note_en: cfg.support_note_en,
+    price_note: cfg.price_note,
+    price_note_en: cfg.price_note_en,
+    announcements: cfg.announcements,
+  });
+}
 
 export function PortalSitePanel() {
   const [form, setForm] = useState<PortalSiteConfig | null>(null);
+  const [baseline, setBaseline] = useState<PortalSiteConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,6 +78,7 @@ export function PortalSitePanel() {
       const cfg = await getAdminPortalSite(signal);
       if (!signal?.aborted) {
         setForm(cfg);
+        setBaseline(cfg);
       }
     } catch (exc) {
       if (isAbortError(exc)) return;
@@ -63,6 +95,11 @@ export function PortalSitePanel() {
     void load(controller.signal);
     return () => controller.abort();
   }, [load]);
+
+  const isDirty = useMemo(
+    () => Boolean(form && baseline && editableSnapshot(form) !== editableSnapshot(baseline)),
+    [form, baseline],
+  );
 
   function setField<K extends keyof PortalSiteConfig>(key: K, value: PortalSiteConfig[K]) {
     setForm((prev) => (prev ? { ...prev, [key]: value } : prev));
@@ -113,6 +150,13 @@ export function PortalSitePanel() {
     setSavedMsg(null);
   }
 
+  function handleDiscard() {
+    if (!baseline) return;
+    setForm(baseline);
+    setError(null);
+    setSavedMsg(null);
+  }
+
   async function handleSave() {
     if (!form) return;
     setSaving(true);
@@ -150,6 +194,7 @@ export function PortalSitePanel() {
         announcements: cleanedAnnouncements,
       });
       setForm(updated);
+      setBaseline(updated);
       setSavedMsg("门户站点配置已保存，刷新用户端 `/` 页面立即生效。");
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "保存门户配置失败");
@@ -159,16 +204,19 @@ export function PortalSitePanel() {
   }
 
   return (
-    <Card withBorder radius="lg" p="lg" className="workspace-panel">
-      <Stack gap="md">
-        <Group justify="space-between" align="flex-start" wrap="wrap" gap="sm">
-          <div>
-            <Title order={2}>门户配置</Title>
-            <Text c="dimmed" size="sm" mt={4}>
-              管理客户自助充值页（`/`）的品牌名称、主视觉文案、购卡/客服外链与公告栏；保存在 `$GSS_CONFIG_DIR/portal-site.json`。
-            </Text>
-          </div>
-          <Group gap="xs">
+    <Stack gap="md">
+      <AdminPageHeader
+        title="门户配置"
+        badge={
+          isDirty ? (
+            <Badge size="sm" color="orange" variant="light">有未保存更改</Badge>
+          ) : form ? (
+            <Badge size="sm" color="teal" variant="light">已与线上同步</Badge>
+          ) : null
+        }
+        subtitle="管理客户自助充值页（/）的品牌名称、主视觉文案、购卡/客服外链与顶部公告栏；保存于 $GSS_CONFIG_DIR/portal-site.json。"
+        actions={
+          <>
             <Button
               component="a"
               href="/"
@@ -182,162 +230,202 @@ export function PortalSitePanel() {
             </Button>
             <Button
               size="xs"
-              variant="subtle"
+              variant="default"
               leftSection={<IconRefresh size={14} />}
               loading={loading}
               onClick={() => void load()}
             >
               重新加载
             </Button>
-          </Group>
-        </Group>
+            <Button
+              size="xs"
+              loading={saving}
+              disabled={!form || !isDirty}
+              onClick={() => void handleSave()}
+            >
+              保存配置
+            </Button>
+          </>
+        }
+      />
 
-        {error && <Alert color="red" icon={<IconAlertCircle size={16} />} title="操作失败">{error}</Alert>}
-        {savedMsg && <Alert color="green" icon={<IconCheck size={16} />}>{savedMsg}</Alert>}
+      {error && (
+        <Alert color="red" radius="md" icon={<IconAlertCircle size={16} />} title="操作失败" withCloseButton onClose={() => setError(null)}>
+          {error}
+        </Alert>
+      )}
+      {savedMsg && (
+        <Alert color="teal" radius="md" icon={<IconCheck size={16} />} withCloseButton onClose={() => setSavedMsg(null)}>
+          {savedMsg}
+        </Alert>
+      )}
 
-        {form && (
-          <Stack gap="lg">
-            <div>
-              <Text fw={600} size="sm" mb="xs">品牌与主视觉文案</Text>
-              <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
-                <TextInput
-                  label="品牌名（中文）"
-                  value={form.brand_name}
-                  onChange={(e) => setField("brand_name", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="品牌名（English）"
-                  value={form.brand_name_en}
-                  onChange={(e) => setField("brand_name_en", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="主标题（中文）"
-                  value={form.hero_title}
-                  onChange={(e) => setField("hero_title", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="主标题（English）"
-                  value={form.hero_title_en}
-                  onChange={(e) => setField("hero_title_en", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="副标题 1（中文）"
-                  value={form.hero_subtitle_1}
-                  onChange={(e) => setField("hero_subtitle_1", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="副标题 1（English）"
-                  value={form.hero_subtitle_1_en}
-                  onChange={(e) => setField("hero_subtitle_1_en", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="副标题 2（中文）"
-                  value={form.hero_subtitle_2}
-                  onChange={(e) => setField("hero_subtitle_2", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="副标题 2（English）"
-                  value={form.hero_subtitle_2_en}
-                  onChange={(e) => setField("hero_subtitle_2_en", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="页脚标语（中文）"
-                  value={form.footer_slogan}
-                  onChange={(e) => setField("footer_slogan", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="页脚标语（English）"
-                  value={form.footer_slogan_en}
-                  onChange={(e) => setField("footer_slogan_en", e.currentTarget.value)}
-                />
-              </SimpleGrid>
+      {!form ? (
+        <section className="ops-panel">
+          <Stack gap="sm">
+            <Skeleton height={28} width="35%" />
+            <Skeleton height={90} />
+            <Skeleton height={90} />
+          </Stack>
+        </section>
+      ) : (
+        <>
+          {/* 卡片 1：品牌与主视觉文案 */}
+          <section className="ops-panel">
+            <div className="ops-panel-head">
+              <div className="ops-panel-title-wrap">
+                <IconWorld size={16} stroke={1.9} />
+                <h3 className="ops-panel-title">品牌与主视觉文案</h3>
+              </div>
+              <span className="ops-panel-sub">支持中英文双语独立维护</span>
+            </div>
+            <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
+              <TextInput
+                label="品牌名（中文）"
+                value={form.brand_name}
+                onChange={(e) => setField("brand_name", e.currentTarget.value)}
+              />
+              <TextInput
+                label="品牌名（English）"
+                value={form.brand_name_en}
+                onChange={(e) => setField("brand_name_en", e.currentTarget.value)}
+              />
+              <TextInput
+                label="主标题（中文）"
+                value={form.hero_title}
+                onChange={(e) => setField("hero_title", e.currentTarget.value)}
+              />
+              <TextInput
+                label="主标题（English）"
+                value={form.hero_title_en}
+                onChange={(e) => setField("hero_title_en", e.currentTarget.value)}
+              />
+              <TextInput
+                label="副标题 1（中文）"
+                value={form.hero_subtitle_1}
+                onChange={(e) => setField("hero_subtitle_1", e.currentTarget.value)}
+              />
+              <TextInput
+                label="副标题 1（English）"
+                value={form.hero_subtitle_1_en}
+                onChange={(e) => setField("hero_subtitle_1_en", e.currentTarget.value)}
+              />
+              <TextInput
+                label="副标题 2（中文）"
+                value={form.hero_subtitle_2}
+                onChange={(e) => setField("hero_subtitle_2", e.currentTarget.value)}
+              />
+              <TextInput
+                label="副标题 2（English）"
+                value={form.hero_subtitle_2_en}
+                onChange={(e) => setField("hero_subtitle_2_en", e.currentTarget.value)}
+              />
+              <TextInput
+                label="页脚标语（中文）"
+                value={form.footer_slogan}
+                onChange={(e) => setField("footer_slogan", e.currentTarget.value)}
+              />
+              <TextInput
+                label="页脚标语（English）"
+                value={form.footer_slogan_en}
+                onChange={(e) => setField("footer_slogan_en", e.currentTarget.value)}
+              />
+            </SimpleGrid>
+          </section>
+
+          {/* 卡片 2：购卡外链、客服与价格说明 */}
+          <section className="ops-panel">
+            <div className="ops-panel-head">
+              <div className="ops-panel-title-wrap">
+                <IconLink size={16} stroke={1.9} />
+                <h3 className="ops-panel-title">购卡外链、客服与价格说明</h3>
+              </div>
+              <span className="ops-panel-sub">留空链接将自动隐藏对应入口</span>
+            </div>
+            <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
+              <TextInput
+                label="购卡 / 卡网链接（留空隐藏）"
+                placeholder="https://example.com/cards"
+                value={form.card_shop_url}
+                onChange={(e) => setField("card_shop_url", e.currentTarget.value)}
+              />
+              <TextInput
+                label="客服链接（留空仅显示说明）"
+                placeholder="https://t.me/your_support"
+                value={form.support_url}
+                onChange={(e) => setField("support_url", e.currentTarget.value)}
+              />
+              <TextInput
+                label="购卡按钮文案（中文）"
+                value={form.card_shop_label}
+                onChange={(e) => setField("card_shop_label", e.currentTarget.value)}
+              />
+              <TextInput
+                label="购卡按钮文案（English）"
+                value={form.card_shop_label_en}
+                onChange={(e) => setField("card_shop_label_en", e.currentTarget.value)}
+              />
+              <TextInput
+                label="客服按钮文案（中文）"
+                value={form.support_label}
+                onChange={(e) => setField("support_label", e.currentTarget.value)}
+              />
+              <TextInput
+                label="客服按钮文案（English）"
+                value={form.support_label_en}
+                onChange={(e) => setField("support_label_en", e.currentTarget.value)}
+              />
+              <Textarea
+                label="客服引导说明（中文）"
+                autosize
+                minRows={2}
+                value={form.support_note}
+                onChange={(e) => setField("support_note", e.currentTarget.value)}
+              />
+              <Textarea
+                label="客服引导说明（English）"
+                autosize
+                minRows={2}
+                value={form.support_note_en}
+                onChange={(e) => setField("support_note_en", e.currentTarget.value)}
+              />
+              <Textarea
+                label="参考价提示（中文）"
+                autosize
+                minRows={2}
+                value={form.price_note}
+                onChange={(e) => setField("price_note", e.currentTarget.value)}
+              />
+              <Textarea
+                label="参考价提示（English）"
+                autosize
+                minRows={2}
+                value={form.price_note_en}
+                onChange={(e) => setField("price_note_en", e.currentTarget.value)}
+              />
+            </SimpleGrid>
+          </section>
+
+          {/* 卡片 3：顶部公告栏 */}
+          <section className="ops-panel">
+            <div className="ops-panel-head">
+              <div className="ops-panel-title-wrap">
+                <IconSpeakerphone size={16} stroke={1.9} />
+                <h3 className="ops-panel-title">顶部公告栏</h3>
+                <Badge size="xs" color="gray" variant="light">{form.announcements.length} 条</Badge>
+              </div>
+              <Button size="xs" variant="light" leftSection={<IconPlus size={14} />} onClick={addAnnouncement}>
+                新增公告
+              </Button>
             </div>
 
-            <Divider />
-
-            <div>
-              <Text fw={600} size="sm" mb="xs">购卡外链、客服与价格说明</Text>
-              <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm">
-                <TextInput
-                  label="购卡 / 卡网链接（留空隐藏）"
-                  placeholder="https://example.com/cards"
-                  value={form.card_shop_url}
-                  onChange={(e) => setField("card_shop_url", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="客服链接（留空仅显示说明）"
-                  placeholder="https://t.me/your_support"
-                  value={form.support_url}
-                  onChange={(e) => setField("support_url", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="购卡按钮文案（中文）"
-                  value={form.card_shop_label}
-                  onChange={(e) => setField("card_shop_label", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="购卡按钮文案（English）"
-                  value={form.card_shop_label_en}
-                  onChange={(e) => setField("card_shop_label_en", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="客服按钮文案（中文）"
-                  value={form.support_label}
-                  onChange={(e) => setField("support_label", e.currentTarget.value)}
-                />
-                <TextInput
-                  label="客服按钮文案（English）"
-                  value={form.support_label_en}
-                  onChange={(e) => setField("support_label_en", e.currentTarget.value)}
-                />
-                <Textarea
-                  label="客服引导说明（中文）"
-                  autosize
-                  minRows={2}
-                  value={form.support_note}
-                  onChange={(e) => setField("support_note", e.currentTarget.value)}
-                />
-                <Textarea
-                  label="客服引导说明（English）"
-                  autosize
-                  minRows={2}
-                  value={form.support_note_en}
-                  onChange={(e) => setField("support_note_en", e.currentTarget.value)}
-                />
-                <Textarea
-                  label="参考价提示（中文）"
-                  autosize
-                  minRows={2}
-                  value={form.price_note}
-                  onChange={(e) => setField("price_note", e.currentTarget.value)}
-                />
-                <Textarea
-                  label="参考价提示（English）"
-                  autosize
-                  minRows={2}
-                  value={form.price_note_en}
-                  onChange={(e) => setField("price_note_en", e.currentTarget.value)}
-                />
-              </SimpleGrid>
-            </div>
-
-            <Divider />
-
-            <Stack gap="sm">
-              <Group justify="space-between" align="center">
-                <div>
-                  <Text fw={600} size="sm">顶部公告栏（{form.announcements.length} 条）</Text>
-                  <Text size="xs" c="dimmed">展示在用户门户顶部通知条，支持中英文独立维护。</Text>
-                </div>
-                <Button size="xs" variant="light" leftSection={<IconPlus size={14} />} onClick={addAnnouncement}>
-                  新增公告
-                </Button>
-              </Group>
-
-              {form.announcements.length === 0 ? (
-                <Text size="sm" c="dimmed" py="sm">暂无公告，点击右上角「新增公告」添加。</Text>
-              ) : (
-                form.announcements.map((item, idx) => (
+            {form.announcements.length === 0 ? (
+              <Text size="sm" c="dimmed" py="md" ta="center">
+                暂无公告，点击右上角「新增公告」添加。
+              </Text>
+            ) : (
+              <Stack gap="sm">
+                {form.announcements.map((item, idx) => (
                   <Paper key={`${item.id}-${idx}`} withBorder radius="md" p="sm">
                     <Stack gap="xs">
                       <Group justify="space-between" align="center">
@@ -388,18 +476,30 @@ export function PortalSitePanel() {
                       </SimpleGrid>
                     </Stack>
                   </Paper>
-                ))
-              )}
-            </Stack>
+                ))}
+              </Stack>
+            )}
+          </section>
 
-            <Group justify="flex-end">
-              <Button loading={saving} onClick={() => void handleSave()}>
-                保存站点配置
-              </Button>
-            </Group>
-          </Stack>
-        )}
-      </Stack>
-    </Card>
+          {/* 吸底未保存更改条 */}
+          {isDirty && (
+            <div className="ops-sticky-save" role="status">
+              <div className="ops-sticky-save-left">
+                <span className="ops-dirty-dot" aria-hidden="true" />
+                <span>门户站点配置有未保存的更改</span>
+              </div>
+              <Group gap="xs">
+                <Button size="xs" variant="default" disabled={saving} onClick={handleDiscard}>
+                  放弃更改
+                </Button>
+                <Button size="xs" loading={saving} onClick={() => void handleSave()}>
+                  保存并生效
+                </Button>
+              </Group>
+            </div>
+          )}
+        </>
+      )}
+    </Stack>
   );
 }
