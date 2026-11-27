@@ -263,6 +263,60 @@ class Persistence:
                 ON portal_tasks(owner_user_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_portal_tasks_guest
                 ON portal_tasks(guest_token_hash, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS order_sensitive_vault (
+                order_id TEXT PRIMARY KEY,
+                session_ciphertext BLOB,
+                card_ciphertext BLOB,
+                has_session INTEGER NOT NULL DEFAULT 0,
+                has_card INTEGER NOT NULL DEFAULT 0,
+                card_brand TEXT,
+                card_bin TEXT,
+                card_last4 TEXT,
+                card_exp TEXT,
+                card_fingerprint TEXT,
+                key_version INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                purged_at TEXT,
+                purge_reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_vault_expires
+                ON order_sensitive_vault(expires_at) WHERE purged_at IS NULL;
+            CREATE INDEX IF NOT EXISTS idx_vault_card_fp
+                ON order_sensitive_vault(card_fingerprint);
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                key_prefix TEXT NOT NULL,
+                key_hash TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'active',
+                rate_limit_rpm INTEGER NOT NULL DEFAULT 30,
+                allowed_plans_json TEXT NOT NULL DEFAULT '["go","plus","pro_lite","pro","pro_max"]',
+                note TEXT,
+                total_requests INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                revoked_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS api_tasks (
+                job_id TEXT PRIMARY KEY,
+                api_key_id TEXT NOT NULL,
+                external_order_id TEXT,
+                masked_email TEXT,
+                plan TEXT NOT NULL,
+                exit_country TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_tasks_key
+                ON api_tasks(api_key_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_api_tasks_ext
+                ON api_tasks(api_key_id, external_order_id);
             """
         )
         for statement in (
@@ -875,11 +929,24 @@ class Persistence:
                            j.finished_at AS job_finished_at,
                            pt.job_id AS portal_task_job_id,
                            pt.masked_email AS masked_email,
-                           pu.username AS portal_username
+                           pu.username AS portal_username,
+                           at.job_id AS api_task_job_id,
+                           at.api_key_id AS api_key_id,
+                           at.external_order_id AS external_order_id,
+                           COALESCE(pt.masked_email, at.masked_email) AS resolved_masked_email,
+                           ak.name AS api_key_name,
+                           ov.has_session AS vault_has_session,
+                           ov.has_card AS vault_has_card,
+                           ov.card_last4 AS vault_card_last4,
+                           ov.expires_at AS vault_expires_at,
+                           ov.purged_at AS vault_purged_at
                     FROM page_orders po
                     LEFT JOIN quick_pay_jobs j ON j.id = po.latest_job_id
                     LEFT JOIN portal_tasks pt ON pt.job_id = po.latest_job_id
                     LEFT JOIN portal_users pu ON pu.id = pt.owner_user_id
+                    LEFT JOIN api_tasks at ON at.job_id = po.latest_job_id
+                    LEFT JOIN api_keys ak ON ak.id = at.api_key_id
+                    LEFT JOIN order_sensitive_vault ov ON ov.order_id = po.id
                     ORDER BY po.created_at DESC""",
                 [*params, capped, skip],
             ).fetchall()
@@ -921,11 +988,18 @@ class Persistence:
                     "EXISTS (SELECT 1 FROM quick_pay_jobs j "
                     "JOIN portal_tasks pt ON pt.job_id = j.id WHERE j.order_id = o.id)"
                 )
+            elif source_norm == "api":
+                clauses.append(
+                    "EXISTS (SELECT 1 FROM quick_pay_jobs j "
+                    "JOIN api_tasks at ON at.job_id = j.id WHERE j.order_id = o.id)"
+                )
             elif source_norm == "quick_pay":
                 clauses.append(
                     "EXISTS (SELECT 1 FROM quick_pay_jobs j WHERE j.order_id = o.id) "
                     "AND NOT EXISTS (SELECT 1 FROM quick_pay_jobs j "
-                    "JOIN portal_tasks pt ON pt.job_id = j.id WHERE j.order_id = o.id)"
+                    "JOIN portal_tasks pt ON pt.job_id = j.id WHERE j.order_id = o.id) "
+                    "AND NOT EXISTS (SELECT 1 FROM quick_pay_jobs j "
+                    "JOIN api_tasks at ON at.job_id = j.id WHERE j.order_id = o.id)"
                 )
             elif source_norm == "step":
                 clauses.append("NOT EXISTS (SELECT 1 FROM quick_pay_jobs j WHERE j.order_id = o.id)")
@@ -950,9 +1024,21 @@ class Persistence:
                 "     WHERE j.order_id = o.id"
                 "       AND (COALESCE(pt.masked_email,'') LIKE ? OR COALESCE(pu.username,'') LIKE ?)"
                 " )"
+                " OR EXISTS ("
+                "     SELECT 1 FROM quick_pay_jobs j"
+                "     JOIN api_tasks at ON at.job_id = j.id"
+                "     LEFT JOIN api_keys ak ON ak.id = at.api_key_id"
+                "     WHERE j.order_id = o.id"
+                "       AND (COALESCE(at.external_order_id,'') LIKE ? OR COALESCE(ak.name,'') LIKE ?)"
+                " )"
+                " OR EXISTS ("
+                "     SELECT 1 FROM order_sensitive_vault ov"
+                "     WHERE ov.order_id = o.id"
+                "       AND (COALESCE(ov.card_last4,'') LIKE ? OR COALESCE(ov.card_bin,'') LIKE ?)"
+                " )"
                 ")"
             )
-            params.extend([like, like, like, like, like, like, like, like, like, like, like])
+            params.extend([like] * 15)
         df = (date_from or "").strip()
         if df:
             clauses.append("o.created_at >= ?")
@@ -1015,11 +1101,17 @@ class Persistence:
                            j.finished_at AS job_finished_at,
                            pt.job_id AS portal_task_job_id,
                            pt.masked_email AS masked_email,
-                           pu.username AS portal_username
+                           pu.username AS portal_username,
+                           at.job_id AS api_task_job_id,
+                           at.api_key_id AS api_key_id,
+                           at.external_order_id AS external_order_id,
+                           ak.name AS api_key_name
                     FROM export_orders eo
                     LEFT JOIN quick_pay_jobs j ON j.id = eo.latest_job_id
                     LEFT JOIN portal_tasks pt ON pt.job_id = eo.latest_job_id
                     LEFT JOIN portal_users pu ON pu.id = pt.owner_user_id
+                    LEFT JOIN api_tasks at ON at.job_id = eo.latest_job_id
+                    LEFT JOIN api_keys ak ON ak.id = at.api_key_id
                     ORDER BY eo.created_at DESC""",
                 [*params, capped],
             ).fetchall()
@@ -1028,7 +1120,16 @@ class Persistence:
     def maintenance_stats(self) -> dict[str, Any]:
         with self._lock:
             counts = {}
-            for table in ("orders", "quick_pay_jobs", "order_events", "account_locks", "account_subscription_snapshots"):
+            for table in (
+                "orders",
+                "quick_pay_jobs",
+                "order_events",
+                "account_locks",
+                "account_subscription_snapshots",
+                "order_sensitive_vault",
+                "api_keys",
+                "api_tasks",
+            ):
                 counts[table] = int(self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         db_bytes = 0
         wal_bytes = 0
@@ -1070,6 +1171,7 @@ class Persistence:
                 row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 if row is not None:
                     checkpoint = {"busy": int(row[0]), "log": int(row[1]), "checkpointed": int(row[2])}
+        self.purge_expired_order_vaults()
         stats = self.maintenance_stats()
         return {
             "retention_days": days,
@@ -1434,10 +1536,356 @@ class Persistence:
             ).fetchall()
         return [dict(row) for row in rows], total
 
+    # -- order sensitive vault (30-day encrypted after-sales retention) ------ #
+    def upsert_order_vault(
+        self,
+        *,
+        order_id: str,
+        session_ciphertext: Optional[bytes] = None,
+        card_ciphertext: Optional[bytes] = None,
+        card_brand: Optional[str] = None,
+        card_bin: Optional[str] = None,
+        card_last4: Optional[str] = None,
+        card_exp: Optional[str] = None,
+        card_fingerprint: Optional[str] = None,
+        expires_at: str,
+        key_version: int = 1,
+    ) -> None:
+        now = _utcnow()
+        has_session = 1 if session_ciphertext is not None else 0
+        has_card = 1 if card_ciphertext is not None else 0
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO order_sensitive_vault(
+                    order_id, session_ciphertext, card_ciphertext,
+                    has_session, has_card,
+                    card_brand, card_bin, card_last4, card_exp, card_fingerprint,
+                    key_version, created_at, updated_at, expires_at, purged_at, purge_reason
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)
+                ON CONFLICT(order_id) DO UPDATE SET
+                    session_ciphertext = COALESCE(excluded.session_ciphertext, order_sensitive_vault.session_ciphertext),
+                    card_ciphertext = COALESCE(excluded.card_ciphertext, order_sensitive_vault.card_ciphertext),
+                    has_session = CASE WHEN excluded.session_ciphertext IS NOT NULL THEN 1 ELSE order_sensitive_vault.has_session END,
+                    has_card = CASE WHEN excluded.card_ciphertext IS NOT NULL THEN 1 ELSE order_sensitive_vault.has_card END,
+                    card_brand = COALESCE(excluded.card_brand, order_sensitive_vault.card_brand),
+                    card_bin = COALESCE(excluded.card_bin, order_sensitive_vault.card_bin),
+                    card_last4 = COALESCE(excluded.card_last4, order_sensitive_vault.card_last4),
+                    card_exp = COALESCE(excluded.card_exp, order_sensitive_vault.card_exp),
+                    card_fingerprint = COALESCE(excluded.card_fingerprint, order_sensitive_vault.card_fingerprint),
+                    key_version = excluded.key_version,
+                    updated_at = excluded.updated_at,
+                    expires_at = COALESCE(order_sensitive_vault.expires_at, excluded.expires_at),
+                    purged_at = NULL,
+                    purge_reason = NULL""",
+                (
+                    order_id,
+                    session_ciphertext,
+                    card_ciphertext,
+                    has_session,
+                    has_card,
+                    card_brand,
+                    card_bin,
+                    card_last4,
+                    card_exp,
+                    card_fingerprint,
+                    key_version,
+                    now,
+                    now,
+                    expires_at,
+                ),
+            )
+
+    def get_order_vault_row(self, order_id: str) -> Optional[dict[str, Any]]:
+        if not order_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM order_sensitive_vault WHERE order_id = ?",
+                (order_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def purge_order_vault(self, order_id: str, *, reason: str = "manual_purge") -> bool:
+        if not order_id:
+            return False
+        now = _utcnow()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """UPDATE order_sensitive_vault
+                   SET session_ciphertext = NULL,
+                       card_ciphertext = NULL,
+                       has_session = 0,
+                       has_card = 0,
+                       updated_at = ?,
+                       purged_at = COALESCE(purged_at, ?),
+                       purge_reason = COALESCE(purge_reason, ?)
+                   WHERE order_id = ? AND (session_ciphertext IS NOT NULL OR card_ciphertext IS NOT NULL OR purged_at IS NULL)""",
+                (now, now, reason, order_id),
+            )
+            return int(cur.rowcount or 0) > 0
+
+    def purge_expired_order_vaults(self, *, now_iso: Optional[str] = None) -> int:
+        cutoff = now_iso or _utcnow()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """UPDATE order_sensitive_vault
+                   SET session_ciphertext = NULL,
+                       card_ciphertext = NULL,
+                       has_session = 0,
+                       has_card = 0,
+                       updated_at = ?,
+                       purged_at = ?,
+                       purge_reason = 'ttl_expired'
+                   WHERE purged_at IS NULL AND expires_at <= ?""",
+                (cutoff, cutoff, cutoff),
+            )
+            return int(cur.rowcount or 0)
+
+    # -- developer API keys & scoped API tasks ------------------------------ #
+    def create_api_key(
+        self,
+        *,
+        key_id: str,
+        name: str,
+        key_prefix: str,
+        key_hash: str,
+        rate_limit_rpm: int = 30,
+        allowed_plans: Optional[list[str]] = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        now = _utcnow()
+        plans_json = json.dumps(allowed_plans or ["go", "plus", "pro_lite", "pro", "pro_max"])
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO api_keys(
+                    id, name, key_prefix, key_hash, status, rate_limit_rpm,
+                    allowed_plans_json, note, total_requests, last_used_at,
+                    created_at, updated_at, revoked_at
+                ) VALUES(?,?,?,?,'active',?,?,?,0,NULL,?,?,NULL)""",
+                (key_id, name, key_prefix, key_hash, int(rate_limit_rpm), plans_json, note or None, now, now),
+            )
+        return self.get_api_key_by_id(key_id) or {}
+
+    def get_api_key_by_hash(self, key_hash: str) -> Optional[dict[str, Any]]:
+        if not key_hash:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM api_keys WHERE key_hash = ?",
+                (key_hash,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_api_key_by_id(self, key_id: str) -> Optional[dict[str, Any]]:
+        if not key_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT k.*,
+                          COUNT(at.job_id) AS total_orders,
+                          SUM(CASE WHEN COALESCE(o.status, j.status) IN ('active', 'delivered', 'succeeded') THEN 1 ELSE 0 END) AS succeeded_orders,
+                          SUM(CASE WHEN COALESCE(o.status, j.status) IN ('failed', 'rejected') THEN 1 ELSE 0 END) AS failed_orders,
+                          SUM(CASE WHEN COALESCE(o.status, j.status) NOT IN ('active', 'delivered', 'succeeded', 'failed', 'rejected', 'refunded') THEN 1 ELSE 0 END) AS pending_orders
+                   FROM api_keys k
+                   LEFT JOIN api_tasks at ON at.api_key_id = k.id
+                   LEFT JOIN quick_pay_jobs j ON j.id = at.job_id
+                   LEFT JOIN orders o ON o.id = j.order_id
+                   WHERE k.id = ?
+                   GROUP BY k.id""",
+                (key_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_api_keys(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT k.*,
+                          COUNT(at.job_id) AS total_orders,
+                          SUM(CASE WHEN COALESCE(o.status, j.status) IN ('active', 'delivered', 'succeeded') THEN 1 ELSE 0 END) AS succeeded_orders,
+                          SUM(CASE WHEN COALESCE(o.status, j.status) IN ('failed', 'rejected') THEN 1 ELSE 0 END) AS failed_orders,
+                          SUM(CASE WHEN COALESCE(o.status, j.status) NOT IN ('active', 'delivered', 'succeeded', 'failed', 'rejected', 'refunded') THEN 1 ELSE 0 END) AS pending_orders
+                   FROM api_keys k
+                   LEFT JOIN api_tasks at ON at.api_key_id = k.id
+                   LEFT JOIN quick_pay_jobs j ON j.id = at.job_id
+                   LEFT JOIN orders o ON o.id = j.order_id
+                   GROUP BY k.id
+                   ORDER BY CASE k.status WHEN 'active' THEN 0 WHEN 'disabled' THEN 1 ELSE 2 END ASC,
+                            k.created_at DESC"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_api_key(
+        self,
+        key_id: str,
+        *,
+        name: Optional[str] = None,
+        status: Optional[str] = None,
+        rate_limit_rpm: Optional[int] = None,
+        allowed_plans: Optional[list[str]] = None,
+        note: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        existing = self.get_api_key_by_id(key_id)
+        if existing is None:
+            return None
+        sets: list[str] = ["updated_at = ?"]
+        params: list[Any] = [_utcnow()]
+        if name is not None:
+            sets.append("name = ?")
+            params.append(name)
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+            if status == "revoked":
+                sets.append("revoked_at = COALESCE(revoked_at, ?)")
+                params.append(_utcnow())
+        if rate_limit_rpm is not None:
+            sets.append("rate_limit_rpm = ?")
+            params.append(int(rate_limit_rpm))
+        if allowed_plans is not None:
+            sets.append("allowed_plans_json = ?")
+            params.append(json.dumps(allowed_plans))
+        if note is not None:
+            sets.append("note = ?")
+            params.append(note or None)
+        params.append(key_id)
+        with self._lock, self._conn:
+            self._conn.execute(f"UPDATE api_keys SET {', '.join(sets)} WHERE id = ?", params)
+        return self.get_api_key_by_id(key_id)
+
+    def rotate_api_key(self, key_id: str, *, key_prefix: str, key_hash: str) -> Optional[dict[str, Any]]:
+        now = _utcnow()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """UPDATE api_keys
+                   SET key_prefix = ?, key_hash = ?, status = 'active', revoked_at = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (key_prefix, key_hash, now, key_id),
+            )
+            if int(cur.rowcount or 0) == 0:
+                return None
+        return self.get_api_key_by_id(key_id)
+
+    def revoke_api_key(self, key_id: str) -> Optional[dict[str, Any]]:
+        now = _utcnow()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """UPDATE api_keys
+                   SET status = 'revoked', revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+                   WHERE id = ?""",
+                (now, now, key_id),
+            )
+            if int(cur.rowcount or 0) == 0:
+                return None
+        return self.get_api_key_by_id(key_id)
+
+    def touch_api_key_usage(self, key_id: str) -> None:
+        now = _utcnow()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """UPDATE api_keys
+                   SET total_requests = total_requests + 1,
+                       last_used_at = ?
+                   WHERE id = ?""",
+                (now, key_id),
+            )
+
+    def bind_api_task(
+        self,
+        *,
+        job_id: str,
+        api_key_id: str,
+        external_order_id: str = "",
+        masked_email: str = "",
+        plan: str,
+        exit_country: str = "",
+    ) -> None:
+        now = _utcnow()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """INSERT INTO api_tasks(
+                    job_id, api_key_id, external_order_id, masked_email, plan, exit_country, created_at
+                ) VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    external_order_id = COALESCE(NULLIF(api_tasks.external_order_id,''), excluded.external_order_id),
+                    masked_email = COALESCE(NULLIF(api_tasks.masked_email,''), excluded.masked_email)""",
+                (job_id, api_key_id, external_order_id or None, masked_email or None, plan, exit_country or None, now),
+            )
+
+    def get_api_task_ownership(self, job_id: str, *, api_key_id: str) -> Optional[dict[str, Any]]:
+        if not job_id or not api_key_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM api_tasks WHERE job_id = ? AND api_key_id = ?",
+                (job_id, api_key_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_api_tasks(
+        self,
+        *,
+        api_key_id: str,
+        status: str = "",
+        external_order_id: str = "",
+        search: str = "",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not api_key_id:
+            return [], 0
+        capped = max(1, min(int(limit), 100))
+        skip = max(0, int(offset))
+        clauses = ["t.api_key_id = ?"]
+        params: list[Any] = [api_key_id]
+        st = (status or "").strip().lower()
+        if st and st != "all":
+            clauses.append("COALESCE(j.status, 'queued') = ?")
+            params.append(st)
+        ext = (external_order_id or "").strip()
+        if ext:
+            clauses.append("t.external_order_id = ?")
+            params.append(ext)
+        q = (search or "").strip()
+        if q:
+            like = f"%{q}%"
+            clauses.append(
+                "(COALESCE(t.external_order_id,'') LIKE ? OR COALESCE(t.masked_email,'') LIKE ? "
+                "OR t.job_id LIKE ? OR COALESCE(j.order_id,'') LIKE ?)"
+            )
+            params.extend([like, like, like, like])
+        where_sql = "WHERE " + " AND ".join(clauses)
+        with self._lock:
+            total = int(
+                self._conn.execute(
+                    f"""SELECT COUNT(*)
+                        FROM api_tasks t
+                        LEFT JOIN quick_pay_jobs j ON j.id = t.job_id
+                        {where_sql}""",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = self._conn.execute(
+                f"""SELECT t.job_id, t.api_key_id, t.external_order_id, t.masked_email,
+                           t.plan, t.exit_country, t.created_at,
+                           j.status, j.stage, j.order_id, j.amount, j.currency,
+                           j.failure_code, j.message, j.finished_at, j.updated_at,
+                           o.auto_renew_status, o.auto_renew_canceled_at, o.auto_renew_error,
+                           o.payment_status, o.delivery_status
+                    FROM api_tasks t
+                    LEFT JOIN quick_pay_jobs j ON j.id = t.job_id
+                    LEFT JOIN orders o ON o.id = j.order_id
+                    {where_sql}
+                    ORDER BY t.created_at DESC
+                    LIMIT ? OFFSET ?""",
+                [*params, capped, skip],
+            ).fetchall()
+        return [dict(row) for row in rows], total
+
     def clear_all(self) -> None:
         """Test/reset helper; never called by a live request path."""
         with self._lock:
-            for table in ("portal_tasks", "portal_users", "order_events", "account_locks",
+            for table in ("api_tasks", "api_keys", "order_sensitive_vault",
+                          "portal_tasks", "portal_users", "order_events", "account_locks",
                           "idempotency_keys", "quick_pay_jobs", "orders"):
                 self._conn.execute(f"DELETE FROM {table}")
             self._conn.commit()

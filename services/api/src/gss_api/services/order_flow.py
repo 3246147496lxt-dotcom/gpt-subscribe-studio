@@ -26,7 +26,7 @@ from gss_core.redaction import redact_sensitive
 
 from ..schemas import BillingIn, OrderCreateRequest, QuickPayRequest
 from ..routers import events as events_router, orders, protocol_cards
-from .. import locks
+from .. import locks, order_vault
 from ..persistence import (
     QuickPayAdmissionBlocked, QuickPayAdmissionConflict, get_db_optional, load_checkout_diagnostics,
 )
@@ -655,6 +655,18 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             job.purchase_attempt_id = order.purchase_attempt_id
             job.amount = order.amount
             job.currency = order.currency
+            # Encrypt & persist complete session + virtual card into 30-day after-sales vault.
+            try:
+                _live_snap = orders.vault.get(order.id)
+                _order_billing = BillingIn(**order.billing) if getattr(order, "billing", None) else None
+                order_vault.capture_order_credentials(
+                    order.id,
+                    session=(_live_snap.session if _live_snap and _live_snap.session else payload.session),
+                    card=payload.card,
+                    billing=payload.billing or _order_billing,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             # Self-calibrate dynamic reference local prices from real non-promo Stripe checkouts.
             if (
                 not use_fake_adapters()
@@ -724,6 +736,13 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
                 proto_out = await orders.pay_order_protocol(order.id, proto_payload)
                 result = proto_out.model_dump() if hasattr(proto_out, "model_dump") else dict(proto_out)
             job.timings["payment_ms"] = int((time.monotonic() - payment_started) * 1000)
+            # Refresh encrypted vault session if checkout upgraded/rotated tokens.
+            try:
+                _post_secrets = orders.vault.get(order.id)
+                if _post_secrets and _post_secrets.session:
+                    order_vault.capture_order_credentials(order.id, session=_post_secrets.session)
+            except Exception:  # noqa: BLE001
+                pass
             _set_stage(job, "verifying_delivery", "支付已提交，正在核验交付")
             status = str(result.get("payment_status") or "")
             state = str(result.get("state") or "")

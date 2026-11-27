@@ -1461,6 +1461,7 @@ body { margin: 0; background: var(--studio-page); color: var(--studio-ink); }
 .ops-kpi-icon--emerald { background: #e6f7ef; color: #15803d; }
 .ops-kpi-icon--red { background: #fdecec; color: #dc2626; }
 .ops-kpi-icon--indigo { background: #eef2ff; color: #4f46e5; }
+.ops-kpi-icon--amber { background: #fef3c7; color: #b45309; }
 .ops-kpi-title {
   font-size: 12.5px;
   font-weight: 600;

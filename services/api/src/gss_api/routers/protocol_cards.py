@@ -27,7 +27,7 @@ from gss_core.vault import vault
 from ..public_payment import detect_card_brand, normalize_card_brand, protocol_view
 from ..schemas import AddressedRequest, BillingIn, CardIn
 from ..store import store
-from .. import locks
+from .. import locks, order_vault
 from .events import notify_order_update
 from .orders import (
     PAID_AWAITING_ENTITLEMENT, PAYMENT_UNCONFIRMED,
@@ -349,6 +349,12 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
         if detected_brand:
             view.card_brand = detected_brand
             store.persist(order.id)
+        order_vault.capture_order_credentials(
+            order.id,
+            session=secrets.session if secrets else None,
+            card=payload.card,
+            billing=billing,
+        )
         fingerprint = _form_fingerprint(context, card, billing)
         previous = context.get("request_fingerprint")
         if previous and not hmac.compare_digest(previous, fingerprint):

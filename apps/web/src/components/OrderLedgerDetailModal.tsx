@@ -2,6 +2,8 @@ import {
   Alert,
   Badge,
   Button,
+  Code,
+  CopyButton,
   Group,
   Modal,
   SimpleGrid,
@@ -10,14 +12,30 @@ import {
 } from "@mantine/core";
 import {
   IconAlertCircle,
+  IconCheck,
   IconClock,
+  IconCopy,
+  IconCreditCard,
+  IconEye,
+  IconEyeOff,
   IconGavel,
+  IconLock,
   IconReceipt,
   IconShieldCheck,
+  IconTrash,
 } from "@tabler/icons-react";
+import { useEffect, useState } from "react";
 
 import { formatAmount } from "../api/client";
-import type { OrderLedgerItem } from "../api/ledger";
+import { isAbortError } from "../api/http";
+import {
+  getOrderVaultMeta,
+  purgeOrderVault,
+  revealOrderVault,
+  type OrderLedgerItem,
+  type OrderVaultMeta,
+  type OrderVaultReveal,
+} from "../api/ledger";
 import type { QuickPayEvent } from "../api/quickPay";
 import { planLabel, regionLabel } from "../plans";
 import {
@@ -73,8 +91,73 @@ export function OrderLedgerDetailModal({
   onOpenFailureDetail: (item: OrderLedgerItem) => void;
   onManualVerdict?: (item: OrderLedgerItem) => void;
 }) {
+  const [vaultMeta, setVaultMeta] = useState<OrderVaultMeta | null>(null);
+  const [vaultLoading, setVaultLoading] = useState(false);
+  const [vaultRevealed, setVaultRevealed] = useState<OrderVaultReveal | null>(null);
+  const [vaultBusy, setVaultBusy] = useState(false);
+  const [vaultError, setVaultError] = useState<string | null>(null);
+  const [confirmPurge, setConfirmPurge] = useState(false);
+
+  const orderId = order?.id || null;
+
+  useEffect(() => {
+    setVaultRevealed(null);
+    setVaultError(null);
+    setConfirmPurge(false);
+    if (!orderId) {
+      setVaultMeta(null);
+      return;
+    }
+    const controller = new AbortController();
+    setVaultLoading(true);
+    void getOrderVaultMeta(orderId, controller.signal)
+      .then((res) => {
+        if (!controller.signal.aborted) setVaultMeta(res);
+      })
+      .catch((exc) => {
+        if (!isAbortError(exc) && !controller.signal.aborted) {
+          setVaultMeta(null);
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setVaultLoading(false);
+      });
+    return () => controller.abort();
+  }, [orderId]);
+
   if (!order) {
     return <Modal opened={false} onClose={onClose} title="订单详情" size="lg" centered />;
+  }
+
+  async function handleRevealVault() {
+    if (!order || vaultBusy) return;
+    setVaultBusy(true);
+    setVaultError(null);
+    try {
+      const res = await revealOrderVault(order.id, { reason: "管理后台订单详情售后核查" });
+      setVaultMeta(res.meta);
+      setVaultRevealed(res);
+    } catch (exc) {
+      setVaultError(exc instanceof Error ? exc.message : "解密失败");
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  async function handlePurgeVault() {
+    if (!order || vaultBusy) return;
+    setVaultBusy(true);
+    setVaultError(null);
+    try {
+      const meta = await purgeOrderVault(order.id, { reason: "管理后台人工销毁凭证" });
+      setVaultMeta(meta);
+      setVaultRevealed(null);
+      setConfirmPurge(false);
+    } catch (exc) {
+      setVaultError(exc instanceof Error ? exc.message : "销毁失败");
+    } finally {
+      setVaultBusy(false);
+    }
   }
 
   const statusInfo = simpleOrderStatus(order.status);
@@ -91,6 +174,7 @@ export function OrderLedgerDetailModal({
 
   const idRows = [
     { label: "订单号", value: order.id },
+    order.external_order_id ? { label: "商户外部单号", value: order.external_order_id } : null,
     order.job_id ? { label: "作业号", value: order.job_id } : null,
     order.checkout_session_id ? { label: "Checkout ID", value: order.checkout_session_id } : null,
     order.payment_intent_id ? { label: "PaymentIntent", value: order.payment_intent_id } : null,
@@ -265,9 +349,16 @@ export function OrderLedgerDetailModal({
         <section className="order-detail-section">
           <div className="order-detail-section-head">
             <span>履约与通道信息</span>
-            <Badge size="xs" variant="light" color={sourceColor(order.source)}>
-              {sourceLabel(order.source)}
-            </Badge>
+            <Group gap={6}>
+              {order.api_key_name && (
+                <Badge size="xs" variant="outline" color="cyan">
+                  Key: {order.api_key_name}
+                </Badge>
+              )}
+              <Badge size="xs" variant="light" color={sourceColor(order.source)}>
+                {sourceLabel(order.source)}
+              </Badge>
+            </Group>
           </div>
           <div className="order-detail-kv-grid">
             <InfoRow label="支付 / 交付">
@@ -332,6 +423,235 @@ export function OrderLedgerDetailModal({
                 <CopyIdBadge value={row.value} prefixLength={14} />
               </InfoRow>
             ))}
+          </div>
+        </section>
+
+        {/* 5.5 售后凭证金库（AES-256-GCM 30 天加密留存 Session 与虚拟卡） */}
+        <section className="order-detail-section">
+          <div className="order-detail-section-head">
+            <Group gap={6} wrap="nowrap">
+              <IconLock size={14} />
+              <span>售后凭证金库（{vaultMeta?.retention_days ?? 30} 天加密留存）</span>
+            </Group>
+            {vaultLoading ? (
+              <span className="order-detail-section-right">检查留存状态…</span>
+            ) : vaultMeta?.available ? (
+              <Badge size="xs" variant="light" color="teal">
+                AES-256-GCM · 剩余 {vaultMeta.remaining_days ?? 0} 天
+              </Badge>
+            ) : vaultMeta?.purged_at || vaultMeta?.expired ? (
+              <Badge size="xs" variant="light" color="gray">
+                {vaultMeta.purge_reason === "manual_purge" ? "已人工销毁" : "已满 30 天自动清理"}
+              </Badge>
+            ) : (
+              <Badge size="xs" variant="light" color="gray">历史单未留存</Badge>
+            )}
+          </div>
+
+          <div className="order-detail-section-body">
+            {vaultLoading ? (
+              <Text size="xs" c="dimmed">正在读取凭证留存元数据…</Text>
+            ) : !vaultMeta || (!vaultMeta.available && !vaultMeta.purged_at && !vaultMeta.expired) ? (
+              <Text size="xs" c="dimmed">
+                该笔订单创建于凭证金库启用前，未保存原始 Session 或虚拟卡信息；新订单将自动加密留存 30 天并在到期后自动清理。
+              </Text>
+            ) : (
+              <Stack gap="xs">
+                <div className="order-detail-kv-grid">
+                  <InfoRow label="Session 留存">
+                    <span>
+                      {vaultMeta.has_session
+                        ? "完整 Session JSON 已加密保存"
+                        : vaultMeta.purged_at
+                          ? "已清理"
+                          : "未保存"}
+                    </span>
+                  </InfoRow>
+                  <InfoRow label="虚拟卡摘要">
+                    <span>
+                      {vaultMeta.card_last4
+                        ? `${vaultMeta.card_brand || "Card"} · ${vaultMeta.card_bin || "••••••"} •••• ${vaultMeta.card_last4}${vaultMeta.card_exp ? ` (${vaultMeta.card_exp})` : ""}`
+                        : vaultMeta.has_card
+                          ? "已加密保存"
+                          : "未记录"}
+                    </span>
+                  </InfoRow>
+                  {vaultMeta.card_fingerprint && (
+                    <InfoRow label="卡指纹（跨单关联）">
+                      <Code fz={11}>{vaultMeta.card_fingerprint}</Code>
+                    </InfoRow>
+                  )}
+                  {vaultMeta.expires_at && (
+                    <InfoRow label={vaultMeta.purged_at ? "清理时间" : "自动过期时间"}>
+                      <span className="order-detail-mono">
+                        {formatDateTimeCompact(vaultMeta.purged_at || vaultMeta.expires_at)}
+                      </span>
+                    </InfoRow>
+                  )}
+                </div>
+
+                {vaultError && (
+                  <Alert color="red" radius="md" p="xs">
+                    <Text size="xs">{vaultError}</Text>
+                  </Alert>
+                )}
+
+                {vaultMeta.available && (
+                  <Group justify="space-between" align="center" wrap="wrap" gap="xs" pt={2}>
+                    <Group gap="xs">
+                      {!vaultRevealed ? (
+                        <Button
+                          size="compact-xs"
+                          variant="light"
+                          color="blue"
+                          leftSection={<IconEye size={13} />}
+                          loading={vaultBusy}
+                          onClick={() => void handleRevealVault()}
+                        >
+                          解密查看完整凭证
+                        </Button>
+                      ) : (
+                        <Button
+                          size="compact-xs"
+                          variant="light"
+                          color="gray"
+                          leftSection={<IconEyeOff size={13} />}
+                          onClick={() => setVaultRevealed(null)}
+                        >
+                          隐藏明文凭证
+                        </Button>
+                      )}
+                    </Group>
+
+                    {!confirmPurge ? (
+                      <Button
+                        size="compact-xs"
+                        variant="subtle"
+                        color="red"
+                        leftSection={<IconTrash size={13} />}
+                        disabled={vaultBusy}
+                        onClick={() => setConfirmPurge(true)}
+                      >
+                        提前销毁
+                      </Button>
+                    ) : (
+                      <Group gap={6}>
+                        <Text size="xs" c="red">确认永久销毁？</Text>
+                        <Button
+                          size="compact-xs"
+                          color="red"
+                          loading={vaultBusy}
+                          onClick={() => void handlePurgeVault()}
+                        >
+                          确认销毁
+                        </Button>
+                        <Button
+                          size="compact-xs"
+                          variant="default"
+                          disabled={vaultBusy}
+                          onClick={() => setConfirmPurge(false)}
+                        >
+                          取消
+                        </Button>
+                      </Group>
+                    )}
+                  </Group>
+                )}
+
+                {vaultRevealed && (
+                  <Stack gap="xs" mt={4}>
+                    {vaultRevealed.card && (
+                      <div
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: 8,
+                          border: "1px solid var(--studio-line)",
+                          background: "var(--studio-surface-2, rgba(148,163,184,0.06))",
+                        }}
+                      >
+                        <Group justify="space-between" mb={6}>
+                          <Group gap={6}>
+                            <IconCreditCard size={14} />
+                            <Text size="xs" fw={650}>虚拟卡片完整信息</Text>
+                          </Group>
+                          <CopyButton
+                            value={`${vaultRevealed.card.number}|${vaultRevealed.card.exp_month}/${vaultRevealed.card.exp_year}|${vaultRevealed.card.cvc}`}
+                          >
+                            {({ copied, copy }) => (
+                              <Button size="compact-xs" variant="subtle" leftSection={copied ? <IconCheck size={12} /> : <IconCopy size={12} />} onClick={copy}>
+                                {copied ? "已复制卡密" : "复制 卡号|效期|CVC"}
+                              </Button>
+                            )}
+                          </CopyButton>
+                        </Group>
+                        <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="xs">
+                          <div>
+                            <Text size="xs" c="dimmed">卡号</Text>
+                            <Group gap={4} wrap="nowrap">
+                              <Code fz={12} fw={650}>{vaultRevealed.card.number}</Code>
+                              <CopyButton value={vaultRevealed.card.number}>
+                                {({ copied, copy }) => (
+                                  <Button size="compact-xs" variant="subtle" px={4} onClick={copy}>
+                                    {copied ? "✓" : "复制"}
+                                  </Button>
+                                )}
+                              </CopyButton>
+                            </Group>
+                          </div>
+                          <div>
+                            <Text size="xs" c="dimmed">有效期</Text>
+                            <Code fz={12}>{vaultRevealed.card.exp_month} / {vaultRevealed.card.exp_year}</Code>
+                          </div>
+                          <div>
+                            <Text size="xs" c="dimmed">安全码 (CVC)</Text>
+                            <Code fz={12}>{vaultRevealed.card.cvc || "-"}</Code>
+                          </div>
+                        </SimpleGrid>
+                        {vaultRevealed.card.billing && Object.keys(vaultRevealed.card.billing).length > 0 && (
+                          <Text size="xs" c="dimmed" mt={6}>
+                            账单地址：{Object.entries(vaultRevealed.card.billing).map(([k, v]) => `${k}=${v}`).join(" · ")}
+                          </Text>
+                        )}
+                      </div>
+                    )}
+
+                    {vaultRevealed.session && (
+                      <div
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: 8,
+                          border: "1px solid var(--studio-line)",
+                          background: "var(--studio-surface-2, rgba(148,163,184,0.06))",
+                        }}
+                      >
+                        <Group justify="space-between" mb={6}>
+                          <Text size="xs" fw={650}>完整 Session JSON</Text>
+                          <CopyButton value={vaultRevealed.session}>
+                            {({ copied, copy }) => (
+                              <Button size="compact-xs" variant="light" leftSection={copied ? <IconCheck size={12} /> : <IconCopy size={12} />} onClick={copy}>
+                                {copied ? "已复制 Session" : "复制完整 Session"}
+                              </Button>
+                            )}
+                          </CopyButton>
+                        </Group>
+                        <Code
+                          block
+                          fz={11}
+                          style={{
+                            maxHeight: 160,
+                            overflowY: "auto",
+                            whiteSpace: "pre-wrap",
+                            wordBreak: "break-all",
+                          }}
+                        >
+                          {vaultRevealed.session}
+                        </Code>
+                      </div>
+                    )}
+                  </Stack>
+                )}
+              </Stack>
+            )}
           </div>
         </section>
 

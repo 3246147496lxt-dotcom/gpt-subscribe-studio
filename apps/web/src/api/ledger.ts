@@ -21,12 +21,18 @@ export type OrderLedgerDiagnostics = {
 
 export type OrderLedgerItem = {
   id: string;
-  source?: "portal" | "quick_pay" | "step" | string;
+  source?: "portal" | "api" | "quick_pay" | "step" | string;
   account_email?: string | null;
   masked_email?: string | null;
   portal_username?: string | null;
+  api_key_id?: string | null;
+  api_key_name?: string | null;
+  external_order_id?: string | null;
   account_tag?: string | null;
   card_brand?: string | null;
+  vault_has_session?: boolean;
+  vault_has_card?: boolean;
+  vault_card_last4?: string | null;
   plan: string;
   billing_country: string;
   exit_country?: string | null;
@@ -289,4 +295,74 @@ export async function releasePaymentLockManual(lockId: string, note: string, ope
 
 export async function getReconcilerStatus(signal?: AbortSignal): Promise<ReconcilerStatus> {
   return requestJson<ReconcilerStatus>("/api/payments/reconciler", { cache: "no-store", signal });
+}
+
+export type OrderVaultMeta = {
+  order_id: string;
+  available: boolean;
+  has_session: boolean;
+  has_card: boolean;
+  card_brand?: string | null;
+  card_bin?: string | null;
+  card_last4?: string | null;
+  card_exp?: string | null;
+  card_fingerprint?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  expires_at?: string | null;
+  remaining_days?: number | null;
+  expired: boolean;
+  purged_at?: string | null;
+  purge_reason?: string | null;
+  retention_days: number;
+};
+
+export type OrderVaultCard = {
+  number: string;
+  exp_month: string;
+  exp_year: string;
+  cvc: string;
+  billing?: Record<string, string> | null;
+};
+
+export type OrderVaultReveal = {
+  meta: OrderVaultMeta;
+  session?: string | null;
+  card?: OrderVaultCard | null;
+};
+
+export async function getOrderVaultMeta(orderId: string, signal?: AbortSignal): Promise<OrderVaultMeta> {
+  return requestJson<OrderVaultMeta>(`/api/orders/${encodeURIComponent(orderId)}/vault`, {
+    cache: "no-store",
+    signal,
+  });
+}
+
+export async function revealOrderVault(
+  orderId: string,
+  input: { operator?: string; reason?: string } = {},
+): Promise<OrderVaultReveal> {
+  return requestJson<OrderVaultReveal>(`/api/orders/${encodeURIComponent(orderId)}/vault/reveal`, {
+    method: "POST",
+    body: {
+      operator: input.operator || "web-operator",
+      reason: input.reason || "售后核查",
+    },
+    cache: "no-store",
+    fallbackError: "解密读取留存凭证失败",
+  });
+}
+
+export async function purgeOrderVault(
+  orderId: string,
+  input: { operator?: string; reason?: string } = {},
+): Promise<OrderVaultMeta> {
+  return requestJson<OrderVaultMeta>(`/api/orders/${encodeURIComponent(orderId)}/vault`, {
+    method: "DELETE",
+    body: {
+      operator: input.operator || "web-operator",
+      reason: input.reason || "人工销毁凭证",
+    },
+    fallbackError: "销毁订单留存凭证失败",
+  });
 }

@@ -2,12 +2,14 @@ import type { OrderLedgerItem } from "../api/ledger";
 
 export const SOURCE_LABEL: Record<string, string> = {
   portal: "用户门户",
+  api: "开放 API",
   quick_pay: "后台一键",
   step: "分步调试",
 };
 
 export const SOURCE_COLOR: Record<string, string> = {
   portal: "blue",
+  api: "cyan",
   quick_pay: "violet",
   step: "gray",
 };

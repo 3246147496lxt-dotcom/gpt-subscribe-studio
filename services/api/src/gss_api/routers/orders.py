@@ -15,7 +15,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Query, status
+from fastapi import APIRouter, Header, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -111,6 +111,11 @@ from ..schemas import (
     OrderManualVerdictRequest,
     OrderOut,
     OrderPayRequest,
+    OrderVaultCardOut,
+    OrderVaultMetaOut,
+    OrderVaultPurgeRequest,
+    OrderVaultRevealOut,
+    OrderVaultRevealRequest,
     QuickPayEventOut,
     ReconcileResultOut,
     SubscriptionOut,
@@ -119,7 +124,7 @@ from ..schemas import (
 )
 from ..persistence import get_db_optional, load_checkout_diagnostics
 from ..store import store
-from .. import locks, purchase_claims
+from .. import locks, order_vault, purchase_claims
 from .events import notify_order_update
 
 router = APIRouter(prefix="/api", tags=["orders"])
@@ -700,6 +705,8 @@ _TIMING_KEY_RE = re.compile(r"^[a-z0-9_]{1,40}$")
 
 
 def _derive_order_source(row: dict[str, Any]) -> str:
+    if row.get("api_task_job_id"):
+        return "api"
     if row.get("portal_task_job_id"):
         return "portal"
     if row.get("job_id"):
@@ -753,14 +760,24 @@ def _ledger_item_from_row(row: dict[str, Any]) -> OrderLedgerItemOut:
     diagnostics = load_checkout_diagnostics(row.get("diagnostics_json"))
     raw_http = row.get("auto_renew_http_status")
     auto_renew_http = int(raw_http) if isinstance(raw_http, int) and not isinstance(raw_http, bool) else None
+    vault_active = (
+        not row.get("vault_purged_at")
+        and not order_vault.is_expired_iso(row.get("vault_expires_at"))
+    )
     return OrderLedgerItemOut(
         id=row["id"],
         source=_derive_order_source(row),
         account_email=row.get("account_email") or None,
-        masked_email=row.get("masked_email") or None,
+        masked_email=row.get("resolved_masked_email") or row.get("masked_email") or None,
         portal_username=row.get("portal_username") or None,
+        api_key_id=row.get("api_key_id") or None,
+        api_key_name=row.get("api_key_name") or None,
+        external_order_id=row.get("external_order_id") or None,
         account_tag=_safe_account_tag(row.get("account_fingerprint")),
         card_brand=normalize_card_brand(row.get("card_brand")),
+        vault_has_session=bool(row.get("vault_has_session")) and vault_active,
+        vault_has_card=bool(row.get("vault_has_card")) and vault_active,
+        vault_card_last4=row.get("vault_card_last4") or None,
         plan=row["plan"],
         billing_country=row["billing_country"],
         exit_country=row.get("exit_country"),
@@ -861,6 +878,7 @@ async def export_orders_csv(
         "failure_code", "upstream_status", "upstream_code",
         "job_id", "purchase_attempt_id", "checkout_session_id", "payment_intent_id",
         "reconcile_attempts", "active_lock_id", "updated_at",
+        "api_key_name", "external_order_id",
     )
     buf = io.StringIO()
     buf.write("\ufeff")
@@ -1256,6 +1274,95 @@ async def manual_verdict_order(order_id: str, payload: OrderManualVerdictRequest
         )
 
 
+@router.get("/orders/{order_id}/vault", response_model=OrderVaultMetaOut)
+async def get_order_vault_meta(order_id: str) -> OrderVaultMetaOut:
+    """Return non-sensitive retention metadata for an order's encrypted vault."""
+    db = get_db_optional()
+    if db is None:
+        return OrderVaultMetaOut(**order_vault.format_vault_meta(order_id, None))
+    if store.get_order(order_id) is None and db.get_order_row(order_id) is None:
+        raise HTTPException(404, detail={"code": "not_found", "message": "订单不存在"})
+    row = db.get_order_vault_row(order_id)
+    if row is not None and not row.get("purged_at") and order_vault.is_expired_iso(row.get("expires_at")):
+        db.purge_order_vault(order_id, reason="ttl_expired")
+        row = db.get_order_vault_row(order_id)
+    return OrderVaultMetaOut(**order_vault.format_vault_meta(order_id, row))
+
+
+@router.post("/orders/{order_id}/vault/reveal", response_model=OrderVaultRevealOut)
+async def reveal_order_vault(
+    order_id: str,
+    response: Response,
+    payload: Optional[OrderVaultRevealRequest] = None,
+) -> OrderVaultRevealOut:
+    """Decrypt and return complete Session & virtual card data for after-sales inspection (audited)."""
+    response.headers["Cache-Control"] = "no-store"
+    db = get_db_optional()
+    if db is None:
+        raise HTTPException(503, detail={"code": "db_unavailable", "message": "本地存储暂不可用"})
+    if store.get_order(order_id) is None and db.get_order_row(order_id) is None:
+        raise HTTPException(404, detail={"code": "not_found", "message": "订单不存在"})
+    operator = ((payload.operator if payload else "web-operator") or "web-operator").strip()
+    reason = ((payload.reason if payload else "售后核查") or "售后核查").strip()
+    try:
+        revealed = order_vault.reveal_order_credentials(order_id, db=db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("order_vault_decrypt_failed order=%s type=%s", order_id, type(exc).__name__)
+        raise HTTPException(
+            500,
+            detail={"code": "vault_decrypt_failed", "message": "凭证解密失败，请核对主密钥配置是否一致。"},
+        ) from None
+    meta = revealed["meta"]
+    if meta["available"]:
+        try:
+            db.add_event(
+                stage="vault",
+                event="vault_revealed",
+                order_id=order_id,
+                code="vault_revealed",
+                message=f"[{operator}] 解密查看订单留存凭证：{reason}",
+                metadata={"operator": operator, "reason": reason},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    card_data = revealed.get("card")
+    return OrderVaultRevealOut(
+        meta=OrderVaultMetaOut(**meta),
+        session=revealed.get("session"),
+        card=OrderVaultCardOut(**card_data) if isinstance(card_data, dict) else None,
+    )
+
+
+@router.delete("/orders/{order_id}/vault", response_model=OrderVaultMetaOut)
+async def purge_order_vault_endpoint(
+    order_id: str,
+    payload: Optional[OrderVaultPurgeRequest] = None,
+) -> OrderVaultMetaOut:
+    """Immediately shred stored encrypted Session & virtual card ciphertexts for an order."""
+    db = get_db_optional()
+    if db is None:
+        raise HTTPException(503, detail={"code": "db_unavailable", "message": "本地存储暂不可用"})
+    if store.get_order(order_id) is None and db.get_order_row(order_id) is None:
+        raise HTTPException(404, detail={"code": "not_found", "message": "订单不存在"})
+    operator = ((payload.operator if payload else "web-operator") or "web-operator").strip()
+    reason = ((payload.reason if payload else "人工销毁凭证") or "人工销毁凭证").strip()
+    purged = db.purge_order_vault(order_id, reason="manual_purge")
+    if purged:
+        try:
+            db.add_event(
+                stage="vault",
+                event="vault_purged",
+                order_id=order_id,
+                code="vault_purged",
+                message=f"[{operator}] 手动销毁订单留存凭证：{reason}",
+                metadata={"operator": operator, "reason": reason},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    row = db.get_order_vault_row(order_id)
+    return OrderVaultMetaOut(**order_vault.format_vault_meta(order_id, row))
+
+
 @router.post(
     "/orders",
     status_code=status.HTTP_201_CREATED,
@@ -1529,6 +1636,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         except Exception:  # noqa: BLE001
             view.proxy_last_sid = None
         store.persist(order.id)
+        order_vault.capture_order_credentials(order.id, session=snapshot)
         return item
 
     route_plan = route_plan_from_env()
@@ -2656,6 +2764,13 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         billing = {k: (v or "").strip() for k, v in payload.billing.model_dump().items()}
         billing = _aligned_billing(billing, normalize_country(order.billing_country), getattr(secrets, "billing", None))
         billing["country"] = (billing.get("country") or "US").upper()
+    if payload.card is not None:
+        order_vault.capture_order_credentials(
+            order_id,
+            session=session_raw,
+            card=payload.card,
+            billing=billing,
+        )
 
     # custom checkout 的会话 id 有两种：oaics_（ChatGPT 内部）与 cs_live_（Stripe 自定义）。
     # 单看 URL 前缀会漏掉后者，所以以订单的 checkout_kind 为准。

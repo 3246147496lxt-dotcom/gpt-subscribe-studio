@@ -7,3 +7,4 @@ socksio==1.0.0
 curl_cffi==0.17.0
 python-multipart==0.0.20
 playwright==1.65.2
+cryptography==50.0.2

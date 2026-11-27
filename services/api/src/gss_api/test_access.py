@@ -62,7 +62,7 @@ class TestAccessMiddleware(BaseHTTPMiddleware):
 
     @staticmethod
     def _is_public_path(path: str, method: str) -> bool:
-        if path.startswith("/api/public/"):
+        if path.startswith("/api/public/") or path.startswith("/api/v1/"):
             return True
         if method in {"GET", "HEAD"}:
             if path in {"/", "/index.html", "/favicon.ico", "/robots.txt"}:
@@ -72,11 +72,11 @@ class TestAccessMiddleware(BaseHTTPMiddleware):
         return False
 
     async def dispatch(self, request, call_next):
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        path = request.url.path
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not path.startswith("/api/v1/"):
             origin = request.headers.get("origin")
             if origin and not self._same_origin(origin, request):
                 return JSONResponse({"detail": "请求来源不匹配"}, status_code=403)
-        path = request.url.path
         if self._is_public_path(path, request.method):
             response = await call_next(request)
             if path.startswith("/api/"):

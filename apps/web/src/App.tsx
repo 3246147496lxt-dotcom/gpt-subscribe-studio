@@ -26,6 +26,7 @@ import {
   IconCurrencyDollar,
   IconExternalLink,
   IconHelpCircle,
+  IconKey,
   IconLayoutDashboard,
   IconListDetails,
   IconLockOpen,
@@ -57,6 +58,9 @@ const PortalSitePanel = lazy(() =>
 );
 const ReferencePricingPanel = lazy(() =>
   import("./components/ReferencePricingPanel").then((m) => ({ default: m.ReferencePricingPanel })),
+);
+const DeveloperApiPanel = lazy(() =>
+  import("./components/DeveloperApiPanel").then((m) => ({ default: m.DeveloperApiPanel })),
 );
 const BatchPreflightPanel = lazy(() =>
   import("./components/BatchPreflightPanel").then((m) => ({ default: m.BatchPreflightPanel })),
@@ -94,6 +98,7 @@ type NavTab =
   | "account"
   | "portal-site"
   | "pricing"
+  | "developer"
   | "proxy"
   | "billing"
   | "flags"
@@ -110,6 +115,7 @@ const VALID_TABS = new Set<string>([
   "account",
   "portal-site",
   "pricing",
+  "developer",
   "proxy",
   "billing",
   "flags",
@@ -151,6 +157,7 @@ const NAV_GROUPS: NavGroupDef[] = [
     items: [
       { id: "portal-site", label: "门户配置", icon: <IconWorld size={16} stroke={1.8} /> },
       { id: "pricing", label: "地区比价", icon: <IconCurrencyDollar size={16} stroke={1.8} /> },
+      { id: "developer", label: "开发者 API", icon: <IconKey size={16} stroke={1.8} /> },
     ],
   },
   {
@@ -566,6 +573,16 @@ export function App() {
                 <ErrorBoundary title="地区比价加载失败">
                   <Suspense fallback={<PanelFallback />}>
                     <ReferencePricingPanel />
+                  </Suspense>
+                </ErrorBoundary>
+              </div>
+            )}
+
+            {visitedTabs.developer && (
+              <div style={{ display: view === "developer" ? "block" : "none" }}>
+                <ErrorBoundary title="开发者 API 加载失败">
+                  <Suspense fallback={<PanelFallback />}>
+                    <DeveloperApiPanel active={view === "developer"} />
                   </Suspense>
                 </ErrorBoundary>
               </div>

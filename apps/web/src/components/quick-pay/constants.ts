@@ -25,6 +25,7 @@ export const STAGE_LABEL: Record<string, string> = {
   failed: "任务未完成",
   unknown: "扣款结果待核对",
   manual_verdict: "人工判定",
+  vault: "凭证金库",
 };
 
 export const FAILURE_LABEL: Record<string, string> = {

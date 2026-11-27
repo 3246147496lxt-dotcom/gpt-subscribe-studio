@@ -32,6 +32,7 @@ BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0, 180.0)
 _bg_task: Optional[asyncio.Task] = None
 _stop_event: Optional[asyncio.Event] = None
 _last_run_at: Optional[str] = None
+_last_vault_purge_mono: float = 0.0
 _total_runs: int = 0
 _resolved_count: int = 0
 _loop_order_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]]" = (
@@ -504,12 +505,21 @@ async def reconcile_lock(lock_id: str, *, force: bool = True) -> dict[str, Any]:
 
 
 async def run_once(limit: int = 20) -> list[dict[str, Any]]:
-    global _last_run_at, _total_runs
+    global _last_run_at, _last_vault_purge_mono, _total_runs
     db = get_db_optional()
     _last_run_at = _utcnow_iso()
     _total_runs += 1
     if db is None:
         return []
+    now_mono = time.monotonic()
+    if now_mono - _last_vault_purge_mono >= 600.0:
+        _last_vault_purge_mono = now_mono
+        try:
+            purged = db.purge_expired_order_vaults()
+            if purged:
+                logger.info("order_vault_ttl_purged count=%d", purged)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("order_vault_purge_error type=%s", type(exc).__name__)
     candidates = db.list_reconcilable_jobs(limit=limit)
     results: list[dict[str, Any]] = []
     for row in candidates:

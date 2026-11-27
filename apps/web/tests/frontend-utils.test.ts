@@ -163,6 +163,7 @@ test("buildOrderLedgerExportUrl omits default 'all' filters and encodes active f
 
 test("orderLedgerFormat renders Chinese operational labels and human durations", () => {
   assert.equal(sourceLabel("portal"), "用户门户");
+  assert.equal(sourceLabel("api"), "开放 API");
   assert.equal(sourceLabel("quick_pay"), "后台一键");
   assert.equal(sourceLabel("step"), "分步调试");
   assert.equal(paymentStatusLabel("succeeded"), "已支付");

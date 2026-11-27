@@ -328,8 +328,14 @@ class OrderLedgerItemOut(BaseModel):
     account_email: Optional[str] = None
     masked_email: Optional[str] = None
     portal_username: Optional[str] = None
+    api_key_id: Optional[str] = None
+    api_key_name: Optional[str] = None
+    external_order_id: Optional[str] = None
     account_tag: Optional[str] = None
     card_brand: Optional[str] = None
+    vault_has_session: bool = False
+    vault_has_card: bool = False
+    vault_card_last4: Optional[str] = None
     plan: str
     billing_country: str
     exit_country: Optional[str] = None
@@ -470,6 +476,90 @@ class OrderManualVerdictOut(BaseModel):
     operator: str
     note: str
     message: str
+
+
+class OrderVaultMetaOut(BaseModel):
+    order_id: str
+    available: bool = False
+    has_session: bool = False
+    has_card: bool = False
+    card_brand: Optional[str] = None
+    card_bin: Optional[str] = None
+    card_last4: Optional[str] = None
+    card_exp: Optional[str] = None
+    card_fingerprint: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    remaining_days: Optional[int] = None
+    expired: bool = False
+    purged_at: Optional[str] = None
+    purge_reason: Optional[str] = None
+    retention_days: int = 30
+
+
+class OrderVaultRevealRequest(BaseModel):
+    operator: str = Field(default="web-operator", max_length=80)
+    reason: str = Field(default="售后核查", max_length=240)
+
+
+class OrderVaultCardOut(BaseModel):
+    number: str
+    exp_month: str
+    exp_year: str
+    cvc: str = ""
+    billing: Optional[Dict[str, str]] = None
+
+
+class OrderVaultRevealOut(BaseModel):
+    meta: OrderVaultMetaOut
+    session: Optional[str] = None
+    card: Optional[OrderVaultCardOut] = None
+
+
+class OrderVaultPurgeRequest(BaseModel):
+    operator: str = Field(default="web-operator", max_length=80)
+    reason: str = Field(default="人工销毁凭证", max_length=240)
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    rate_limit_rpm: int = Field(default=30, ge=1, le=600)
+    allowed_plans: list[str] = Field(default_factory=lambda: ["go", "plus", "pro_lite", "pro", "pro_max"])
+    note: str = Field(default="", max_length=300)
+
+
+class ApiKeyUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    status: Optional[Literal["active", "disabled"]] = None
+    rate_limit_rpm: Optional[int] = Field(default=None, ge=1, le=600)
+    allowed_plans: Optional[list[str]] = None
+    note: Optional[str] = Field(default=None, max_length=300)
+
+
+class ApiKeyOut(BaseModel):
+    id: str
+    name: str
+    key_prefix: str
+    status: str
+    rate_limit_rpm: int
+    allowed_plans: list[str] = Field(default_factory=list)
+    note: Optional[str] = None
+    total_requests: int = 0
+    total_orders: int = 0
+    succeeded_orders: int = 0
+    failed_orders: int = 0
+    pending_orders: int = 0
+    last_used_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+    revoked_at: Optional[str] = None
+
+
+class ApiKeySecretOut(BaseModel):
+    key: ApiKeyOut
+    api_key: str
+    warning: str = "此密钥仅展示一次，请立即妥善保存；关闭后服务端无法再次找回明文。"
 
 
 class ReconcilerStatusOut(BaseModel):

@@ -73,6 +73,7 @@ const PLAN_FILTER_OPTIONS = [
 const SOURCE_FILTER_OPTIONS = [
   { value: "all", label: "全部来源" },
   { value: "portal", label: "用户门户" },
+  { value: "api", label: "开放 API" },
   { value: "quick_pay", label: "后台一键" },
   { value: "step", label: "分步调试" },
 ];

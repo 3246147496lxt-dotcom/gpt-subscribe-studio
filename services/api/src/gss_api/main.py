@@ -19,7 +19,7 @@ from gss_core.proxies import GatewayStore, configured_proxy
 from .persistence import init_db
 from .store import store
 from .routers import (
-    account, events, fixed_billing as fixed_billing_router, locks, orders, promo, proxies, public_portal, quick_pay, saved_cards,
+    account, events, fixed_billing as fixed_billing_router, locks, open_api, orders, promo, proxies, public_portal, quick_pay, saved_cards,
     protocol_cards, runtime_flags as runtime_flags_router,
     system as system_router, webhooks as webhooks_router,
 )
@@ -69,6 +69,10 @@ def create_app() -> FastAPI:
     proxy_sid_pinned = _check_pinned_proxy_sid()
     db = init_db()
     store.attach_db(db)
+    try:
+        db.purge_expired_order_vaults()
+    except Exception:  # noqa: BLE001
+        pass
     from .locks import recover_incomplete_jobs
     from .services import order_flow, reconciler, reference_pricing, webhooks as webhook_svc
     recover_incomplete_jobs()
@@ -114,6 +118,9 @@ def create_app() -> FastAPI:
                 "/api/public/account/cancel-auto-renew",
                 "/api/public/auth/login",
                 "/api/public/auth/register",
+                "/api/v1/recharges",
+                "/api/v1/account/subscription",
+                "/api/v1/account/cancel-auto-renew",
             }
             or (path.startswith("/api/public/tasks/") and path.endswith("/cancel-auto-renew"))
         )
@@ -138,6 +145,8 @@ def create_app() -> FastAPI:
     app.include_router(system_router.router)
     app.include_router(public_portal.router)
     app.include_router(public_portal.admin_router)
+    app.include_router(open_api.router)
+    app.include_router(open_api.admin_router)
 
     @app.get("/api/health", tags=["health"])
     async def health() -> dict:
