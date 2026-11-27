@@ -45,12 +45,7 @@ async def subscription_detail(payload: AccountSubscriptionRequest) -> AccountSub
     key = account_id or email.lower()
     db = get_db_optional()
 
-    # Cached first: a read must not spend an upstream request unless asked.
-    if db is not None and key and not payload.force_refresh:
-        cached = db.get_account_snapshot(key)
-        if cached and cached.get("cacheVersion") == CACHE_VERSION:
-            return AccountSubscriptionOut(**{**cached, "cached": True, "stale": False})
-
+    # Always fetch fresh live data on manual account queries; never serve cached or stale snapshots.
     try:
         merged = await fetch_snapshot(
             payload.session,
@@ -59,13 +54,6 @@ async def subscription_detail(payload: AccountSubscriptionRequest) -> AccountSub
             country=credentials["session_country"] or "US",
         )
     except DomainError as exc:
-        if db is not None and key:
-            cached = db.get_account_snapshot(key)
-            if cached and cached.get("cacheVersion") == CACHE_VERSION and exc.code is not ErrorCode.INVALID_SESSION:
-                return AccountSubscriptionOut(**{
-                    **cached, "cached": True, "stale": True,
-                    "warning": "上游暂时不可用，显示上次查询结果。",
-                })
         raise _http(exc) from None
 
     detail = normalize(merged, email=email, account_id=account_id)

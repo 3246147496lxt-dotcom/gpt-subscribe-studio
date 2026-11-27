@@ -475,3 +475,127 @@ def test_protocol_payment_unknown_blocks_all_further_confirmation(monkeypatch, o
     finally:
         vault.drop(oid)
         store.clear()
+
+
+@pytest.mark.usefixtures("verified_us_payer")
+def test_protocol_pay_pre_confirm_domain_error_fails_without_unknown_lock(monkeypatch):
+    """A DomainError strictly before confirmation_started must fail cleanly without locking."""
+    from gss_api.routers import orders
+    from gss_contracts.errors import DomainError, ErrorCode
+
+    monkeypatch.setenv("GSS_USE_FAKE", "1")
+    store.clear()
+    client = TestClient(create_app())
+    created = client.post("/api/orders", json={
+        "plan": "pro_lite", "billing_country": "US", "session": "fake-session",
+    })
+    assert created.status_code == 201, created.text
+    oid = created.json()["id"]
+    path = f"/api/orders/{oid}"
+    seen_kwargs: dict = {}
+    try:
+        class PreConfirmFailProtocol:
+            def __init__(self, **kwargs):
+                seen_kwargs.update(kwargs)
+                self.confirmation_started = False
+                self.intent_id = ""
+                self.confirmed = {}
+                self.stage = "checkout"
+                self.receipt_evidence = None
+                self.last_http_trace = None
+
+            def pay_from_url(self):
+                raise DomainError(
+                    ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                    "预热阶段代理连接超时，未提交支付",
+                    detail={"code": "proxy_tunnel_failed", "stage": "prepare"},
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(orders, "PlusHarProtocol", PreConfirmFailProtocol)
+        store.view(oid).checkout_kind = "custom"
+        body = {
+            "card": {"number": "0" * 16, "cvc": "000", "exp_month": "12", "exp_year": "33"},
+            "billing": created.json()["billing"],
+        }
+        resp = client.post(f"{path}/pay-protocol", json=body)
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert seen_kwargs["plan"] == "pro_lite"
+        assert data["state"] == "failed"
+        assert data["code"] == "proxy_tunnel_failed"
+        assert data["payment_status"] == "failed"
+        assert "预热阶段代理连接超时" in data["message"]
+        order_state = client.get(path).json()
+        assert order_state["status"] == "failed"
+    finally:
+        vault.drop(oid)
+        store.clear()
+
+
+@pytest.mark.usefixtures("verified_us_payer")
+def test_protocol_pay_accepts_har_receipt_evidence_for_pro_lite(monkeypatch):
+    """Pro Lite HAR payment with verified PI receipt_evidence must not fall back to unknown."""
+    from decimal import Decimal
+    from gss_api.routers import orders
+    from gss_contracts.adapter import PaymentReceiptEvidence
+    from gss_core.stripe_protocol import PaymentOutcome
+
+    monkeypatch.setenv("GSS_USE_FAKE", "1")
+    store.clear()
+    client = TestClient(create_app())
+    created = client.post("/api/orders", json={
+        "plan": "pro_lite", "billing_country": "US", "session": "fake-session",
+    })
+    assert created.status_code == 201, created.text
+    oid = created.json()["id"]
+    path = f"/api/orders/{oid}"
+    view = store.view(oid)
+    view.checkout_kind = "custom"
+    view.checkout_session_id = "oaics_pro_lite_fixture"
+    view.amount = "100.00"
+    view.currency = "USD"
+    try:
+        class PaidHarProtocol:
+            def __init__(self, **kwargs):
+                self.confirmation_started = True
+                self.intent_id = "pi_pro_lite_fixture"
+                self.confirmed = {"status": "complete"}
+                self.stage = "payment"
+                self.receipt_evidence = PaymentReceiptEvidence(
+                    checkout_id="oaics_pro_lite_fixture",
+                    payment_id="pi_pro_lite_fixture",
+                    amount=Decimal("100.00"),
+                    currency="USD",
+                )
+                self.last_http_trace = None
+
+            def pay_from_url(self):
+                return PaymentOutcome(
+                    state="paid",
+                    intent_id="pi_pro_lite_fixture",
+                    intent_status="succeeded",
+                    message="Pro Lite 订阅已生效",
+                    raw={"checkout": {"checkout_session_id": "oaics_pro_lite_fixture", "status": "complete"}},
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(orders, "PlusHarProtocol", PaidHarProtocol)
+        monkeypatch.setattr(orders, "_verify_after_payment", AsyncMock(return_value=True))
+        body = {
+            "card": {"number": "0" * 16, "cvc": "000", "exp_month": "12", "exp_year": "33"},
+            "billing": created.json()["billing"],
+        }
+        resp = client.post(f"{path}/pay-protocol", json=body)
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["state"] == "paid"
+        assert data["payment_status"] == "succeeded"
+        assert data["payment_intent_id"] == "pi_pro_lite_fixture"
+    finally:
+        vault.drop(oid)
+        store.clear()

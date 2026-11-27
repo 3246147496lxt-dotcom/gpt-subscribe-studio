@@ -108,3 +108,96 @@ def test_preflight_passes_with_split_exit(tmp_path, monkeypatch) -> None:
     check = _check_verified_billing("plus", "PHP", exit_country="PH", billing_country="PH")
     assert check.status == "pass"
     assert "US" in check.message
+
+
+def test_admin_settings_api_manages_fixed_us_billing_without_restart(tmp_path, monkeypatch) -> None:
+    import stat as stat_mod
+    from gss_api.services.preflight import _check_verified_billing
+    from gss_core.verified_payer import MissingProfile
+
+    cfg_dir = tmp_path / "admin-config"
+    monkeypatch.setenv("GSS_CONFIG_DIR", str(cfg_dir))
+    monkeypatch.delenv("GSS_FIXED_BILLING_FILE", raising=False)
+    monkeypatch.delenv("GSS_VERIFIED_BILLING_FILE", raising=False)
+    monkeypatch.delenv("GSS_BILLING_PROFILES_FILE", raising=False)
+    monkeypatch.delenv("GSS_USE_FAKE", raising=False)
+
+    client = TestClient(create_app())
+
+    # 1) 初始未配置
+    res0 = client.get("/api/settings/fixed-billing")
+    assert res0.status_code == 200, res0.text
+    snap0 = res0.json()
+    assert snap0["configured"] is False
+    assert snap0["valid"] is False
+    assert snap0["source"] == "none"
+    assert snap0["address"] is None
+    assert len(snap0["tax_free_states"]) == 5
+
+    # 2) 非免税州 / 非 US / 非法邮箱均被 400 拦截
+    for bad in (
+        {**ADDRESS, "state": "CA"},
+        {**ADDRESS, "country": "JP"},
+        {**ADDRESS, "email": "not-an-email"},
+    ):
+        bad_res = client.put("/api/settings/fixed-billing", json=bad)
+        assert bad_res.status_code == 400, bad_res.text
+
+    # 3) 保存合法美国免税州地址 -> 自动 0600 落盘且立即对 load_profile / preflight 生效
+    save_res = client.put("/api/settings/fixed-billing", json={**ADDRESS, "state": "de", "country": "us"})
+    assert save_res.status_code == 200, save_res.text
+    snap1 = save_res.json()
+    assert snap1["configured"] is True
+    assert snap1["valid"] is True
+    assert snap1["source"] == "managed"
+    assert snap1["can_delete"] is True
+    assert snap1["address"]["state"] == "DE"
+    assert snap1["address"]["country"] == "US"
+    assert snap1["verification_id"]
+
+    managed_file = cfg_dir / "fixed-billing.json"
+    assert managed_file.is_file()
+    assert stat_mod.S_IMODE(managed_file.stat().st_mode) == 0o600
+    assert load_profile()["state"] == "DE"
+    assert load_billing_profiles().resolve_for_country("US", "JPY")["state"] == "DE"
+    assert _check_verified_billing("plus", "JPY", exit_country="JP").status == "pass"
+
+    # 4) 清空后立即回到 fail-closed（MissingProfile）
+    del_res = client.delete("/api/settings/fixed-billing")
+    assert del_res.status_code == 200, del_res.text
+    snap2 = del_res.json()
+    assert snap2["configured"] is False
+    assert snap2["valid"] is False
+    assert not managed_file.exists()
+    with pytest.raises(MissingProfile):
+        load_profile()
+
+
+def test_admin_settings_api_respects_env_fixed_billing_path(tmp_path, monkeypatch) -> None:
+    env_file = tmp_path / "env-fixed.json"
+    monkeypatch.setenv("GSS_FIXED_BILLING_FILE", str(env_file))
+    client = TestClient(create_app())
+
+    save_res = client.put("/api/settings/fixed-billing", json=ADDRESS)
+    assert save_res.status_code == 200, save_res.text
+    snap = save_res.json()
+    assert snap["source"] == "env_fixed"
+    assert snap["storage_label"] == "GSS_FIXED_BILLING_FILE"
+    assert env_file.is_file()
+    assert load_fixed_billing_file() == ADDRESS
+
+
+def test_fixed_billing_settings_require_admin_auth(tmp_path) -> None:
+    from gss_api.test_access import TestAccessMiddleware
+
+    creds = tmp_path / "auth.json"
+    creds.write_text(json.dumps({"password": "admin-secret-fixture"}))
+    login_html = tmp_path / "login.html"
+    login_html.write_text("<html>login</html>")
+
+    app = create_app()
+    app.add_middleware(TestAccessMiddleware, credentials_file=str(creds), login_file=str(login_html))
+    client = TestClient(app)
+    assert client.get("/api/settings/fixed-billing").status_code == 401
+    assert client.put("/api/settings/fixed-billing", json=ADDRESS).status_code == 401
+    assert client.delete("/api/settings/fixed-billing").status_code == 401

@@ -65,6 +65,7 @@ from gss_core.chatgpt import (
     _intent_object,
     _PLAN_NAME,
     _json,
+    _resolve_reissue_ua,
     _without_session_headers,
     parse_account_check,
     _log_upstream_failure,
@@ -95,7 +96,13 @@ from gss_core.har_telemetry import (
 )
 from gss_core.saved_cards import restore_account
 from gss_core.saved_card_protocol import _factor, _stripe_error, outcome
-from gss_core.session_token import parse_session_bundle
+from gss_core.session_token import (
+    chunk_session_cookie,
+    is_access_token_expired,
+    is_session_cookie_name,
+    parse_session_bundle,
+    reassemble_session_token,
+)
 from gss_core.proxies import ProxyLeaseError, claim_sid_lease, cool_proxy, release_sid_lease
 from gss_core.stripe_protocol import PaymentOutcome
 
@@ -103,6 +110,20 @@ logger = logging.getLogger("gss.plus_har")
 
 _UNSETTLED_INTENT_STATES = {"requires_payment_method", "canceled", "cancelled"}
 _CARD_REJECTION_CODES = {"card_declined", "expired_card", "incorrect_cvc", "incorrect_number"}
+_ENTITLEMENT_PLAN_ALIASES: Dict[str, set[str]] = {
+    "plus": {"plus", "chatgptplusplan"},
+    "go": {"go", "chatgptgoplan"},
+    "pro": {"pro", "chatgptpro", "chatgptproplan"},
+    "pro_lite": {"pro_lite", "prolite", "chatgptprolite", "chatgptproliteplan"},
+    "pro_max": {"pro_max", "promax", "chatgptpromax", "chatgptpromaxplan"},
+}
+_PLAN_DISPLAY_NAMES: Dict[str, str] = {
+    "plus": "Plus",
+    "go": "Go",
+    "pro_lite": "Pro Lite",
+    "pro": "Pro",
+    "pro_max": "Pro Max",
+}
 
 
 def cash_receipt(checkout_id, payment_id, received_minor, currency, expected_minor):
@@ -116,7 +137,7 @@ def cash_receipt(checkout_id, payment_id, received_minor, currency, expected_min
                                   amount=Decimal(received_minor) / _factor(code), currency=code)
 
 
-def active_plus_entitlement(payload: dict, account_id: str = "") -> bool:
+def active_plus_entitlement(payload: dict, account_id: str = "", plan: str = "plus") -> bool:
     entitlement = payload.get("entitlement") or {}
     subscription = payload.get("subscription") or {}
     if not isinstance(entitlement, dict) or not isinstance(subscription, dict):
@@ -124,7 +145,10 @@ def active_plus_entitlement(payload: dict, account_id: str = "") -> bool:
     plans = [str(v).lower() for v in (payload.get("plan_type"), entitlement.get("subscription_plan"),
                                       subscription.get("plan")) if v]
     flags = [payload.get("is_active"), entitlement.get("has_active_subscription")]
-    if not plans or any(v not in {"plus", "chatgptplusplan"} for v in plans):
+    allowed = _ENTITLEMENT_PLAN_ALIASES.get(
+        str(plan or "plus").strip().lower(), {"plus", "chatgptplusplan"},
+    )
+    if not plans or any(v not in allowed for v in plans):
         return False
     if not any(v is True for v in flags) or any(v is False for v in flags):
         return False
@@ -298,6 +322,7 @@ class PlusHarProtocol:
         # is not fetched twice in one attempt.
         self._checkout_snapshot: Optional[Dict[str, Any]] = None
         self.discarded_checkout_id = ""
+        self._save_payment_method_choice: Optional[bool] = True
         self._radar_cached = ""
         self.confirmed: Dict[str, Any] = {}
         self.intent_id = ""
@@ -369,8 +394,10 @@ class PlusHarProtocol:
         if self.browser_context is not None:
             from gss_core.browser_context import safe_browser_cookies
             cookies.update(safe_browser_cookies(self.browser_context.cookies))
-        if getattr(self.client, "session_token", ""):
-            cookies.setdefault("__Secure-next-auth.session-token", self.client.session_token)
+        if getattr(self.client, "session_token", "") and not any(
+            is_session_cookie_name(name) for name in cookies
+        ):
+            cookies.update(chunk_session_cookie(self.client.session_token))
         if getattr(self.client, "device_id", ""):
             cookies["oai-did"] = self.client.device_id
         cookies.setdefault("g_state", g_state_cookie(self.device))
@@ -422,13 +449,18 @@ class PlusHarProtocol:
 
     # ── headers ────────────────────────────────────────────────────
     def _web_headers(self, *, referer: str = "https://chatgpt.com/",
-                     json_body: bool = True, telemetry: Optional[str] = None) -> Dict[str, str]:
+                     json_body: bool = True, telemetry: Optional[str] = None,
+                     include_sentinel_so: bool = False,
+                     confirm_headers: bool = False) -> Dict[str, str]:
         headers = self.device.web_headers(referer=referer)
         if json_body:
             headers["content-type"] = "application/json"
         else:
             headers.pop("origin", None)
             headers.pop("content-type", None)
+        if confirm_headers:
+            headers["x-oaics-server-confirm-card"] = "true"
+            headers["x-openai-checkout-method-retry"] = "1"
         if self.browser_context is not None:
             headers.update({k.lower(): v for k, v in (self.browser_context.headers() or {}).items()})
             if not json_body:
@@ -449,7 +481,7 @@ class PlusHarProtocol:
             headers["oai-telemetry"] = telemetry
         if self.client.sentinel_token:
             headers["openai-sentinel-token"] = self.client.sentinel_token
-        if self.client.sentinel_so:
+        if include_sentinel_so and getattr(self.client, "sentinel_so", ""):
             headers["openai-sentinel-so-token"] = self.client.sentinel_so
         return headers
 
@@ -463,8 +495,11 @@ class PlusHarProtocol:
         self._require_credentials()
         url = f"{APP_BASE}{route}"
         is_get = method.strip().upper() == "GET"
+        is_confirm = route == "/backend-api/payments/checkout/confirm"
         headers = self._web_headers(referer=referer, json_body=json_body is not None,
-                                    telemetry=telemetry)
+                                    telemetry=telemetry,
+                                    include_sentinel_so=is_confirm,
+                                    confirm_headers=is_confirm)
         kwargs: Dict[str, Any] = {"headers": headers, "timeout": self.timeout}
         if json_body is not None:
             kwargs["json"] = json_body
@@ -569,30 +604,70 @@ class PlusHarProtocol:
     def _prepare(self) -> None:
         self._claim_exit()
         if self.client is None:
+            from gss_core import runtime_flags
+
             imported = parse_session_bundle(self.session)
+            keep_ua = runtime_flags.get_bool("reissue_keep_ua")
+            direct_session = runtime_flags.get_bool("direct_session_checkout")
+            at_valid = bool(
+                imported.access_token
+                and not is_access_token_expired(imported.access_token, leeway_seconds=60)
+            )
             cross_country = bool(
                 imported.country and self.exit_country
                 and imported.country.upper() != self.exit_country.upper()
             )
-            if imported.refresh_token:
+            used_direct = False
+            if direct_session and at_valid:
+                # Direct-session mode: preserve exported accessToken, oai-did,
+                # chunked session cookies, and OS user-agent on the bound exit
+                # proxy without triggering a redundant /api/auth/session reissue
+                # or discarding the checkout session already created for this order.
+                self.client = ChatGPTClient.from_raw_session(
+                    self.session, proxy=self.proxy, strip_ambient=False
+                )
+                if not self.client.user_agent:
+                    self.client.user_agent = _resolve_reissue_ua(
+                        imported, self.client.device_id, preserve_user_agent=keep_ua
+                    )
+                self.session_reissued = False
+                used_direct = True
+            elif imported.refresh_token:
                 # OAuth credentials are portable: one refresh exchange on this
                 # exit replaces both the web cookie and the login country.
                 self.client = ChatGPTClient.from_raw_session(
                     self.session, proxy=self.proxy, strip_ambient=True)
+                if not self.client.user_agent:
+                    self.client.user_agent = _resolve_reissue_ua(
+                        imported, self.client.device_id, preserve_user_agent=keep_ua
+                    )
                 if not self.read_only:
                     self.client.access_token = ""
                 self.session_reissued = True
             elif cross_country and imported.session_token:
                 # Cross-region takeover: keep only the session cookie and
-                # re-issue the token on this order's exit with a new device.
+                # re-issue the token on this order's exit with a same-OS device.
+                reauth_kwargs: Dict[str, Any] = {
+                    "proxy": self.proxy,
+                    "country": self.exit_country,
+                    "timeout": self.timeout,
+                }
+                if keep_ua:
+                    reauth_kwargs["preserve_user_agent"] = True
                 self.client = ChatGPTClient.reauthorize_for_country(
-                    self.session, proxy=self.proxy, country=self.exit_country)
+                    self.session, **reauth_kwargs
+                )
                 self.session_reissued = True
             else:
                 # Same region or no session cookie: drop the exported device,
-                # statsig country and cookie jar, then warm on this exit.
+                # statsig country and cookie jar, then warm on this exit while
+                # preserving the session's OS profile (macOS/Windows).
                 self.client = ChatGPTClient.from_raw_session(
                     self.session, proxy=self.proxy, strip_ambient=True)
+                if not self.client.user_agent:
+                    self.client.user_agent = _resolve_reissue_ua(
+                        imported, self.client.device_id, preserve_user_agent=keep_ua
+                    )
                 if not self.read_only and imported.session_token:
                     # Drop the exported AT before warm_exit_session re-issues on this exit.
                     self.client.access_token = ""
@@ -602,17 +677,27 @@ class PlusHarProtocol:
             self.client.timezone = self.device.timezone
             if not self.client.user_agent:
                 self.client.user_agent = self.device.ua
-            elif self.session_reissued:
+            else:
                 self.device = apply_user_agent(self.device, self.client.user_agent)
             if not self.read_only:
-                try:
-                    accounts = self.client.warm_exit_session(
-                        oauth=bool(imported.refresh_token),
-                        reissue=not self.session_reissued,
-                    )
-                except DomainError as exc:
-                    raise DomainError(exc.code, exc.message, detail=exc.detail) from None
-                self._reject_if_already_subscribed(accounts)
+                if used_direct and self.checkout_id:
+                    # Checkout was already created for this order on the pinned
+                    # exit proxy; only run a lightweight non-fatal edge warmup
+                    # so __cf_bm and <html data-build> are fresh without wiping
+                    # credentials or re-issuing.
+                    try:
+                        self.client.warmup(reject_unauthorized=True)
+                    except DomainError as exc:
+                        raise DomainError(exc.code, exc.message, detail=exc.detail) from None
+                else:
+                    try:
+                        accounts = self.client.warm_exit_session(
+                            oauth=bool(imported.refresh_token) and not used_direct,
+                            reissue=(not self.session_reissued) and not used_direct,
+                        )
+                    except DomainError as exc:
+                        raise DomainError(exc.code, exc.message, detail=exc.detail) from None
+                    self._reject_if_already_subscribed(accounts)
             try:
                 restore_account(self.client, self.expected_account,
                                 credentials_current=self.credentials_current)
@@ -644,7 +729,7 @@ class PlusHarProtocol:
             page_url="https://chatgpt.com/",
             started_at=self.t0,
         ))
-        budget = float(os.environ.get("GSS_HAR_TELEMETRY_BUDGET", "120") or 0)
+        budget = float(os.environ.get("GSS_HAR_TELEMETRY_BUDGET", "15") or 0)
         if budget > 0 and hasattr(self.telemetry, "deadline"):
             self.telemetry.deadline = time.time() + budget
 
@@ -705,7 +790,7 @@ class PlusHarProtocol:
             }
         response = self._app("POST", "/backend-api/payments/checkout", json_body=body,
                              telemetry=oai_telemetry_header(),
-                             referer="https://chatgpt.com/?cta_tab=personal")
+                             referer="https://chatgpt.com/")
         if self.client is not None:
             self.client.sentinel_token = ""
             self.client.sentinel_so = ""
@@ -727,12 +812,47 @@ class PlusHarProtocol:
         self.processor = str(payload.get("processor_entity") or self.processor)
         self.cuss_secret = str(payload.get("customer_session_client_secret") or self.cuss_secret)
         self.confirm_return_url = str(payload.get("confirm_return_url") or self.confirm_return_url)
+        self._sync_save_choice(payload)
         self.raw["create"] = payload
         return payload
+
+    def _sync_save_choice(self, session: Dict[str, Any]) -> None:
+        """Align `save_payment_method_for_reuse` with OpenAI's live checkout experiments.
+
+        Live ChatGPT frontend (`13455.adbcf21f0b.js` / `418851.4535c67f63.js`)
+        only sends `save_payment_method_for_reuse` when `disable_saved_payment_methods`
+        is not true AND `experiments.saved_payment_link_arm` is an active non-control
+        treatment arm (e.g. `save_default_link`). Sending it otherwise triggers HTTP 400
+        `"Save choice is not available for this checkout session"`.
+        """
+        if not isinstance(session, dict):
+            return
+        has_flag = "disable_saved_payment_methods" in session
+        has_experiments = "experiments" in session
+        if not has_flag and not has_experiments:
+            return
+        if session.get("disable_saved_payment_methods") is True:
+            self._save_payment_method_choice = None
+            return
+        experiments = session.get("experiments")
+        if not isinstance(experiments, dict):
+            self._save_payment_method_choice = None
+            return
+        arm = str(experiments.get("saved_payment_link_arm") or "").strip().lower()
+        if not arm or arm == "control":
+            self._save_payment_method_choice = None
+            return
+        explicit = str(experiments.get("saved_payment_link_save_for_reuse") or "").strip().lower()
+        initial = str(experiments.get("saved_payment_link_initial_save_for_reuse") or "").strip().lower()
+        if explicit == "false" or (not explicit and initial == "false"):
+            self._save_payment_method_choice = False
+        else:
+            self._save_payment_method_choice = True
 
     def _read_checkout(self) -> Dict[str, Any]:
         if self._checkout_snapshot is not None:
             payload, self._checkout_snapshot = self._checkout_snapshot, None
+            self._sync_save_choice(payload)
             return payload
         route = f"/backend-api/payments/checkout/{self.processor}/{self.checkout_id}"
         response = self._app("GET", route, params={"supports_business_seat_offer": "true"})
@@ -754,6 +874,7 @@ class PlusHarProtocol:
             self.cuss_secret = str(payload["customer_session_client_secret"])
         if payload.get("confirm_return_url"):
             self.confirm_return_url = str(payload["confirm_return_url"])
+        self._sync_save_choice(payload)
         self.raw["checkout"] = payload
         return payload
 
@@ -819,9 +940,8 @@ class PlusHarProtocol:
             "deferred_intent[amount]": str(self.amount_minor),
             "deferred_intent[currency]": self.currency.lower(),
             "deferred_intent[setup_future_usage]": "off_session",
-            "deferred_intent[payment_method_types][0]": "card",
-            "deferred_intent[payment_method_types][1]": "link",
-            "currency": self.currency.lower(),
+            "deferred_intent[payment_method_types][0]": "link",
+            "deferred_intent[payment_method_types][1]": "card",
             "key": self.publishable_key,
             "_stripe_version": STRIPE_API_VERSION,
             "elements_init_source": "stripe.elements",
@@ -831,6 +951,10 @@ class PlusHarProtocol:
             "browser_timezone": self.device.timezone,
             "type": "deferred_intent",
         }
+        if self.elements_session_id:
+            params["session_id"] = self.elements_session_id
+        else:
+            params["currency"] = self.currency.lower()
         if self.cuss_secret:
             params["customer_session_client_secret"] = self.cuss_secret
         return params
@@ -951,6 +1075,8 @@ class PlusHarProtocol:
         session = payload.get("checkout_session") if isinstance(payload.get("checkout_session"), dict) else {}
         if session.get("publishable_key"):
             self.publishable_key = str(session["publishable_key"])
+        if session:
+            self._sync_save_choice(session)
         before = self.amount_minor
         self.amount_minor = self._total_minor(session or payload)
         tax_delta = (before - self.amount_minor) if before else None
@@ -1050,6 +1176,12 @@ class PlusHarProtocol:
 
     def _confirmation_token(self) -> str:
         b = self.billing
+        logger.info(
+            "plus_har_ctoken_start mode=%s registered=%s server_ids_adopted=%s",
+            self.mode,
+            bool(getattr(self.telemetry, "registered", False)),
+            bool(getattr(self.telemetry, "server_ids_adopted", False)),
+        )
         # A locally generated guid/muid/sid is not a Stripe device identity.
         # Fail closed before the confirmation token, payment method or intent:
         # nothing has been sent at this point, so no charge can be in flight.
@@ -1095,8 +1227,8 @@ class PlusHarProtocol:
             "set_as_default_payment_method": "false",
             "client_context[currency]": self.currency.lower(),
             "client_context[mode]": "subscription",
-            "client_context[payment_method_types][0]": "card",
-            "client_context[payment_method_types][1]": "link",
+            "client_context[payment_method_types][0]": "link",
+            "client_context[payment_method_types][1]": "card",
             "client_attribution_metadata[client_session_id]": self.device.stripe_js_id,
             "client_attribution_metadata[merchant_integration_source]": "elements",
             "client_attribution_metadata[merchant_integration_subtype]": "payment-element",
@@ -1199,7 +1331,7 @@ class PlusHarProtocol:
         for name, value in gathered.items():
             if name and value is not None:
                 self.client.extra_cookies[name] = value
-        token = gathered.get("__Secure-next-auth.session-token")
+        token = reassemble_session_token(gathered)
         if token:
             self.client.session_token = token
 
@@ -1253,18 +1385,20 @@ class PlusHarProtocol:
             )
 
     def _app_confirm(self) -> Dict[str, Any]:
-        body = {
+        body: Dict[str, Any] = {
             "checkout_session_id": self.checkout_id,
-            "save_payment_method_for_reuse": True,
             "confirm_token": self.ctoken,
             "selected_payment_method_type": "card",
         }
+        if self._save_payment_method_choice is not None:
+            body["save_payment_method_for_reuse"] = bool(self._save_payment_method_choice)
         self._reset_web_session()
         started = time.monotonic()
         logger.info(
             "plus_har_confirm_start route=/backend-api/payments/checkout/confirm "
-            "timeout=%.1f checkout=%s ctoken=%s",
+            "timeout=%.1f checkout=%s ctoken=%s save_choice=%s",
             self.timeout, self.checkout_id[:14], bool(self.ctoken),
+            self._save_payment_method_choice,
         )
         try:
             response = self._app("POST", "/backend-api/payments/checkout/confirm", json_body=body,
@@ -1275,6 +1409,10 @@ class PlusHarProtocol:
                 time.monotonic() - started, type(exc).__name__,
             )
             raise
+        finally:
+            if self.client is not None:
+                self.client.sentinel_token = ""
+                self.client.sentinel_so = ""
         payload = _json(response)
         status = int(getattr(response, "status_code", 0) or 0)
         logger.info(
@@ -1299,7 +1437,8 @@ class PlusHarProtocol:
                 response_json=payload,
                 response_text=getattr(response, "text", ""),
             )
-            message = redact_sensitive(str(payload.get("message") or f"confirm HTTP {status}"))[:200]
+            raw_msg = payload.get("message") or payload.get("detail") or f"confirm HTTP {status}"
+            message = redact_sensitive(str(raw_msg))[:200]
             exc = DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, message)
             exc._http_trace = self.last_http_trace
             raise exc
@@ -1316,7 +1455,7 @@ class PlusHarProtocol:
             )
             exc = DomainError(
                 ErrorCode.SUBSCRIPTION_LIMIT,
-                "该账号已达到订阅数量上限（subscription_limit），本次未扣款",
+                "该银行卡或设备关联的订阅数量已达上限（subscription_limit），本次未扣款；请更换银行卡或隔离设备环境后重试",
             )
             exc._http_trace = self.last_http_trace
             raise exc
@@ -1403,14 +1542,51 @@ class PlusHarProtocol:
         return payload
 
     # ── 6. settle ──────────────────────────────────────────────────
-    def _subscription_active(self) -> bool:
-        try:
-            self._require_credentials()
-            payload = self.client.subscription_payload()
-        except Exception:  # noqa: BLE001
+    def _refresh_after_upgrade(self) -> bool:
+        """Force-refresh /api/auth/session after plan upgrade invalidates the old AT."""
+        if self.client is None or not getattr(self.client, "session_token", ""):
             return False
-        self.plus_entitlement_verified = active_plus_entitlement(payload, self.expected_account or self.client.account_id)
-        return self.plus_entitlement_verified
+        refresh = getattr(self.client, "refresh_session", None)
+        if not callable(refresh):
+            return False
+        try:
+            ok = bool(refresh(trust_statsig=False, reject_unauthorized=False, force_refresh=True))
+        except TypeError:
+            ok = bool(refresh())
+        logger.info("plus_har_post_pay_session_refreshed ok=%s", ok)
+        return ok
+
+    def _subscription_active(self) -> bool:
+        attempts = 1 if self.read_only else 2
+        for attempt in range(attempts):
+            if attempt > 0:
+                time.sleep(2.0)
+            try:
+                self._require_credentials()
+                try:
+                    payload = self.client.subscription_payload()
+                except DomainError as exc:
+                    if exc.code is not ErrorCode.INVALID_SESSION or not self._refresh_after_upgrade():
+                        raise
+                    self._require_credentials()
+                    payload = self.client.subscription_payload()
+            except Exception:  # noqa: BLE001
+                return False
+            self.plus_entitlement_verified = active_plus_entitlement(
+                payload, self.expected_account or self.client.account_id, plan=self.plan,
+            )
+            if self.plus_entitlement_verified:
+                return True
+            ent = payload.get("entitlement") if isinstance(payload.get("entitlement"), dict) else {}
+            logger.info(
+                "plus_har_subscription_not_active attempt=%s plan=%s observed_plan=%s sub_plan=%s is_active=%s",
+                attempt + 1,
+                self.plan,
+                payload.get("plan_type") or "-",
+                ent.get("subscription_plan") or "-",
+                payload.get("is_active"),
+            )
+        return False
 
     def _ack_checkout(self) -> bool:
         body = {"stripe_checkout_session_id": self.checkout_id,
@@ -1468,8 +1644,24 @@ class PlusHarProtocol:
         currency = page.get("currency") or (page.get("checkout_state") or {}).get("currency")
         return cash_receipt(self.checkout_id, page_intent, received, currency, self.receipt_expected_minor)
 
+    @staticmethod
+    def _intent_settled_amount(intent: dict) -> Any:
+        """Return settled minor units from a Stripe PaymentIntent.
+
+        Stripe secret-key responses carry ``amount_received`` (authoritative when
+        present); publishable-key client responses (``POST /v1/payment_intents/{id}/confirm``
+        and client ``GET``) omit ``amount_received`` and report ``amount`` with
+        ``status == "succeeded"``.
+        """
+        if "amount_received" in intent:
+            return intent.get("amount_received")
+        if (intent.get("status") == "succeeded"
+                and intent.get("object") in {None, "", "payment_intent"}):
+            return intent.get("amount")
+        return None
+
     def _bound_intent(self, intent: dict) -> bool:
-        amount = intent.get("amount_received")
+        amount = self._intent_settled_amount(intent)
         return bool(intent.get("status") == "succeeded" and self.intent_id.startswith("pi_") and self.intent_id == intent.get("id")
                     and type(amount) is int and amount > 0 and amount == self.receipt_expected_minor
                     and str(intent.get("currency") or "").upper() == self.currency)
@@ -1484,7 +1676,7 @@ class PlusHarProtocol:
                 confirm_payload.get("payment_intent_id") or confirm_payload.get("payment_intent") or ""):
             out.state = "rejected"
             out.code = "subscription_limit"
-            out.message = "该账号已达到订阅数量上限（subscription_limit），本次未扣款"
+            out.message = "该银行卡或设备关联的订阅数量已达上限（subscription_limit），本次未扣款；请更换银行卡或隔离设备环境后重试"
             return out
         intent_status = str(intent_payload.get("status") or "")
         out.intent_id = str(intent_payload.get("id") or self.intent_id or "")
@@ -1548,7 +1740,7 @@ class PlusHarProtocol:
             bound = self._bound_intent(intent_payload)
             if bound:
                 self.receipt_evidence = cash_receipt(
-                    self.checkout_id, self.intent_id, intent_payload["amount_received"],
+                    self.checkout_id, self.intent_id, self._intent_settled_amount(intent_payload),
                     intent_payload["currency"], self.receipt_expected_minor,
                 )
             else:
@@ -1560,12 +1752,13 @@ class PlusHarProtocol:
             # when the page is already complete; never block on secondary fields.
             if not self.read_only and status == "complete" and payment_status in {"paid", "no_payment_required"}:
                 self._ack_checkout()
+            plan_label = _PLAN_DISPLAY_NAMES.get(str(self.plan or "plus").lower(), str(self.plan or "Plus"))
             if self._subscription_active():
                 out.state = "paid"
-                out.message = "Plus 订阅已生效"
+                out.message = f"{plan_label} 订阅已生效"
             else:
                 out.state = "pending"
-                out.message = "付款已确认，等待 Plus 订阅生效"
+                out.message = f"付款已确认，等待 {plan_label} 订阅生效"
             out.intent_status = "succeeded"
             return out
         if status == "complete" and payment_status in {"paid", "no_payment_required"}:
@@ -1577,7 +1770,8 @@ class PlusHarProtocol:
                 return out
             self.receipt_evidence = self._page_receipt(page)
             if self.receipt_evidence is None and self._bound_intent(intent_payload):
-                self.receipt_evidence = cash_receipt(self.checkout_id, self.intent_id, intent_payload["amount_received"],
+                self.receipt_evidence = cash_receipt(self.checkout_id, self.intent_id,
+                                                    self._intent_settled_amount(intent_payload),
                                                     intent_payload["currency"], self.receipt_expected_minor)
             if self.receipt_evidence is None:
                 out.message = "缺少可对应原订单的实收回执"
@@ -1585,20 +1779,22 @@ class PlusHarProtocol:
             out.intent_id = self.receipt_evidence.payment_id
             if not self.read_only:
                 self._ack_checkout()
+            plan_label = _PLAN_DISPLAY_NAMES.get(str(self.plan or "plus").lower(), str(self.plan or "Plus"))
             if self._subscription_active():
                 out.state = "paid"
                 out.intent_status = intent_status or "succeeded"
-                out.message = "Plus 订阅已生效"
+                out.message = f"{plan_label} 订阅已生效"
             else:
                 out.state = "pending"
                 out.intent_status = intent_status or "succeeded"
-                out.message = "付款已确认，等待 Plus 订阅生效"
+                out.message = f"付款已确认，等待 {plan_label} 订阅生效"
             return out
         if intent_status == "succeeded":
             if not self._bound_intent(intent_payload):
                 out.message = "实收凭据未与本单金额及币种匹配"
                 return out
-            self.receipt_evidence = cash_receipt(self.checkout_id, self.intent_id, intent_payload["amount_received"],
+            self.receipt_evidence = cash_receipt(self.checkout_id, self.intent_id,
+                                                self._intent_settled_amount(intent_payload),
                                                 intent_payload["currency"], self.receipt_expected_minor)
             out.state = "pending"
             out.intent_status = intent_status
@@ -1680,6 +1876,10 @@ class PlusHarProtocol:
         self._consumers_lookup("web_link_authentication_in_payment_element")
         if self.mode != "off":
             self.telemetry.register()
+            logger.info(
+                "plus_har_register_done adopted=%s",
+                bool(getattr(self.telemetry, "server_ids_adopted", False)),
+            )
         self._consumers_lookup("web_elements_controller")
         self._flush(PHASE_CAPTCHA)
         self._card_metadata()
@@ -1703,7 +1903,16 @@ class PlusHarProtocol:
         self.stage = "payment"
 
         self._sentinel("checkout_session_approval")
+        approval_token = str(getattr(self.client, "sentinel_token", "") or "")
         self._sentinel("chatgpt_checkout")
+        checkout_so = str(getattr(self.client, "sentinel_so", "") or "")
+        if self.client is not None:
+            # 2026-11-26 live capture [1151]: checkout/confirm carries
+            # openai-sentinel-token (flow=checkout_session_approval) together
+            # with openai-sentinel-so-token (flow=chatgpt_checkout).
+            if approval_token:
+                self.client.sentinel_token = approval_token
+            self.client.sentinel_so = checkout_so
         # Set the fence before I/O: a lost reply cannot prove the request was not applied.
         self._require_credentials()
         if self.receipt_expected_minor is None:
@@ -1808,7 +2017,8 @@ class PlusHarProtocol:
                 if not self._bound_intent(intent):
                     out.message = "实收凭据未与本单金额及币种匹配"
                     return out
-                self.receipt_evidence = cash_receipt(self.checkout_id, self.intent_id, intent["amount_received"],
+                self.receipt_evidence = cash_receipt(self.checkout_id, self.intent_id,
+                                                    self._intent_settled_amount(intent),
                                                     intent["currency"], self.receipt_expected_minor)
                 out.state = "pending"
                 out.intent_status = state
@@ -1931,6 +2141,7 @@ def run_har_context(
         customer_session_client_secret=str(spec.get("customer_session_client_secret") or ""),
         email=str((billing or {}).get("email") or ""),
         country=country,
+        plan=str(spec.get("plan") or "plus"),
         exit_country=exit_country,
         account_id=str(client.account_id or spec.get("account_id") or ""),
         processor=str(spec.get("processor") or ""),
@@ -1967,18 +2178,59 @@ def run_har_context(
         return outcome("integration_error", "checkout", exc.message, code=str(exc.code))
     except DomainError as exc:
         code = str(exc.code)
+        detail_code = str((exc.detail or {}).get("code") or "")
+        pre_confirm = bool(
+            engine.confirmation_started is False
+            and not engine.intent_id
+            and not engine.confirmed
+            and not context.get("app_confirmation_started")
+            and not context.get("intent_id")
+        )
+        logger.warning(
+            "run_har_context_domain_error stage=%s code=%s detail_code=%s confirm_started=%s msg=%s",
+            engine.stage, code, detail_code or "-", not pre_confirm,
+            redact_sensitive(exc.message)[:160],
+        )
         if code == str(ErrorCode.SUBSCRIPTION_LIMIT):
             out_state = "rejected"
-        elif code == str(ErrorCode.SENTINEL_CHALLENGE_FAILED):
+        elif code == str(ErrorCode.PAYMENT_DECLINED):
+            out_state = "card_declined"
+        elif code == str(ErrorCode.SENTINEL_CHALLENGE_FAILED) or (
+            pre_confirm and detail_code in {"telemetry_unavailable", "proxy_tunnel_failed", "proxy_sid_unavailable"}
+        ):
             out_state = "failed"
         else:
-            out_state = "card_declined" if code == str(ErrorCode.PAYMENT_DECLINED) else "unknown"
+            out_state = "unknown"
         payload = outcome(out_state, engine.stage,
-                          redact_sensitive(exc.message)[:240], code=code)
+                          redact_sensitive(exc.message)[:240], code=detail_code or code)
         payload["stage"] = engine.stage
         trace = getattr(exc, "_http_trace", None) or getattr(engine, "last_http_trace", None)
         if isinstance(trace, dict):
             payload["_http_trace"] = trace
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        pre_confirm = bool(
+            engine.confirmation_started is False
+            and not engine.intent_id
+            and not engine.confirmed
+            and not context.get("app_confirmation_started")
+            and not context.get("intent_id")
+        )
+        logger.warning(
+            "run_har_context_unexpected stage=%s confirm_started=%s type=%s",
+            engine.stage, not pre_confirm, type(exc).__name__,
+        )
+        if pre_confirm:
+            payload = outcome(
+                "failed",
+                engine.stage,
+                f"支付前阶段网络中断（{type(exc).__name__}），未提交扣款，可安全重试",
+                code="pre_confirm_transport_error",
+            )
+            payload["stage"] = engine.stage
+            return payload
+        payload = outcome("unknown", "payment", "支付确认期间连接中断，请核对原订单状态")
+        payload["stage"] = "payment"
         return payload
     finally:
         context["har_device"] = engine.device.to_dict()

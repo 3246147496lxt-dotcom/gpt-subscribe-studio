@@ -254,15 +254,15 @@ def test_public_two_phase_subscription_and_billing_history(
     assert len(d2["invoices"]) == 1
     assert d2["invoices"][0]["amount"] == "1100.00 PHP"
 
-    # Subsequent Phase 1 read hits cache and immediately returns cached invoices!
+    # Subsequent Phase 1 manual read always queries upstream live (no stale cache served).
     p3 = portal_client.post(
         "/api/public/account/subscription-detail",
         json={"session": _session_payload("buyer@example.test"), "includeInvoices": False},
     )
     assert p3.status_code == 200
     d3 = p3.json()
-    assert d3["cached"] is True
-    assert len(d3["invoices"]) == 1
+    assert d3["cached"] is False
+    assert d3["planName"] == "ChatGPT Plus"
 
 
 def test_public_and_admin_access_isolation(tmp_path: Path) -> None:

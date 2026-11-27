@@ -319,7 +319,7 @@ def _check_verified_billing(
             label="固定核验账单",
             status="fail",
             code="BILLING_PROFILE_UNAVAILABLE",
-            message="未配置可用的固定核验账单文件（GSS_FIXED_BILLING_FILE / GSS_VERIFIED_BILLING_FILE / GSS_BILLING_PROFILES_FILE）或文件权限不符合 0400/0600。",
+            message="未配置可用的固定核验账单：可在后台「系统 → 固定账单」直接配置，或设置 GSS_FIXED_BILLING_FILE（权限须为 0400/0600）。",
         )
     payer_country = str(profile.get("country") or "").upper()
     if exit_billing_must_match() and exit_country and exit_country.upper() != payer_country:

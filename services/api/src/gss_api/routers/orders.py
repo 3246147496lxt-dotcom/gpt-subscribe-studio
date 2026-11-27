@@ -32,7 +32,12 @@ from gss_contracts import (
     Plan,
     RoutePlan,
 )
-from gss_contracts.adapter import receipt_matches_order, team_entitlement_matches, verification_lease
+from gss_contracts.adapter import (
+    PaymentReceiptEvidence,
+    receipt_matches_order,
+    team_entitlement_matches,
+    verification_lease,
+)
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_account import FakeAccountAdapter
 from gss_checkout import FakeCheckoutAdapter
@@ -344,9 +349,13 @@ def _plan_matches(order: Order, info, view) -> bool:
     if order.plan is Plan.TEAM:
         return team_entitlement_matches(info, view.receipt_evidence,
                                         workspace_name=view.workspace_name, seat_quantity=view.seat_quantity)
-    aliases = {"plus": {"plus", "chatgptplusplan"}, "go": {"go", "chatgptgoplan"},
-               "pro": {"pro", "chatgptpro", "chatgptproplan"},
-               "pro_lite": {"pro_lite", "chatgptprolite"}, "pro_max": {"pro_max", "chatgptpromax"}}
+    aliases = {
+        "plus": {"plus", "chatgptplusplan"},
+        "go": {"go", "chatgptgoplan"},
+        "pro": {"pro", "chatgptpro", "chatgptproplan"},
+        "pro_lite": {"pro_lite", "prolite", "chatgptprolite", "chatgptproliteplan"},
+        "pro_max": {"pro_max", "promax", "chatgptpromax", "chatgptpromaxplan"},
+    }
     return info.active and (info.raw_kind or "").strip().lower() in aliases.get(str(order.plan), set())
 
 
@@ -366,14 +375,27 @@ async def _verify_after_payment(order: Order, view) -> bool:
     secrets = vault.get(order.id)
     if secrets is None:
         return False
-    try:
-        with verification_lease(lambda: vault.get(order.id) is secrets):
-            info = await build_pipeline().verify(session=secrets.session)
-    except Exception as exc:
-        # Account lookup is read-only. Never release custody or downgrade a paid receipt here.
-        logger.warning("entitlement_lookup_delayed id=%s type=%s", order.id, type(exc).__name__)
-        return False
-    if not _plan_matches(order, info, view):
+    attempts = 1 if use_fake_adapters() else 2
+    info = None
+    for attempt in range(attempts):
+        if attempt > 0:
+            await asyncio.sleep(2.0)
+            if vault.get(order.id) is not secrets:
+                return False
+        try:
+            with verification_lease(lambda: vault.get(order.id) is secrets):
+                info = await build_pipeline().verify(session=secrets.session)
+        except Exception as exc:
+            # Account lookup is read-only. Never release custody or downgrade a paid receipt here.
+            logger.warning("entitlement_lookup_delayed id=%s type=%s", order.id, type(exc).__name__)
+            return False
+        if _plan_matches(order, info, view):
+            break
+        logger.info(
+            "entitlement_plan_mismatch id=%s attempt=%s expected=%s active=%s raw_kind=%s",
+            order.id, attempt + 1, order.plan, getattr(info, "active", None), getattr(info, "raw_kind", None),
+        )
+    if info is None or not _plan_matches(order, info, view):
         return False
     assert_deliverable(OrderStatus.ACTIVE, info)
     view.subscription = info
@@ -880,7 +902,7 @@ async def get_order_events(order_id: str) -> list[QuickPayEventOut]:
 
 
 _FAILURE_SUMMARY_BY_CODE: Dict[str, str] = {
-    "subscription_limit": "充值账单未通过确认（账号已达订阅上限），本次尚未提交付款。",
+    "subscription_limit": "结账确认被上游拒绝（该银行卡或设备关联的订阅数量已达上限），本次未扣款；请更换银行卡或使用独立浏览器环境重新导出 Session 后重试。",
     "already_subscribed": "当前账号已存在有效订阅，本次未创建新账单也未提交付款。",
     "unusual_activity": "上游风控判定异常流量并拒绝了本次请求，尚未提交付款。请更换同地区出口节点或重新导出 Session 后重试。",
     "invalid_session": "账号 Session 已失效或被撤销，本次尚未提交付款。请重新登录 ChatGPT 导出完整 Session 后重试。",
@@ -1167,6 +1189,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                     normalize_country(payload.billing_country), country)
     if verified is not None and exit_country != country and not split_exit_billing_allowed():
         raise HTTPException(409, "当前为严格模式：出口必须与固定账单国家一致，未创建订单。")
+    direct_session = runtime_flags.get_bool("direct_session_checkout")
     cross_country = bool(original_country and original_country != exit_country)
     at_missing = not bundle.access_token
     at_expired = bool(
@@ -1177,12 +1200,20 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
     )
     need_st_reissue = bool(
         bundle.session_token
-        and (cross_country or at_missing or at_expired or proactive_exit_reissue)
+        and (
+            at_missing
+            or at_expired
+            or (not direct_session and (cross_country or proactive_exit_reissue))
+        )
     )
     need_oauth_reissue = bool(
         not need_st_reissue
         and bundle.refresh_token
-        and (cross_country or at_missing or at_expired or _reissue_on_exit_enabled())
+        and (
+            at_missing
+            or at_expired
+            or (not direct_session and (cross_country or _reissue_on_exit_enabled()))
+        )
     )
     pipeline = None
     if non_team:
@@ -1516,6 +1547,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                     # Re-issue AT on the newly rotated exit IP when ST/OAuth is available
                     # so OpenAI does not see an AT minted on the previous SID's IP.
                     if (not use_fake_adapters()
+                            and not direct_session
                             and (need_st_reissue or need_oauth_reissue or _reissue_on_exit_enabled())):
                         cur_bundle = parse_session_bundle(raw_session)
                         if cur_bundle.session_token or cur_bundle.refresh_token:
@@ -2440,6 +2472,9 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     def credentials_current() -> bool:
         return vault.get(order_id) is secrets
 
+    hp_instance: list[Any] = []
+    hp_receipt: list[Any] = []
+
     def _run() -> PaymentOutcome:
         if not credentials_current():
             raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
@@ -2455,6 +2490,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                     getattr(view, "customer_session_client_secret", "") or ""),
                 email=billing.get("email") or "",
                 country=billing.get("country") or "",
+                plan=str(order.plan),
                 account_id=secrets.account_id,
                 checkout_id=getattr(view, "checkout_session_id", "") or "",
                 confirm_return_url=getattr(view, "confirm_return_url", "") or "",
@@ -2465,6 +2501,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 browser_context=BrowserContext.from_dict(getattr(secrets, "browser_context", None)),
                 purchase_attempt_id=getattr(secrets, "purchase_attempt_id", ""),
             )
+            hp_instance.append(hp)
             hp.credentials_current = credentials_current
             hp.receipt_expected_minor = _minor(view.amount, currency) if view.amount is not None else None
             try:
@@ -2472,6 +2509,27 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
             finally:
                 if isinstance(getattr(hp, "last_http_trace", None), dict):
                     view.failure_trace = hp.last_http_trace
+                if getattr(hp, "receipt_evidence", None) is not None:
+                    hp_receipt.append(hp.receipt_evidence)
+                client = getattr(hp, "client", None)
+                if client is not None and getattr(client, "access_token", ""):
+                    resolved_ua = getattr(client, "user_agent", "") or getattr(client, "ua", "")
+                    updated = {
+                        "accessToken": client.access_token,
+                        "sessionToken": getattr(client, "session_token", ""),
+                        "deviceId": getattr(client, "device_id", ""),
+                        "sessionId": getattr(client, "oai_session_id", ""),
+                        "userAgent": resolved_ua,
+                        "cookies": dict(getattr(client, "extra_cookies", None) or {}),
+                        "statsigContext": {
+                            "deviceId": getattr(client, "device_id", ""),
+                            "userAgent": resolved_ua,
+                            "country": getattr(client, "session_country", "") or "",
+                        },
+                    }
+                    if getattr(client, "refresh_token", ""):
+                        updated["refresh_token"] = client.refresh_token
+                    secrets.session = json.dumps(updated)
                 hp.close()
         if is_custom_checkout:
             # 输入框模式：浏览器已换好 pm_，服务端只做确认，不接触卡号
@@ -2541,6 +2599,40 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
             store.update_status(order_id, OrderStatus.FAILED)
             _set_payment_status(order_id, "failed")
             raise _from_domain(exc, session_reissued=view.session_reissued_for_country, nonteam=order.plan is not Plan.TEAM)
+        if exc.code is ErrorCode.SUBSCRIPTION_LIMIT:
+            msg = redact_sensitive(exc.message)[:240]
+            view.failure_code = str(exc.code.value)
+            view.last_error = msg
+            store.update_status(order_id, OrderStatus.REJECTED)
+            _set_payment_status(order_id, "failed", summary=msg)
+            store.persist(order_id)
+            return _protocol_out(order_id, state="rejected", code=str(exc.code.value), message=msg)
+        hp_ref = hp_instance[0] if hp_instance else None
+        pre_confirm = bool(
+            hp_ref is not None
+            and hp_ref.confirmation_started is False
+            and not (isinstance(getattr(hp_ref, "intent_id", ""), str) and hp_ref.intent_id)
+            and not (isinstance(getattr(hp_ref, "confirmed", None), dict) and hp_ref.confirmed)
+            and view.payment_intent_id is None
+            and view.observed_payment_id is None
+        )
+        if pre_confirm:
+            err_code = str((exc.detail or {}).get("code") or exc.code.value)
+            msg = redact_sensitive(exc.message)[:240]
+            logger.warning(
+                "protocol_pay_pre_confirm_failed id=%s code=%s stage=%s msg=%s",
+                order_id, err_code, getattr(hp_ref, "stage", "-"), msg,
+            )
+            view.failure_code = err_code
+            view.last_error = msg
+            store.update_status(order_id, OrderStatus.FAILED)
+            _set_payment_status(order_id, "failed", summary=msg)
+            store.persist(order_id)
+            return _protocol_out(order_id, state="failed", code=err_code, message=msg)
+        logger.warning(
+            "protocol_pay_unknown_domain id=%s code=%s msg=%s",
+            order_id, exc.code.value, redact_sensitive(exc.message)[:160],
+        )
         await _mark_payment_unknown(order)
         return _protocol_out(order_id, state="unknown", message=PAYMENT_UNCONFIRMED)
     except Exception as exc:
@@ -2568,6 +2660,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
             result = hosted_payment_result(body, view.checkout_session_id or "", view.checkout_url or "")
             if result.receipt_evidence is not None:
                 observed.append(result.receipt_evidence)
+        if hp_receipt and isinstance(hp_receipt[0], PaymentReceiptEvidence):
+            observed.append(hp_receipt[0])
         if (not observed or any(item != observed[0] for item in observed)
                 or (outcome.intent_id and observed[0].payment_id != outcome.intent_id)
                 or not _accept_receipt(order, observed[0])):
@@ -2576,6 +2670,11 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         delivered = await _verify_after_payment(order, view)
         response_state = "paid" if delivered else "pending"
         message = view.status_summary
+    elif outcome.state == "rejected":
+        msg = outcome.message or "上游业务拒绝"
+        _set_payment_status(order_id, "failed", summary=msg)
+        store.update_status(order_id, OrderStatus.REJECTED)
+        response_state, message = "rejected", msg
     elif outcome.state == "card_declined":
         _set_payment_status(order_id, "failed", summary=outcome.message or "支付失败")
         store.update_status(order_id, OrderStatus.FAILED)

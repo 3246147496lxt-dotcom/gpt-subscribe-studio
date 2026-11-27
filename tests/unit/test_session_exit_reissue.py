@@ -195,6 +195,161 @@ def test_reauthorize_for_country_can_preserve_session_ua(monkeypatch):
         client.close()
 
 
+def test_mac_exported_session_stays_macos_across_reauthorize_oauth_and_plushar(monkeypatch):
+    from gss_core import runtime_flags
+    from gss_core.session_token import parse_session_bundle
+
+    monkeypatch.setenv("GSS_WARMUP_INTERVAL", "0")
+    fresh_at = _make_jwt(account_id="acct-mac-parity")
+    mac_reduced_ua = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    )
+    win_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    )
+
+    class _Http:
+        def __init__(self):
+            self.headers: dict = {}
+            self.cookies = SimpleNamespace(
+                jar=SimpleNamespace(),
+                set=lambda *a, **k: None,
+                get_dict=lambda **k: {},
+            )
+
+        def get(self, url, **kwargs):
+            payload = {"accessToken": fresh_at}
+            return SimpleNamespace(status_code=200, text=json.dumps(payload), headers={}, json=lambda: payload)
+
+        def post(self, url, data=None, headers=None):
+            payload = {"access_token": fresh_at, "refresh_token": "rt-mac-2"}
+            return SimpleNamespace(status_code=200, text=json.dumps(payload), json=lambda: payload)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cg, "_new_session", lambda **kw: _Http())
+
+    # 1) 顶层 userAgent + 平台字段均可被识别，Mac session 重颁默认不退化成 Windows
+    raw_mac_top = json.dumps({
+        "accessToken": "old-at",
+        "sessionToken": "st-mac-top",
+        "userAgent": mac_reduced_ua,
+    })
+    bundle_mac = parse_session_bundle(raw_mac_top)
+    assert bundle_mac.user_agent == mac_reduced_ua
+    assert bundle_mac.os_hint == "macos"
+
+    client_clean = ChatGPTClient.reauthorize_for_country(
+        raw_mac_top, proxy="http://exit.invalid:8080", country="PH", preserve_user_agent=False,
+    )
+    try:
+        assert "Macintosh" in client_clean.user_agent
+        assert client_clean.user_agent != mac_reduced_ua
+        ident = {k.lower(): v for k, v in client_clean._identity_headers().items()}
+        assert ident["sec-ch-ua-platform"] == '"macOS"'
+        assert "sec-ch-ua-arch" not in ident
+        assert client_clean.sentinel_profile["sec_ch_ua_arch"] == '"arm"'
+        assert client_clean.sentinel_profile["platform"] == "MacIntel"
+        assert client_clean.sentinel_profile["platform_label"] == "macOS"
+    finally:
+        client_clean.close()
+
+    # 2) preserve_user_agent=True 保留缩减 UA，高熵版本号属性自动展开 .0.0.0 -> 真实构建号
+    client_keep = ChatGPTClient.reauthorize_for_country(
+        raw_mac_top, proxy="http://exit.invalid:8080", country="PH", preserve_user_agent=True,
+    )
+    try:
+        assert client_keep.user_agent == mac_reduced_ua
+        assert client_keep.chrome_build == "146.0.7680.180"
+        assert '"Google Chrome";v="146.0.7680.180"' in client_keep.sec_ch_ua_full_list
+        assert "146.0.0.0" not in client_keep.sec_ch_ua_full_list
+        client_keep._accepted_ch.update({"sec-ch-ua-full-version", "sec-ch-ua-full-version-list"})
+        ident = {k.lower(): v for k, v in client_keep._identity_headers().items()}
+        assert ident["sec-ch-ua-full-version"] == '"146.0.7680.180"'
+        assert '"Google Chrome";v="146.0.7680.180"' in ident["sec-ch-ua-full-version-list"]
+    finally:
+        client_keep.close()
+
+    # 2b) 超 3933B 的真实 NextAuth sessionToken 自动拆分为 .0/.1 分片 Cookie 并可无缝重组
+    big_st = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0.." + ("a" * 16) + "." + ("b" * 4270) + "." + ("c" * 22)  # release-check: ignore
+    assert len(big_st) > 3933
+    chunked_raw = json.dumps({"accessToken": "old-at", "sessionToken": big_st, "userAgent": mac_reduced_ua})
+    parsed_big = parse_session_bundle(chunked_raw)
+    assert parsed_big.session_token == big_st
+    assert "__Secure-next-auth.session-token.0" in parsed_big.cookies
+    assert len(parsed_big.cookies["__Secure-next-auth.session-token.0"]) == 3933
+    assert "__Secure-next-auth.session-token.1" in parsed_big.cookies
+    c_big = ChatGPTClient.from_raw_session(chunked_raw)
+    hdr_cookie = c_big._cookie_header()
+    assert "__Secure-next-auth.session-token.0=" in hdr_cookie
+    assert "__Secure-next-auth.session-token.1=" in hdr_cookie
+    assert "__Secure-next-auth.session-token=" not in hdr_cookie
+    assert "__Secure-next-auth.session-token" not in c_big._cookie_header(include_session_token=False)
+    # 仅带分片 Cookie 字典也能还原完整 sessionToken
+    reassembled_bundle = parse_session_bundle(json.dumps({"accessToken": "old-at", "cookies": parsed_big.cookies}))
+    assert reassembled_bundle.session_token == big_st
+
+    # 3) Windows 导出 session 在 auto 模式下（即使跑在 Mac 宿主机上）仍发 Windows 请求头
+    raw_win = json.dumps({"accessToken": "old-at", "sessionToken": "st-win", "userAgent": win_ua})
+    client_win = ChatGPTClient.reauthorize_for_country(
+        raw_win, proxy="http://exit.invalid:8080", country="PH", preserve_user_agent=False,
+    )
+    try:
+        assert "Windows NT" in client_win.user_agent
+        assert client_win._identity_headers()["sec-ch-ua-platform"] == '"Windows"'
+    finally:
+        client_win.close()
+
+    # 4) OAuth 重颁同样保持 macOS，不强切 Windows
+    raw_oauth_mac = json.dumps({
+        "refresh_token": "rt-mac-1",
+        "statsigContext": {"userAgent": mac_reduced_ua, "country": "US"},
+    })
+    client_oauth = ChatGPTClient.reauthorize_oauth(raw_oauth_mac, proxy="http://exit.invalid:8080", country="JP")
+    try:
+        assert "Macintosh" in client_oauth.user_agent
+        assert client_oauth._identity_headers()["sec-ch-ua-platform"] == '"macOS"'
+    finally:
+        client_oauth.close()
+
+    # 5) 裸 ST 无 UA 时，面板切「强制 macOS」全链路生效（含 Linux 服务器场景）
+    runtime_flags.update_flags({"client_os_profile": "macos"})
+    try:
+        raw_bare_st = json.dumps({"sessionToken": "st-bare-mac"})
+        client_forced = ChatGPTClient.reauthorize_for_country(
+            raw_bare_st, proxy="http://exit.invalid:8080", country="JP",
+        )
+        try:
+            assert "Macintosh" in client_forced.user_agent
+            assert client_forced._identity_headers()["sec-ch-ua-platform"] == '"macOS"'
+            assert client_forced.sentinel_profile["platform"] == "MacIntel"
+        finally:
+            client_forced.close()
+
+        from gss_core.har_device import DeviceProfile, apply_user_agent
+        dev = DeviceProfile.random(country="JP")
+        assert dev.os_key == "macos"
+        apply_user_agent(dev, mac_reduced_ua)
+        assert dev.chrome_build == "146.0.7680.180"
+    finally:
+        runtime_flags.reset_flags(["client_os_profile"])
+
+    # 6) PlusHarProtocol 同区 read_only 路径也把 Mac session 同步到 client + device
+    proto = PlusHarProtocol(session=raw_mac_top, exit_country="US", read_only=True)
+    monkeypatch.setattr(har, "restore_account", lambda *a, **k: None)
+    try:
+        proto._prepare()
+        assert proto.client is not None
+        assert "Macintosh" in proto.client.user_agent
+        assert proto.device.os_key == "macos"
+        assert proto.device.ch_platform == '"macOS"'
+    finally:
+        proto.close()
+
+
 def test_reauthorize_oauth_exchanges_refresh_token_on_target_exit(monkeypatch):
     fresh_at = _make_jwt(account_id="acct-oauth")
 

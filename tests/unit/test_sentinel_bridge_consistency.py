@@ -224,6 +224,7 @@ def test_bridge_pow_reuses_real_sentinel_sdk_req_fingerprint():
         # 与主站同一次 GREASE 轮换（低熵在前），哨兵高熵列表必须跟随。
         "secChUa": '"Not;A=Brand";v="24", "Chromium";v="150", "Google Chrome";v="150"',
         "secChUaPlatform": '"Windows"',
+        "dataBuild": "365a168c257ed41976cc0f3e9f74446546fe6852",
     }
     try:
         proc = subprocess.run(
@@ -244,18 +245,19 @@ def test_bridge_pow_reuses_real_sentinel_sdk_req_fingerprint():
     assert seen_reqs, "真实 sentinel_sdk.js 未发出 /sentinel/req"
 
     req_hdrs, raw_body = seen_reqs[0]
-    # 对齐 HAR：/sentinel/req 带全套高熵 Client Hints（含 arch / bitness / platform-version）。
-    # 缺后三项时同一出口下会出现「主站有、哨兵没有」的请求族差异。
-    assert req_hdrs.get("sec-ch-ua-full-version") == f'"{build}"'
-    assert req_hdrs.get("sec-ch-ua-model") == '""'
-    assert f'"Google Chrome";v="{build}"' in req_hdrs.get("sec-ch-ua-full-version-list", "")
-    assert req_hdrs.get("sec-ch-ua-arch") == '"x86"'
-    assert req_hdrs.get("sec-ch-ua-bitness") == '"64"'
-    assert req_hdrs.get("sec-ch-ua-platform-version") == '"10.0.0"'
-    # GREASE 品牌必须来自传入的 sec-ch-ua（不能写死 Not(A:Brand/24）。
+    # 2026-11-26 真机实测：chatgpt.com 未下发 Accept-CH，/sentinel/req 默认只发低熵三件套。
     assert req_hdrs.get("sec-ch-ua") == '"Not;A=Brand";v="24", "Chromium";v="150", "Google Chrome";v="150"'
-    assert '"Not;A=Brand";v="24.0.0.0"' in req_hdrs.get("sec-ch-ua-full-version-list", "")
-    assert "Not(A:Brand" not in req_hdrs.get("sec-ch-ua-full-version-list", "")
+    assert req_hdrs.get("sec-ch-ua-mobile") == "?0"
+    assert req_hdrs.get("sec-ch-ua-platform") == '"Windows"'
+    for he_hint in (
+        "sec-ch-ua-full-version",
+        "sec-ch-ua-full-version-list",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-bitness",
+        "sec-ch-ua-platform-version",
+        "sec-ch-ua-model",
+    ):
+        assert he_hint not in req_hdrs, f"默认 /sentinel/req 不应携带未协商的高熵头 {he_hint}"
 
     req_payload = json.loads(raw_body.decode("utf-8"))
     assert req_payload["p"].startswith("gAAAAAC"), "真实 sdk.js 前缀应为 gAAAAAC"
@@ -270,6 +272,7 @@ def test_bridge_pow_reuses_real_sentinel_sdk_req_fingerprint():
         assert pow_cfg[index] == req_cfg[index], f"真实 sdk.js config[{index}] 不一致: {pow_cfg[index]!r} != {req_cfg[index]!r}"
     assert pow_cfg[2] == 4294705152
     assert pow_cfg[5] == f"{origin}/sentinel/20260810913b/sdk.js"
+    assert pow_cfg[6] == "365a168c257ed41976cc0f3e9f74446546fe6852"
     assert "Philippine Standard Time" in pow_cfg[1]
     assert "Asia/Manila" not in pow_cfg[1]
     assert isinstance(pow_cfg[17], int)
@@ -323,6 +326,7 @@ def test_bridge_preserves_sec_ch_ua_order_and_edge_brand_and_query_keys():
         "availH": 1032,
         "secChUa": edge_ch,
         "secChUaPlatform": '"Windows"',
+        "sendHighEntropyHints": True,
     }
     try:
         proc = subprocess.run(

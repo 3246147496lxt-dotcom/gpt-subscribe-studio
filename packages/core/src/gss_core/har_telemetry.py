@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import logging
 import random
 import time
 import urllib.parse
@@ -27,6 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .har_device import DeviceProfile
+
+logger = logging.getLogger("gss.har_telemetry")
 
 
 @contextmanager
@@ -210,8 +213,9 @@ class StripeTelemetry:
         headers["cookie"] = f"m={self.guid}"
         try:
             response = self.http.post(f"{M_STRIPE}/6", content=_b64_url(payload),
-                                      headers=headers, timeout=15.0)
-            if int(getattr(response, "status_code", 0) or 0) == 200 and getattr(response, "content", b""):
+                                      headers=headers, timeout=12.0)
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status == 200 and getattr(response, "content", b""):
                 try:
                     body = response.json()
                 except Exception:  # noqa: BLE001
@@ -221,8 +225,10 @@ class StripeTelemetry:
                     if value:
                         setattr(self, name, value)
                         self._server_ids_seen = True
-        except Exception:  # noqa: BLE001 - telemetry must never block payment
-            pass
+            elif status >= 400:
+                logger.warning("m_stripe_fingerprint_http status=%s", status)
+        except Exception as exc:  # noqa: BLE001 - telemetry must never block payment
+            logger.warning("m_stripe_fingerprint_failed type=%s", type(exc).__name__)
         return payload
 
     def register(self) -> None:
@@ -234,6 +240,10 @@ class StripeTelemetry:
             "mouse-timings-10",
             [random.randint(20, 900) for _ in range(10)],
         ))
+        if not self._server_ids_seen:
+            # One extra retry on transient residential proxy blip so confirmation_tokens
+            # gets authoritative Stripe server guid/muid/sid without burning an order.
+            self._post_fingerprint(self._fingerprint_body(with_signals=True, with_ids=True))
         self._adopt_server_ids()
         self.registered = True
 
@@ -255,12 +265,10 @@ class StripeTelemetry:
     # ── js.stripe.com / m.stripe.network asset loads ───────────────
     ASSETS = (
         ("https://js.stripe.com/basil/stripe.js", "https://chatgpt.com/"),
-        ("https://js.stripe.com/v3/controller-with-preconnect-9a777715ca4969506d9d7a6674dae5b6.html",
+        ("https://js.stripe.com/v3/controller-with-preconnect-383201c9026508c5e8da5b2767322cfb.html",
          "https://chatgpt.com/"),
-        ("https://js.stripe.com/v3/fingerprinted/js/shared-690527f8d3c420a8fcc6f1886cb6306e.js",
-         "https://js.stripe.com/v3/controller-with-preconnect-9a777715ca4969506d9d7a6674dae5b6.html"),
-        ("https://js.stripe.com/v3/hcaptcha-invisible-958211fd0bbfc01588e6b70f4697cd72.html",
-         "https://js.stripe.com/"),
+        ("https://js.stripe.com/v3/fingerprinted/js/shared-4207ab3ac02a80504efdb2b7eb870a01.js",
+         "https://js.stripe.com/v3/controller-with-preconnect-383201c9026508c5e8da5b2767322cfb.html"),
         ("https://m.stripe.network/inner.html", "https://js.stripe.com/"),
         ("https://m.stripe.network/out-4.5.45.js", "https://m.stripe.network/inner.html"),
     )
@@ -268,6 +276,8 @@ class StripeTelemetry:
     def warm_assets(self) -> None:
         """The SDK/iframe resources the capture loads before fingerprinting."""
         for url, referer in self.ASSETS:
+            if self.deadline and time.time() > self.deadline:
+                return
             is_html = url.endswith(".html")
             url_host = urllib.parse.urlsplit(url).netloc
             ref_host = urllib.parse.urlsplit(referer).netloc
@@ -296,7 +306,7 @@ class StripeTelemetry:
                 omit.add("cookie")
             try:
                 with _without_headers(self.http, omit):
-                    self.http.get(url, headers=headers, timeout=10.0)
+                    self.http.get(url, headers=headers, timeout=4.0)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -428,7 +438,7 @@ class StripeTelemetry:
             })
             try:
                 self.http.post(f"{R_STRIPE}/b", content=body,
-                               headers=self.device.stripe_headers(), timeout=10.0)
+                               headers=self.device.stripe_headers(), timeout=4.0)
                 failures = 0
             except Exception:  # noqa: BLE001
                 failures += 1

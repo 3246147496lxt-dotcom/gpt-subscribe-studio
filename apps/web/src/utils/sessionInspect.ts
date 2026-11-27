@@ -3,10 +3,48 @@ export type SessionInspection = {
   summary: string;
   maskedEmail?: string;
   accountPrefix?: string;
+  detectedOs?: "macOS" | "Windows" | "Linux";
   hasRefreshCredential: boolean;
   hasCookies: boolean;
   expiresInSeconds?: number;
 };
+
+function detectOsFromJson(obj: Record<string, unknown>): "macOS" | "Windows" | "Linux" | undefined {
+  const statsigRaw = obj.statsigContext ?? obj.statsig_context ?? obj.statsig;
+  let statsig: Record<string, unknown> | null = null;
+  if (statsigRaw && typeof statsigRaw === "object" && !Array.isArray(statsigRaw)) {
+    statsig = statsigRaw as Record<string, unknown>;
+  } else if (typeof statsigRaw === "string" && statsigRaw.trim().startsWith("{")) {
+    try {
+      const parsed = JSON.parse(statsigRaw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        statsig = parsed as Record<string, unknown>;
+      }
+    } catch {
+      statsig = null;
+    }
+  }
+  const candidates = [
+    statsig?.userAgent, statsig?.user_agent, statsig?.ua,
+    obj.userAgent, obj.user_agent, obj.ua,
+    statsig?.["sec-ch-ua-platform"], statsig?.sec_ch_ua_platform, statsig?.platform, statsig?.os,
+    obj["sec-ch-ua-platform"], obj.sec_ch_ua_platform, obj.platform, obj.os,
+  ];
+  for (const item of candidates) {
+    if (typeof item !== "string" || !item.trim()) continue;
+    const low = item.replace(/^"+|"+$/g, "").trim().toLowerCase();
+    if (low.includes("macintosh") || low.includes("mac os") || low.includes("macos") || low.includes("darwin") || low === "mac") {
+      return "macOS";
+    }
+    if (low.includes("windows") || low.includes("win32") || low === "win") {
+      return "Windows";
+    }
+    if (low.includes("linux") || low.includes("x11")) {
+      return "Linux";
+    }
+  }
+  return undefined;
+}
 
 function decodeBase64Url(segment: string): string | null {
   try {
@@ -71,6 +109,7 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
 
   let accessToken = "";
   let email = "";
+  let detectedOs: "macOS" | "Windows" | "Linux" | undefined;
   let hasRefreshCredential = false;
   let hasCookies = false;
 
@@ -100,6 +139,7 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
     if (typeof tokenCandidate === "string") {
       accessToken = tokenCandidate.trim();
     }
+    detectedOs = detectOsFromJson(obj);
     const userObj = obj.user && typeof obj.user === "object" ? (obj.user as Record<string, unknown>) : null;
     if (userObj && typeof userObj.email === "string") {
       email = userObj.email.trim();
@@ -144,6 +184,7 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
           state: "refresh_only",
           summary: "未包含 accessToken，但检测到刷新凭证，建单时将尝试自动刷新",
           maskedEmail: email ? maskEmail(email) : undefined,
+          detectedOs,
           hasRefreshCredential,
           hasCookies,
         };
@@ -152,6 +193,7 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
         state: "invalid",
         summary: "JSON 中缺少 accessToken（也未找到刷新凭证），请重新导出完整 Session",
         maskedEmail: email ? maskEmail(email) : undefined,
+        detectedOs,
         hasRefreshCredential: false,
         hasCookies,
       };
@@ -187,6 +229,7 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
       state: "opaque",
       summary: "已识别 accessToken（非标准 JWT 结构，将在提交时由服务端核验）",
       maskedEmail: email ? maskEmail(email) : undefined,
+      detectedOs,
       hasRefreshCredential,
       hasCookies,
     };
@@ -213,6 +256,7 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
           : `accessToken 已过期 ${formatRemainingDuration(remaining)} 且无刷新凭证，请重新导出`,
         maskedEmail,
         accountPrefix,
+        detectedOs,
         hasRefreshCredential,
         hasCookies,
         expiresInSeconds: Math.round(remaining),
@@ -224,6 +268,7 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
         summary: `accessToken 即将过期（剩余 ${formatRemainingDuration(remaining)}）`,
         maskedEmail,
         accountPrefix,
+        detectedOs,
         hasRefreshCredential,
         hasCookies,
         expiresInSeconds: Math.round(remaining),
@@ -234,6 +279,7 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
       summary: `凭证有效，剩余约 ${formatRemainingDuration(remaining)}`,
       maskedEmail,
       accountPrefix,
+      detectedOs,
       hasRefreshCredential,
       hasCookies,
       expiresInSeconds: Math.round(remaining),
@@ -245,6 +291,7 @@ export function inspectSession(raw: string, nowMs: number = Date.now()): Session
     summary: "已解析 Session JWT 结构",
     maskedEmail,
     accountPrefix,
+    detectedOs,
     hasRefreshCredential,
     hasCookies,
   };

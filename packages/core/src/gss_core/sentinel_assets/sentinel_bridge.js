@@ -135,6 +135,7 @@ function makeGenerator(ua, cores, language, timezone, screenW, screenH, opts) {
     sid: overrides.sid || uuidv4(),
     heapLimit: Number(overrides.heapLimit) || 4294705152,
     sdkUrl: String(overrides.sdkUrl || ""),
+    dataBuild: String(overrides.dataBuild || ""),
     pageUrl: String(overrides.pageUrl || ""),
     // 与真实浏览器一致：screen.width + screen.height（指纹数组 [0]）
     screenNum: sw + sh,
@@ -201,7 +202,7 @@ function configArray(g) {
     0, // 3 PoW 计数器
     g.ua, // 4
     g.sdkUrl, // 5 与 sandbox.__SDK_URL__ 完全一致
-    null, // 6
+    g.dataBuild || null, // 6 首页 <html data-build="..."> 构建哈希
     g.language, // 7
     g.languages.join(","), // 8
     g.nine, // 9
@@ -332,10 +333,33 @@ function isGreaseBrand(brand, version, major) {
   return Boolean(version) && version !== major;
 }
 
+const _KNOWN_FULL_BUILDS = {
+  "150": "150.0.7871.189",
+  "146": "146.0.7680.180",
+  "145": "145.0.7632.116",
+  "142": "142.0.7444.175",
+  "136": "136.0.7103.114",
+  "133": "133.0.6943.141",
+};
+
+function expandReducedBuild(build) {
+  const s = String(build || "").trim();
+  const parts = s.split(".");
+  if (parts.length === 4 && parts[1] === "0" && parts[2] === "0" && parts[3] === "0") {
+    if (_KNOWN_FULL_BUILDS[parts[0]]) return _KNOWN_FULL_BUILDS[parts[0]];
+    const majorInt = parseInt(parts[0], 10);
+    if (Number.isFinite(majorInt)) {
+      const branch = Math.max(6000, 6943 + (majorInt - 133) * 55);
+      return `${parts[0]}.0.${branch}.112`;
+    }
+  }
+  return s;
+}
+
 function highEntropyClientHints(ua, extra, secChUa) {
   const m = String(ua || "").match(/(?:Chrome|CriOS)\/(\d+(?:\.\d+)*)/);
   if (!m) return {};
-  const build = m[1];
+  const build = expandReducedBuild(m[1]);
   const major = build.split(".")[0] || "150";
   const hints = Object.assign({}, extra || {});
   const tokens = parseSecChUaTokens(secChUa);
@@ -363,11 +387,11 @@ function highEntropyClientHints(ua, extra, secChUa) {
   };
 }
 
-function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOrigin, frameUrl, secChUa, secChUaPlatform, capture, clientHints) {
-  // sdk 里的 fetch 桥到 fetchImpl：改写 URL 到 sentinel.openai.com、补头、走代理。
-  // 关键：dispatcher 与 fetchImpl 必须来自同一个 undici 版本，否则 Node 内置 fetch
-  // 校验外部 dispatcher 的 Request handler 会报 "invalid onRequestStart method"。
-  const extraHints = secChUa ? highEntropyClientHints(ua, clientHints, secChUa) : {};
+function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOrigin, frameUrl, secChUa, secChUaPlatform, capture, clientHints, sendHighEntropyHints) {
+  // sdk 里的 fetch 桥到 fetchImpl：改写 URL 到 sentinelOrigin、补头、走代理。
+  // 2026-11-26 真机实测：chatgpt.com 未下发 Accept-CH，/backend-api/sentinel/req
+  // 仅发低熵三件套（sec-ch-ua / -mobile / -platform），仅在显式开启时附加高熵 hints。
+  const extraHints = (secChUa && sendHighEntropyHints) ? highEntropyClientHints(ua, clientHints, secChUa) : {};
   return function (url, opts) {
     opts = opts || {};
     let u = String(url);
@@ -712,6 +736,8 @@ async function handleRequest(raw) {
   const { performance: hostPerformance } = require("perf_hooks");
   const capture = { reqBody: "" };
   const sdkUrl = `${sentinelOrigin}/sentinel/${version}/sdk.js`;
+  const dataBuild = String(args.dataBuild || "").trim();
+  const sendHighEntropyHints = Boolean(args.sendHighEntropyHints);
   const sandbox = {
     console,
     setTimeout,
@@ -731,7 +757,8 @@ async function handleRequest(raw) {
       secChUa,
       secChUaPlatform,
       capture,
-      clientHints
+      clientHints,
+      sendHighEntropyHints
     ),
     TextEncoder,
     TextDecoder,
@@ -744,6 +771,7 @@ async function handleRequest(raw) {
     __CORES__: cores,
     __FLOW__: flow,
     __SDK_URL__: sdkUrl,
+    __DATA_BUILD__: dataBuild,
     __SEED_DID_KEY__: "oai-did",
     __SEED_DID_VAL__: deviceId,
     __PAGE_URL__: pageUrl,
@@ -822,6 +850,7 @@ async function handleRequest(raw) {
     initialPerformance: sandbox.__SENTINEL_PERF__,
     heapLimit: sandbox.__SENTINEL_HEAP_LIMIT__,
     sdkUrl: sandbox.__SDK_URL__,
+    dataBuild,
     pageUrl,
   });
   // sdk.js 自己发到 /sentinel/req 的指纹数组是同一 flow 的第一份自述；

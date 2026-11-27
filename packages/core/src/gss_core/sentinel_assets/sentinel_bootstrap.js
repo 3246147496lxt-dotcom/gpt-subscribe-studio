@@ -292,7 +292,27 @@
 
   var _uaStr = String(g.__UA__ || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.7871.189 Safari/537.36");
   var _uaMatch = _uaStr.match(/(?:Chrome|CriOS)\/(\d+(?:\.\d+)*)/);
-  var _fullVer = _uaMatch ? _uaMatch[1] : "150.0.7871.189";
+  var _knownFullBuilds = {
+    "150": "150.0.7871.189",
+    "146": "146.0.7680.180",
+    "145": "145.0.7632.116",
+    "142": "142.0.7444.175",
+    "136": "136.0.7103.114",
+    "133": "133.0.6943.141"
+  };
+  var _rawVer = _uaMatch ? _uaMatch[1] : "150.0.7871.189";
+  var _verParts = _rawVer.split(".");
+  var _fullVer = _rawVer;
+  if (_verParts.length === 4 && _verParts[1] === "0" && _verParts[2] === "0" && _verParts[3] === "0") {
+    if (_knownFullBuilds[_verParts[0]]) {
+      _fullVer = _knownFullBuilds[_verParts[0]];
+    } else {
+      var _mInt = parseInt(_verParts[0], 10);
+      if (isFinite(_mInt)) {
+        _fullVer = _verParts[0] + ".0." + Math.max(6000, 6943 + (_mInt - 133) * 55) + ".112";
+      }
+    }
+  }
   var _majorVer = _fullVer.split(".")[0] || "150";
   var _platLabel = String(g.__PLATFORM_LABEL__ || "Windows");
   var _brands = parseBrandList(g.__SEC_CH_UA__);
@@ -816,8 +836,12 @@
     getAttribute: makeNonCtor(function () { return null; }, "getAttribute"),
     type: "text/javascript"
   });
+  var _dataBuildStr = String(g.__DATA_BUILD__ || "");
   var docElement = tagObj("HTMLHtmlElement", {
-    getAttribute: makeNonCtor(function () { return null; }, "getAttribute"),
+    getAttribute: makeNonCtor(function (k) {
+      if (k === "data-build" && _dataBuildStr) return _dataBuildStr;
+      return null;
+    }, "getAttribute"),
     tagName: "HTML",
     lang: _navLanguage
   });

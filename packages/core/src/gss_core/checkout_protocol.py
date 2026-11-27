@@ -222,8 +222,14 @@ def _app_confirm(client: ChatGPTClient, context: dict) -> dict | None:
         res["_http_trace"] = trace
         return res
     if str(payload.get("status") or "").lower() in {"blocked", "failed", "error", "subscription_limit"}:
-        result = outcome("request_rejected", "payment", redact_sensitive(str(payload.get("message") or "商户未接受本次结账确认"))[:240])
-        if str(payload.get("status") or "").lower() == "subscription_limit":
+        is_sub_limit = str(payload.get("status") or "").lower() == "subscription_limit"
+        default_msg = (
+            "该银行卡或设备关联的订阅数量已达上限（subscription_limit），本次未扣款；请更换银行卡或隔离设备环境后重试"
+            if is_sub_limit
+            else "商户未接受本次结账确认"
+        )
+        result = outcome("request_rejected", "payment", redact_sensitive(str(payload.get("message") or default_msg))[:240])
+        if is_sub_limit:
             result["code"] = str(ErrorCode.SUBSCRIPTION_LIMIT)
         result["_http_trace"] = build_redacted_http_trace(
             title="Checkout 确认",

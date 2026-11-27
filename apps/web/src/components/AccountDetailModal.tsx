@@ -99,12 +99,14 @@ export function AccountInspectorPanel({
         session: session.trim(),
         accountId: detail.accountId,
       });
-      setCancelNotice(
-        res.message
-          || (res.already_canceled ? "该账号的自动续费已处于关闭状态。" : "已关闭下期自动续费，当前周期权益保持不变。"),
-      );
       if (res.canceled || res.already_canceled) {
+        setCancelNotice(
+          res.message
+            || (res.already_canceled ? "该账号的自动续费已处于关闭状态。" : "已关闭下期自动续费，当前周期权益保持不变。"),
+        );
         setDetail((prev) => (prev ? { ...prev, autoRenew: "已关闭" } : prev));
+      } else {
+        setError(res.message || "未能关闭自动续费，请稍后重试。");
       }
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "关闭自动续费失败，请稍后重试。");
@@ -134,7 +136,7 @@ export function AccountInspectorPanel({
         disabled={loading}
       />
       <Group justify="flex-end">
-        <Button onClick={() => void run(false)} loading={loading} disabled={!session.trim()}>
+        <Button onClick={() => void run(true)} loading={loading} disabled={!session.trim()}>
           查询详情
         </Button>
       </Group>
@@ -163,7 +165,6 @@ export function AccountInspectorPanel({
           <Group justify="space-between" align="center" wrap="wrap">
             <Group gap="xs">
               <Text fw={700} size="lg">{detail.email || "未知账号"}</Text>
-              {detail.cached && <Badge variant="outline" color="gray">缓存</Badge>}
             </Group>
             <StatusBadge status={detail.status} />
           </Group>

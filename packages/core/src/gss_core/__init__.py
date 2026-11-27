@@ -13,7 +13,7 @@ from .config import load_settings, missing_upstreams, use_fake_adapters
 from .session_token import parse_session
 from .vault import OrderSecrets, SecretVault, vault
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",

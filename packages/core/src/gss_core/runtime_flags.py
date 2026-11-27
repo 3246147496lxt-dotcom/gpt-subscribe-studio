@@ -58,11 +58,10 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="reissue_session_on_exit",
         category="session",
-        label="建单前始终用 ST 在当前出口重颁新 AT",
+        label="建单前强制重颁新 AT（ST → AT）",
         description=(
-            "真实上游模式下，只要 Session 包含 sessionToken（ST）或 OAuth refresh_token，"
-            "建单前一律先丢弃旧 AT 与旧浏览器 Cookie，在本次充值代理出口重新签发新 AT，"
-            "降低因 IP/UA/环境漂移触发 401 token_revoked 的概率。"
+            "真实上游模式下，建单前先丢弃旧 AT 与旧 Cookie，使用 sessionToken（ST）或 OAuth refresh_token "
+            "在当前代理出口重新签发新 AT。若已开启「直通模式」且 AT 未过期，则自动跳过重颁。"
         ),
         kind="bool",
         env_var="GSS_REISSUE_SESSION_ON_EXIT",
@@ -71,20 +70,50 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="reissue_keep_ua",
         category="session",
-        label="重颁 AT 时沿用原 Session 的 User-Agent",
+        label="原样保留原 Session 的 User-Agent",
         description=(
-            "关闭时使用与 curl_cffi TLS 指纹一致的干净出口 Chrome UA；"
-            "开启后在请求 /api/auth/session 时优先沿用导出 Session 中自带的原 userAgent。"
+            "关闭（默认）时自动匹配原 Session 同系统（Mac/Win）的干净 Chrome 构建号；"
+            "开启后完整保留原 Session 里的 UA 字符串，并自动展开缩减版 .0.0.0 版本号。"
         ),
         kind="bool",
         env_var="GSS_REISSUE_KEEP_UA",
         default=False,
     ),
     FlagSpec(
+        key="client_os_profile",
+        category="session",
+        label="客户端系统画像（macOS / Windows / Linux）",
+        description=(
+            "控制请求头、Client Hints 与 Sentinel 沙箱的系统标识：「自动跟随」优先按 session.json 导出端自动匹配 "
+            "（Mac 导出发 macOS、Win 导出发 Windows），无 UA 的裸 ST 跟随宿主机系统；Linux 服务器专跑 Mac 裸 ST 可选「强制 macOS」。"
+        ),
+        kind="enum",
+        env_var="GSS_CLIENT_OS_PROFILE",
+        default="auto",
+        options=(
+            ("auto", "自动跟随（Session → 本机）"),
+            ("macos", "强制 macOS"),
+            ("windows", "强制 Windows"),
+            ("linux", "强制 Linux"),
+        ),
+    ),
+    FlagSpec(
+        key="direct_session_checkout",
+        category="session",
+        label="直通建单模式（免重颁、保留原 oai-did）",
+        description=(
+            "当 session.json 已含未过期 accessToken 时，保留原 oai-did 与 accessToken，不冷调 /api/auth/session，"
+            "直接在目标出口完成首页、账号与定价预热后发起建单（对齐真机空白环境实测）。"
+        ),
+        kind="bool",
+        env_var="GSS_DIRECT_SESSION_CHECKOUT",
+        default=False,
+    ),
+    FlagSpec(
         key="warm_account",
         category="session",
-        label="跨区重颁后预热账号接口 (/backend-api/me)",
-        description="跨区重颁新 AT 后额外等待 1–1.5 秒并探测一次 /backend-api/me；默认关闭以保持主链路精简。",
+        label="重颁后额外预热账号接口 (/backend-api/me)",
+        description="仅在走重颁模式时生效：重颁新 AT 后额外停顿 1–1.5 秒并探测一次 /backend-api/me。",
         kind="bool",
         env_var="GSS_WARM_ACCOUNT",
         default=False,
@@ -92,8 +121,8 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="proxy_preflight",
         category="session",
-        label="刷新 Session 前校验代理出口与国家一致性",
-        description="发送 sessionToken 前先通过无凭证探针核验代理 IP 与归属国，异常时直接中止且不外发凭证。",
+        label="重颁前校验代理出口国家一致性",
+        description="外发 sessionToken 前先用无凭证探针核对代理出口 IP 归属国，不匹配立即中止且不外发凭证。",
         kind="bool",
         env_var="GSS_PROXY_PREFLIGHT",
         default=False,
@@ -102,8 +131,8 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="plus_engine",
         category="protocol",
-        label="Plus 支付协议引擎",
-        description="选择 Plus / Go / Pro 家族在 oaics_ 链路下的协议实现：默认 HAR 逐请求复刻，可按需切回 legacy。",
+        label="Plus / Pro 支付协议引擎",
+        description="选择 oaics_ 结账链路的支付协议实现：默认 HAR 逐请求复刻，可按需切回 legacy 旧版直付。",
         kind="enum",
         env_var="GSS_PLUS_ENGINE",
         default="har",
@@ -115,8 +144,8 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="har_telemetry",
         category="protocol",
-        label="HAR 浏览器遥测与指纹回放",
-        description="控制是否完整回放 m.stripe.com/6、r.stripe.com/b、CES 及 /sentinel/ping；关闭可缩短耗时但可能提高风控概率。",
+        label="Stripe 遥测与指纹回放",
+        description="控制是否完整回放 m.stripe.com/6、r.stripe.com/b、CES 及 /sentinel/ping；关闭可提速但可能抬高风控。",
         kind="enum",
         env_var="GSS_HAR_TELEMETRY",
         default="full",
@@ -128,8 +157,8 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="checkout_rotate",
         category="protocol",
-        label="建单代理隧道握手失败时自动轮换 SID 重试",
-        description="仅在连接建立前出现代理隧道/TLS 握手失败且未收到任何上游响应时轮换一次 SID 重试，绝不重放已提交请求。",
+        label="建单代理超时自动换节点重试",
+        description="连接建立前遇到代理隧道超时 / TLS 握手失败（未提交业务请求）时自动切换新 SID 重试一次，避免单节点卡死。",
         kind="bool",
         env_var="GSS_CHECKOUT_ROTATE",
         default=False,
@@ -137,8 +166,8 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="require_exit_billing_match",
         category="protocol",
-        label="严格模式：强制出口地区与固定账单国家一致",
-        description="默认关闭（固定美国免税账单 + 自由切换任意出口地区）；开启后所选出口必须与固定账单国家一致。",
+        label="严格模式：出口国必须与账单国一致",
+        description="关闭（默认）时支持固定美国免税账单 + 任意低价区出口；开启后强制出口国家必须与账单国相同。",
         kind="bool",
         env_var="GSS_REQUIRE_EXIT_BILLING_MATCH",
         default=False,
@@ -147,8 +176,8 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="quick_pay_concurrency",
         category="runtime",
-        label="一键充值最大并发任务数",
-        description="全局同时执行的 quick-pay 槽位数（1–16）；同一账号始终串行，不受此数值影响。",
+        label="一键充值全局最大并发数",
+        description="同时执行的一键充值任务槽位上限（1–16）；同一账号始终串行，不受此数值影响。",
         kind="int",
         env_var="GSS_QUICK_PAY_CONCURRENCY",
         default=3,
@@ -158,8 +187,8 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="preflight_strict",
         category="runtime",
-        label="一键充值入队严格拦截（缺账单直接拒绝）",
-        description="开启后若缺少固定核验账单文件，任务在前置体检阶段即直接拦截失败，不再进入建单阶段。",
+        label="入队前置严格拦截（缺账单直接拒绝）",
+        description="开启后若未配置固定免税账单，任务在前置体检阶段即直接拦截，不进入建单阶段。",
         kind="bool",
         env_var="GSS_PREFLIGHT_STRICT",
         default=False,
@@ -167,8 +196,8 @@ FLAG_SPECS: Tuple[FlagSpec, ...] = (
     FlagSpec(
         key="reconciler_enabled",
         category="runtime",
-        label="启用后台只读自动对账补偿器",
-        description="后台定期对 paid_pending_delivery 与 unknown 订单执行纯只读状态核验与自动核销，绝不发起扣款。",
+        label="后台只读自动对账补偿",
+        description="定期对「待核验」与「未知状态」订单做纯只读订阅核对与自动交付，绝不重复扣款。",
         kind="bool",
         env_var="GSS_RECONCILER_ENABLED",
         default=True,

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gss-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "共享底座：脱敏日志、配置加载、传输工具（gpt-subscribe-studio）"
 requires-python = ">=3.10"
 dependencies = [

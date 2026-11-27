@@ -28,19 +28,32 @@ def _check_lease(client):
 def restore_account(
     client: ChatGPTClient, expected: str = "", *, trust_statsig: bool = True, credentials_current=None
 ) -> str:
+    from . import runtime_flags
+    from .session_token import is_access_token_expired
+
     def require_credentials():
         _check_lease(client)
         if credentials_current is not None and not credentials_current():
             raise DomainError(ErrorCode.SESSION_EXPIRED, "订单凭证已过期")
 
     require_credentials()
-    refreshed = (
-        client.refresh_session()
-        if trust_statsig
-        else client.refresh_session(trust_statsig=False)
+    skip_refresh = bool(
+        runtime_flags.get_bool("direct_session_checkout")
+        and getattr(client, "access_token", "")
+        and not is_access_token_expired(client.access_token, leeway_seconds=60)
     )
-    if refreshed:
-        client.account_id = jwt_account_id(client.access_token)
+    if skip_refresh:
+        parsed_account = jwt_account_id(client.access_token)
+        if parsed_account:
+            client.account_id = parsed_account
+    else:
+        refreshed = (
+            client.refresh_session()
+            if trust_statsig
+            else client.refresh_session(trust_statsig=False)
+        )
+        if refreshed:
+            client.account_id = jwt_account_id(client.access_token)
     require_credentials()
     client.hydrate()
     account_id = str(client.account_id or "")

@@ -224,7 +224,16 @@ class DeviceProfile:
         # macOS UA on a Linux box is the cross-check hCaptcha/Radar catches, so
         # the OS follows the machine unless an operator pins another one.
         host = _host_fingerprint()
-        chosen = os_key or os.environ.get("GSS_DEVICE_OS") or host.get("os") or _detect_os()
+        flag_os = ""
+        try:
+            from . import runtime_flags
+
+            candidate_os = runtime_flags.get_str("client_os_profile")
+            if candidate_os in _OS_PROFILES:
+                flag_os = candidate_os
+        except Exception:  # noqa: BLE001
+            flag_os = ""
+        chosen = os_key or flag_os or os.environ.get("GSS_DEVICE_OS") or host.get("os") or _detect_os()
         os_key = chosen if chosen in _OS_PROFILES else _detect_os()
         prof = _OS_PROFILES[os_key]
 
@@ -363,21 +372,26 @@ class DeviceProfile:
     def chrome_px(self) -> int:
         return self.screen_h - self.avail_h
 
-    def client_hint_headers(self) -> Dict[str, str]:
-        """`sec-ch-ua*` exactly as the capture sends them (no mobile hints on
-        desktop, empty model string included)."""
+    def client_hint_headers(self, *, include_high_entropy: bool = False) -> Dict[str, str]:
+        """`sec-ch-ua*` headers.
+
+        2026-11-26 live capture confirmed chatgpt.com never returns `Accept-CH`,
+        so real Chrome only sends the 3 low-entropy hints on chatgpt.com.
+        High-entropy hints are opt-in (RFC 8942) when requested explicitly.
+        """
         headers = {
             "sec-ch-ua": self.sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": self.ch_platform,
         }
-        if self.ch_platform_version:
-            headers["sec-ch-ua-platform-version"] = f'"{self.ch_platform_version}"'
-        headers["sec-ch-ua-arch"] = self.ch_arch
-        headers["sec-ch-ua-bitness"] = self.ch_bitness
-        headers["sec-ch-ua-full-version"] = f'"{self.sec_ch_ua_full_version}"'
-        headers["sec-ch-ua-full-version-list"] = self.sec_ch_ua_full_version_list
-        headers["sec-ch-ua-model"] = '""'
+        if include_high_entropy:
+            if self.ch_platform_version:
+                headers["sec-ch-ua-platform-version"] = f'"{self.ch_platform_version}"'
+            headers["sec-ch-ua-arch"] = self.ch_arch
+            headers["sec-ch-ua-bitness"] = self.ch_bitness
+            headers["sec-ch-ua-full-version"] = f'"{self.sec_ch_ua_full_version}"'
+            headers["sec-ch-ua-full-version-list"] = self.sec_ch_ua_full_version_list
+            headers["sec-ch-ua-model"] = '""'
         return headers
 
     def accept_language(self) -> str:
@@ -408,6 +422,7 @@ class DeviceProfile:
             "user-agent": self.ua,
             "x-openai-checkout-source": "chatgpt_web_merged",
             "x-openai-rate-limit-join-workspace": "1",
+            "x-openai-rejoin-pro-cta": "1",
         }
 
     def stripe_headers(self) -> Dict[str, str]:
@@ -547,7 +562,9 @@ def apply_user_agent(device: "DeviceProfile", user_agent: str) -> "DeviceProfile
         device.memory = prof["memory"][0]
     match = re.search(r"(?:Chrome|CriOS)/([0-9][0-9.]*)", text)
     if match:
-        device.chrome_build = match.group(1)
+        from .chatgpt import expand_reduced_chrome_build
+
+        device.chrome_build = expand_reduced_chrome_build(match.group(1), key)
         device.chrome_major = device.chrome_build.split(".", 1)[0]
         device.impersonate = _nearest_impersonate(device.chrome_major)
     device.ua = text

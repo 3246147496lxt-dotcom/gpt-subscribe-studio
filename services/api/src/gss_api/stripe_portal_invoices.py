@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
 from gss_core.chatgpt import _new_session
+from gss_core.redaction import redact_sensitive
 
 logger = logging.getLogger("gss.account_detail")
 
@@ -676,6 +677,18 @@ def _launch_chromium(pw: Any) -> Any:
             return pw.chromium.launch(headless=True, channel=channel)
         except Exception:  # noqa: BLE001
             continue
+    for system_path in (
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ):
+        if os.path.isfile(system_path):
+            try:
+                return pw.chromium.launch(headless=True, executable_path=system_path)
+            except Exception:  # noqa: BLE001
+                continue
     return pw.chromium.launch(headless=True)
 
 
@@ -1494,7 +1507,7 @@ def _cancel_portal_subscription_browser(
             "buttons": final_buttons[:8],
         }
     except Exception as exc:  # noqa: BLE001
-        logger.info("account_detail_portal_cancel_error type=%s", type(exc).__name__)
+        logger.info("account_detail_portal_cancel_error type=%s detail=%s", type(exc).__name__, redact_sensitive(str(exc))[:180])
         return {
             "canceled": False,
             "stage": "browser_error",

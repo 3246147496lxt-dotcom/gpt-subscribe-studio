@@ -29,7 +29,7 @@ export const STAGE_LABEL: Record<string, string> = {
 export const FAILURE_LABEL: Record<string, string> = {
   card_declined: "发卡行拒绝付款；请核对银行记录",
   insufficient_funds: "卡片余额不足",
-  subscription_limit: "账号已达到订阅上限；请核对现有订阅",
+  subscription_limit: "该银行卡或设备关联的订阅数量已达上限；请更换卡片或隔离设备环境",
   already_subscribed: "当前账号已是有效订阅状态，无需重复开通",
   unusual_activity: "上游拒绝了本次请求",
   sentinel_challenge_failed: "安全验证失败；已熔断，未继续扣款",

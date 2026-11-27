@@ -540,13 +540,7 @@ async def public_subscription_detail(payload: AccountSubscriptionRequest) -> Acc
     account_id = payload.account_id.strip() or credentials["account_id"]
     key = account_id or email.lower()
     db = get_db_optional()
-    existing_cached = db.get_account_snapshot(key) if (db is not None and key) else None
-    if existing_cached and existing_cached.get("cacheVersion") == CACHE_VERSION and not payload.force_refresh:
-        cached_out = {**existing_cached, "cached": True, "stale": False}
-        if not cached_out.get("invoices") and cached_out.get("billingSource") in {"loading", "stripe_portal_timeout"}:
-            cached_out["billingSource"] = "loading"
-            cached_out["billingNote"] = None
-        return AccountSubscriptionOut(**cached_out)
+    # Always query upstream live on manual account checks; never serve cached or stale snapshots.
     try:
         if payload.include_invoices:
             merged = await fetch_snapshot(
@@ -563,29 +557,11 @@ async def public_subscription_detail(payload: AccountSubscriptionRequest) -> Acc
                 country=credentials["session_country"] or "US",
             )
     except DomainError as exc:
-        if existing_cached and existing_cached.get("cacheVersion") == CACHE_VERSION and exc.code is not ErrorCode.INVALID_SESSION:
-            return AccountSubscriptionOut(**{
-                **existing_cached, "cached": True, "stale": True,
-                "warning": "上游暂时不可用，显示上次查询结果。",
-            })
         raise _account_http(exc) from None
     detail = normalize(merged, email=email, account_id=account_id)
-    # Persist updated basic snapshot while never wiping previously verified invoices on a deferred/timeout run.
     if db is not None and key:
-        to_save = dict(detail)
-        if (
-            not to_save["invoices"]
-            and to_save.get("billingSource") in {"loading", "stripe_portal_timeout"}
-            and existing_cached
-            and existing_cached.get("invoices")
-        ):
-            to_save["invoices"] = existing_cached["invoices"]
-            to_save["billingSource"] = existing_cached.get("billingSource") or "stripe_portal"
-            to_save["billingNote"] = None
-            if payload.include_invoices:
-                detail = dict(to_save)
         db.save_account_snapshot(
-            key, email=email, account_id=account_id, detail=to_save, queried_at=to_save["queriedAt"],
+            key, email=email, account_id=account_id, detail=detail, queried_at=detail["queriedAt"],
         )
     return AccountSubscriptionOut(**detail)
 

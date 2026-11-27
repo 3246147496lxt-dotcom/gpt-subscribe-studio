@@ -121,7 +121,7 @@ def collect_diagnostics(*, gateway_store: Optional[GatewayStore] = None) -> Syst
                 label="固定账单资料",
                 status="fail",
                 code="BILLING_PROFILE_UNAVAILABLE",
-                message="未配置可用的固定账单文件（GSS_FIXED_BILLING_FILE / GSS_VERIFIED_BILLING_FILE / GSS_BILLING_PROFILES_FILE）或权限不满足 0400/0600。",
+                message="未配置可用的固定账单资料：可在后台「系统 → 固定账单」直接保存，或配置 GSS_FIXED_BILLING_FILE（权限须为 0400/0600）。",
             ))
 
     proxy_url = None

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
 
-from .fixed_billing import fixed_verification_id, load_fixed_billing_file
+from .fixed_billing import fixed_verification_id, has_fixed_billing_source, load_fixed_billing_file
 from .verified_payer import MissingProfile, VerifiedBilling, _address, _unique
 
 _LIMIT = 16384
@@ -103,12 +103,11 @@ def _load_from_path(path: Path) -> BillingProfiles:
 
 
 def load_billing_profiles() -> BillingProfiles:
-    # A single fixed US address is the primary deployment mode; when set it wins
-    # over the older per-currency / single-payer files.
-    fixed_value = os.environ.get("GSS_FIXED_BILLING_FILE", "").strip()
-    if fixed_value:
+    # A single fixed US address is the primary deployment mode; when configured
+    # via GSS_FIXED_BILLING_FILE or the admin panel it wins over older files.
+    if has_fixed_billing_source():
         try:
-            address = load_fixed_billing_file(Path(fixed_value))
+            address = load_fixed_billing_file()
             if address is None:
                 raise ValueError
             return BillingProfiles({}, _fixed_verified(address))

@@ -137,6 +137,7 @@ _LOGGABLE_ENDPOINTS = frozenset({
     "/backend-api/payments/checkout/taxes",
     "/backend-api/payments/payment_method",
     "/backend-api/subscriptions",
+    "/backend-api/subscriptions/cancel",
     "/v1/confirmation_tokens",
 })
 

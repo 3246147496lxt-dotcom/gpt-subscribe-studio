@@ -457,7 +457,13 @@ def start_quick_pay(payload: QuickPayRequest, idempotency_key: str,
     return job
 
 
-async def _cancel_auto_renew(job: QuickPayJob, *, order_id: str, plan: str) -> None:
+async def _cancel_auto_renew(
+    job: QuickPayJob,
+    *,
+    order_id: str,
+    plan: str,
+    fallback_secrets: Any = None,
+) -> None:
     view = orders.store.view(order_id)
     if not view.auto_cancel_renew:
         view.auto_renew_status = "disabled"
@@ -466,7 +472,7 @@ async def _cancel_auto_renew(job: QuickPayJob, *, order_id: str, plan: str) -> N
     _set_stage(job, "canceling_auto_renew", "正在关闭下期自动续费")
     view.auto_renew_status = "canceling_auto_renew"
     orders.store.persist(order_id)
-    secrets = orders.vault.get(order_id)
+    secrets = orders.vault.get(order_id) or fallback_secrets
     if secrets is None:
         view.auto_renew_status = "manual_required"
         view.auto_renew_error = "vault_expired"
@@ -698,6 +704,7 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             _publish_sse(job)
             payment_started = time.monotonic()
             stage_started["confirming_payment"] = payment_started
+            live_secrets = orders.vault.get(order.id)
             order_billing = BillingIn(**order.billing) if getattr(order, "billing", None) else None
             resolved_billing = payload.billing or order_billing
             normalized_plan = orders.normalize_plan_name(payload.plan)
@@ -732,10 +739,16 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
                 _persist_job(job)
                 if view.auto_cancel_renew:
                     cancel_started = time.monotonic()
-                    await _cancel_auto_renew(job, order_id=job.order_id or order.id, plan=payload.plan)
+                    await _cancel_auto_renew(
+                        job, order_id=job.order_id or order.id, plan=payload.plan,
+                        fallback_secrets=live_secrets,
+                    )
                     job.timings["cancel_renew_ms"] = max(0, int((time.monotonic() - cancel_started) * 1000))
                 else:
-                    await _cancel_auto_renew(job, order_id=job.order_id or order.id, plan=payload.plan)
+                    await _cancel_auto_renew(
+                        job, order_id=job.order_id or order.id, plan=payload.plan,
+                        fallback_secrets=live_secrets,
+                    )
                 job.stage = "auto_renew_canceled" if delivered and job.auto_renew_status == "canceled" else job.status
             elif state in {"requires_action", "challenge_required"} or status == "requires_action":
                 job.status = "requires_action"
@@ -746,6 +759,9 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
                     job.message = "需要持卡人或本人在浏览器完成验证（3DS / 官方确认），完成后可点击只读核验。"
                 _event(job, "requires_action", job.message)
             elif state in {"failed", "rejected", "card_declined"}:
+                job.status = "failed"
+            elif state == "unknown" and str(result.get("stage") or "") == "checkout" and status == "unpaid":
+                # Pre-confirmation checkout/telemetry failure before any payment confirmation was submitted.
                 job.status = "failed"
             elif state == "unknown" or status == "processing":
                 job.status = "unknown"

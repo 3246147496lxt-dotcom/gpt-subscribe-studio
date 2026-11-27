@@ -132,6 +132,7 @@ def mint(
     sec_ch_ua_bitness: str = "",
     sec_ch_ua_platform_version: str = "",
     version: str = "",
+    data_build: str = "",
 ) -> Dict[str, Any]:
     """返回哨兵 JSON；失败返回空 dict，由调用方决定是否中止。"""
 
@@ -145,6 +146,7 @@ def mint(
             "flow": flow,
             "proxy": proxy or "",
             "version": str(version or "").strip() or _BRIDGE_VERSION,
+            "dataBuild": str(data_build or "").strip(),
             "pageUrl": page_url,
             "language": language,
             "timezone": timezone,
@@ -159,8 +161,8 @@ def mint(
             "impersonate": impersonate or "",
             "secChUa": sec_ch_ua or "",
             "secChUaPlatform": sec_ch_ua_platform or "",
-            # 高熵 Client Hints：参考 HAR 的 /sentinel/req 与主站请求同源，
-            # 缺 arch/bitness/platform-version 时哨兵请求会成为同出口下的异常请求族。
+            # 传入沙箱 navigator.userAgentData.getHighEntropyValues；
+            # HTTP 线缆层默认只发低熵三件套（与 2026-11-26 实测一致）。
             "secChUaArch": sec_ch_ua_arch or "",
             "secChUaBitness": sec_ch_ua_bitness or "",
             "secChUaPlatformVersion": sec_ch_ua_platform_version or "",

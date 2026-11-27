@@ -30,6 +30,7 @@ import {
   IconListDetails,
   IconLockOpen,
   IconLogout,
+  IconMapPin,
   IconMoon,
   IconNetwork,
   IconSun,
@@ -66,6 +67,9 @@ const LocksPanel = lazy(() =>
 const ProxySettings = lazy(() =>
   import("./components/ProxySettings").then((m) => ({ default: m.ProxySettings })),
 );
+const FixedBillingSettings = lazy(() =>
+  import("./components/FixedBillingSettings").then((m) => ({ default: m.FixedBillingSettings })),
+);
 const RuntimeFlagsPanel = lazy(() =>
   import("./components/RuntimeFlagsPanel").then((m) => ({ default: m.RuntimeFlagsPanel })),
 );
@@ -91,6 +95,7 @@ type NavTab =
   | "portal-site"
   | "pricing"
   | "proxy"
+  | "billing"
   | "flags"
   | "webhooks"
   | "batch"
@@ -106,6 +111,7 @@ const VALID_TABS = new Set<string>([
   "portal-site",
   "pricing",
   "proxy",
+  "billing",
   "flags",
   "webhooks",
   "batch",
@@ -151,6 +157,7 @@ const NAV_GROUPS: NavGroupDef[] = [
     title: "系统",
     items: [
       { id: "proxy", label: "代理网关", icon: <IconNetwork size={16} stroke={1.8} /> },
+      { id: "billing", label: "固定账单", icon: <IconMapPin size={16} stroke={1.8} /> },
       { id: "flags", label: "策略开关", icon: <IconAdjustments size={16} stroke={1.8} /> },
       { id: "webhooks", label: "告警通知", icon: <IconBell size={16} stroke={1.8} /> },
     ],
@@ -477,7 +484,7 @@ export function App() {
             <Text fz={11} c="dimmed" truncate>
               {showLogout ? "鉴权模式" : "本地模式"}
             </Text>
-            <Text fz={11} c="dimmed">v{health?.version || "0.1.0"}</Text>
+            <Text fz={11} c="dimmed">v{health?.version || "0.2.0"}</Text>
           </Group>
         </AppShell.Section>
       </AppShell.Navbar>
@@ -564,6 +571,16 @@ export function App() {
                 <ErrorBoundary title="代理网关加载失败">
                   <Suspense fallback={<PanelFallback />}>
                     <ProxySettings />
+                  </Suspense>
+                </ErrorBoundary>
+              </div>
+            )}
+
+            {visitedTabs.billing && (
+              <div style={{ display: view === "billing" ? "block" : "none" }}>
+                <ErrorBoundary title="固定账单加载失败">
+                  <Suspense fallback={<PanelFallback />}>
+                    <FixedBillingSettings onNavigate={navigate} />
                   </Suspense>
                 </ErrorBoundary>
               </div>

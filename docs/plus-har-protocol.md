@@ -308,6 +308,18 @@ ctoken 的 `guid/muid/sid` 与 `m.stripe.com/6` 返回完全一致，`config_id`
 前端 `quoteChanged` 分支据此弹二次确认；确认后第二次 POST 的 `expected_amount` 等于新金额，
 校验通过才继续。税后更低（优惠、免税）直接放行。
 
+## 8c. 真卡全链路闭环更新（2026-11-27 · v0.2.0）
+
+2026-11-27 基于真实支付抓包与实单验证完成 `Plus / PH` 与 `Pro Lite / CL` 全链路打通，在 2026-10-30 基线上补齐了以下关键契约：
+
+- **直通模式与预热**：`direct_session_checkout=true` 时保留原 `oai-did` 与未过期 `accessToken`，执行 `_soft_checkout_prelude()` 后直接建单，避免冷调 `/api/auth/session` 触发漂移。
+- **客户端 Confirm 回执兼容**：`_intent_settled_amount()` 兼容 publishable-key 调 `POST /v1/payment_intents/{pi}/confirm` 成功时仅返回 `status="succeeded"` + `amount`（无 `amount_received`）的真实响应。
+- **升级后核验与会话刷新**：支持 `prolite` / `promax` 无下划线套餐名；升级后旧 AT 失效时强制刷新 `/api/auth/session`（携带 `X-OpenAI-Failed-Access-Token-Iat`）并清理旧 `.0/.1` 分片 Cookie。
+- **关闭自动续费接口迁移**：Stripe Portal 取消开关已禁用，主路径切至 ChatGPT 一等接口 `POST /backend-api/subscriptions/cancel`。
+- **`subscription_limit` 真实语义**：实锤为卡指纹或设备 `oai-did` 订阅数上限（发生于 `POST /backend-api/payments/checkout/confirm`），换卡或隔离设备即可恢复。
+
+完整实测样本统计、排查过程与运维手册见：[LIVE_PAYMENT_RETROSPECTIVE_20261127.md](./LIVE_PAYMENT_RETROSPECTIVE_20261127.md)。
+
 ## 9. 未覆盖
 
 - 3DS：`requires_action` 仍归 `challenge_required`，纯协议不做验证页。

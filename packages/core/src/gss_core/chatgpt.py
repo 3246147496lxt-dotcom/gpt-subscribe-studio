@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -37,9 +38,13 @@ from gss_core.sentinel import (
 )
 from gss_core.session_token import (
     SessionBundle,
+    chunk_session_cookie,
     identity_cookies_for_reissue,
+    is_session_cookie_name,
+    jwt_claims,
     parse_session_bundle,
     parse_statsig_context,
+    reassemble_session_token,
 )
 
 APP_BASE = "https://chatgpt.com"
@@ -127,10 +132,82 @@ _PROFILES = {
     },
 }
 
-# 默认只用 Windows Chrome：实测 macOS / Linux 档案在支付风控里显著更差
-# （linux.do #80：苹果设备风控明显更高）。需要沿用真实 Session UA 时由
-# `reissue_keep_ua=True` 走 profile_from_session_ua，不受此表限制。
+# 无 Session UA 且无宿主机桌面标识（如 Linux 容器）时的兜底平台顺序。
 _PROFILE_ORDER = ["windows"]
+
+_KNOWN_FULL_BUILDS: Dict[str, str] = {
+    "150": "150.0.7871.189",
+    "146": "146.0.7680.180",
+    "145": "145.0.7632.116",
+    "142": "142.0.7444.175",
+    "136": "136.0.7103.114",
+    "133": "133.0.6943.141",
+}
+
+
+def expand_reduced_chrome_build(build: str, os_key: str = "windows") -> str:
+    """将 Chrome UA-Reduction 缩减版 `M.0.0.0` 展开为真实 4 段构建号。
+
+    真 Chrome 的 User-Agent 会把构建号缩减为 `Chrome/146.0.0.0`，但高熵
+    `sec-ch-ua-full-version` / `sec-ch-ua-full-version-list` 始终发真实 4 段版本号。
+    """
+    text = str(build or "").strip()
+    if not text:
+        return _PROFILES.get(os_key, _PROFILES["windows"])["builds"][0]
+    parts = text.split(".")
+    if len(parts) == 4 and parts[1] == "0" and parts[2] == "0" and parts[3] == "0":
+        major = parts[0]
+        prof = _PROFILES.get(os_key)
+        if prof:
+            for item in prof["builds"]:
+                if item.split(".", 1)[0] == major:
+                    return item
+        if major in _KNOWN_FULL_BUILDS:
+            return _KNOWN_FULL_BUILDS[major]
+        try:
+            major_int = int(major)
+            branch = max(6000, 6943 + (major_int - 133) * 55)
+            return f"{major}.0.{branch}.112"
+        except ValueError:
+            return text
+    return text
+
+
+def _os_key_from_ua(ua: str) -> Optional[str]:
+    low = str(ua or "").lower()
+    if not low:
+        return None
+    if "macintosh" in low or "mac os x" in low:
+        return "macos"
+    if "windows" in low:
+        return "windows"
+    if "linux" in low or "x11" in low:
+        return "linux"
+    return None
+
+
+def _configured_os_profile() -> str:
+    try:
+        from . import runtime_flags
+
+        value = runtime_flags.get_str("client_os_profile")
+        if value in {"auto", "macos", "windows", "linux"}:
+            return value
+    except Exception:  # noqa: BLE001
+        pass
+    return "auto"
+
+
+def default_os_key() -> str:
+    """无 Session UA 时的默认客户端系统：面板/环境变量 > 宿主机桌面系统 > _PROFILE_ORDER。"""
+    configured = _configured_os_profile()
+    if configured in _PROFILES:
+        return configured
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("win"):
+        return "windows"
+    return _PROFILE_ORDER[0]
 
 
 def _hash8(seed: str, salt: str = "") -> int:
@@ -138,14 +215,38 @@ def _hash8(seed: str, salt: str = "") -> int:
     return int(_hl.sha256((str(seed) + salt).encode("utf-8")).hexdigest()[:8], 16)
 
 
-def _pick_profile(device_id: str) -> dict:
+def _pick_profile(device_id: str, *, os_key: Optional[str] = None) -> dict:
     """按 device_id 稳定选定平台与版本，同一账号永远同一组合。"""
     seed = str(device_id or "anon")
-    key = _PROFILE_ORDER[_hash8(seed, "os") % len(_PROFILE_ORDER)]
+    if os_key and os_key in _PROFILES:
+        key = os_key
+    else:
+        resolved = default_os_key()
+        key = resolved if resolved in _PROFILES else _PROFILE_ORDER[_hash8(seed, "os") % len(_PROFILE_ORDER)]
     prof = dict(_PROFILES[key])
     prof["key"] = key
     prof["build"] = prof["builds"][_hash8(seed, "b") % len(prof["builds"])]
     return prof
+
+
+def _resolve_reissue_ua(
+    bundle: SessionBundle,
+    device_id: str,
+    *,
+    preserve_user_agent: bool = False,
+) -> str:
+    """为重颁/建单挑选与 Session 导出端同系统的 UA，避免 macOS Session 被切成 Windows 吊销。"""
+    configured = _configured_os_profile()
+    session_os = _os_key_from_ua(bundle.user_agent) or (bundle.os_hint if bundle.os_hint in _PROFILES else None)
+    if configured in _PROFILES:
+        if preserve_user_agent and bundle.user_agent and _os_key_from_ua(bundle.user_agent) == configured:
+            return bundle.user_agent
+        profile = _pick_profile(device_id, os_key=configured)
+        return profile["ua"].format(build=profile["build"])
+    if preserve_user_agent and bundle.user_agent:
+        return bundle.user_agent
+    profile = _pick_profile(device_id, os_key=session_os)
+    return profile["ua"].format(build=profile["build"])
 
 
 _UA_CHROME_VERSION = re.compile(r"(?:Chrome|CriOS)/([0-9][0-9.]*)")
@@ -186,7 +287,8 @@ def _profile_from_session_ua(ua: str) -> Optional[dict]:
         prof["hints"] = {"sec-ch-ua-platform": '"Chrome OS"'}
     match = _UA_CHROME_VERSION.search(text)
     prof["key"] = key
-    prof["build"] = match.group(1) if match else prof["builds"][0]
+    raw_build = match.group(1) if match else prof["builds"][0]
+    prof["build"] = expand_reduced_chrome_build(raw_build, key)
     return prof
 
 
@@ -375,6 +477,7 @@ def hosted_checkout_url(url: str = "", session_id: str = "") -> str:
 _WEB_CHECKOUT_HEADERS = {
     "x-openai-checkout-source": "chatgpt_web_merged",
     "x-openai-rate-limit-join-workspace": "1",
+    "x-openai-rejoin-pro-cta": "1",
 }
 
 # 顶层文档导航（GET /）上真 Chrome 不会发送的 API 专有头。
@@ -688,6 +791,8 @@ class ChatGPTClient:
     _elements_session_id: str = field(default="", repr=False)
     _strip_ambient: bool = field(default=False, repr=False)
     _last_refresh_transport_error: Optional[tuple[str, Optional[int]]] = field(default=None, repr=False)
+    _accepted_ch: set[str] = field(default_factory=set, repr=False)
+    _checkout_prelude_done: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         ctx = self.browser_context
@@ -717,6 +822,10 @@ class ChatGPTClient:
         else:
             device = bundle.device_id or str(uuid.uuid5(uuid.NAMESPACE_URL, "dcp-did:" + seed))
             session_id = bundle.oai_session_id or str(uuid.uuid5(uuid.NAMESPACE_URL, "dcp-sid:" + seed))
+        resolved_ua = bundle.user_agent
+        if not resolved_ua and not strip_ambient and bundle.os_hint in _PROFILES:
+            prof = _pick_profile(device, os_key=bundle.os_hint)
+            resolved_ua = prof["ua"].format(build=prof["build"])
         return cls(
             access_token=token,
             proxy=proxy,
@@ -724,7 +833,7 @@ class ChatGPTClient:
             session_token=bundle.session_token,
             refresh_token=bundle.refresh_token,
             device_id=device,
-            user_agent=bundle.user_agent,
+            user_agent=resolved_ua,
             session_country=bundle.country,
             extra_cookies=dict(bundle.cookies),
             oai_session_id=session_id,
@@ -740,6 +849,7 @@ class ChatGPTClient:
         country: str,
         preserve_user_agent: bool = False,
         warmup_edge: bool = True,
+        timeout: Optional[float] = None,
     ) -> "ChatGPTClient":
         """在目标出口用 sessionToken（ST）重新签发 accessToken（AT）。
 
@@ -755,16 +865,16 @@ class ChatGPTClient:
                 "跨区充值需要完整 Session（缺少 __Secure-next-auth.session-token）",
             )
         device = str(uuid.uuid4())
-        profile = _pick_profile(device)
-        user_agent = (
-            bundle.user_agent
-            if preserve_user_agent and bundle.user_agent
-            else profile["ua"].format(build=profile["build"])
+        user_agent = _resolve_reissue_ua(
+            bundle,
+            device,
+            preserve_user_agent=preserve_user_agent,
         )
         session_cookie = "__Secure-next-auth.session-token"
         client = cls(
             access_token="",
             proxy=proxy,
+            timeout=float(timeout) if timeout is not None else ORDER_HTTP_TIMEOUT_S,
             session_token=clean_st,
             refresh_token=bundle.refresh_token,
             device_id=device,
@@ -774,7 +884,7 @@ class ChatGPTClient:
             language=locale_for(country),
             timezone=timezone_for(country),
             extra_cookies=identity_cookies_for_reissue(
-                {session_cookie: clean_st}
+                chunk_session_cookie(clean_st)
             ),
             _strip_ambient=True,
         )
@@ -808,7 +918,7 @@ class ChatGPTClient:
                 )
             # 注：重颁完成到建单之间的拟人停顿由调用方（orders.py _human_pause_async /
             # PlusHarProtocol warm_exit_session）统一执行，避免在线程池内重复背靠背 sleep。
-            rotated = client.extra_cookies.get(session_cookie, "")
+            rotated = reassemble_session_token(client.extra_cookies)
             if rotated:
                 client.session_token = rotated
             # 刷新响应可能回带旧 oai-did；强制回到本次新生成的设备标识。
@@ -823,18 +933,31 @@ class ChatGPTClient:
 
     @classmethod
     def reauthorize_oauth(
-        cls, raw: str, *, proxy: Optional[str], country: str
+        cls,
+        raw: str,
+        *,
+        proxy: Optional[str],
+        country: str,
+        preserve_user_agent: Optional[bool] = None,
     ) -> "ChatGPTClient":
-        """在目标出口用 OAuth refresh_token 换取全新 access_token，并生成干净设备身份。"""
+        """在目标出口用 OAuth refresh_token 换取全新 access_token，并生成同系统干净设备身份。"""
         bundle = parse_session_bundle(raw)
         if not bundle.refresh_token:
             raise DomainError(
                 ErrorCode.INVALID_SESSION,
                 "缺少 OAuth refresh_token，无法重新签发访问令牌",
             )
+        if preserve_user_agent is None:
+            try:
+                from . import runtime_flags
+
+                keep_ua = runtime_flags.get_bool("reissue_keep_ua")
+            except Exception:  # noqa: BLE001
+                keep_ua = False
+        else:
+            keep_ua = bool(preserve_user_agent)
         device = str(uuid.uuid4())
-        profile = _pick_profile(device)
-        user_agent = profile["ua"].format(build=profile["build"])
+        user_agent = _resolve_reissue_ua(bundle, device, preserve_user_agent=keep_ua)
         client = cls(
             access_token="",
             proxy=proxy,
@@ -866,13 +989,16 @@ class ChatGPTClient:
             clean_name = str(name or "").replace("\r", "").replace("\n", "").strip()
             if not clean_name or value is None:
                 continue
-            if not include_session_token and clean_name == "__Secure-next-auth.session-token":
+            if not include_session_token and is_session_cookie_name(clean_name):
                 continue
             values[clean_name] = str(value).replace("\r", "").replace("\n", "").strip()
         if include_session_token and self.session_token:
             clean_st = str(self.session_token).replace("\r", "").replace("\n", "").strip()
             if clean_st:
-                values.setdefault("__Secure-next-auth.session-token", clean_st)
+                for existing_key in [k for k in values if is_session_cookie_name(k)]:
+                    values.pop(existing_key, None)
+                for ck_name, ck_val in chunk_session_cookie(clean_st).items():
+                    values[ck_name] = ck_val
         if self.device_id:
             clean_did = str(self.device_id).replace("\r", "").replace("\n", "").strip()
             if clean_did:
@@ -1073,8 +1199,21 @@ class ChatGPTClient:
         with _without_session_headers(http, {"origin", "content-type"}):
             return http.get(url, **kwargs)
 
+    def _capture_accept_ch(self, response: Any) -> None:
+        """Record RFC 8942 Accept-CH opt-ins returned by chatgpt.com."""
+        headers = getattr(response, "headers", None)
+        if not headers or not hasattr(headers, "items"):
+            return
+        for key, value in headers.items():
+            if str(key).lower() == "accept-ch" and value:
+                for token in str(value).split(","):
+                    clean = token.strip().lower()
+                    if clean:
+                        self._accepted_ch.add(clean)
+
     def _identity_headers(self) -> Dict[str, str]:
         build = self.chrome_build
+        eff_hints = self._effective_hints()
         headers = {
             "User-Agent": self.ua,
             "Accept": "*/*",
@@ -1088,25 +1227,29 @@ class ChatGPTClient:
             "oai-did": self.device_id,
             "oai-device-id": self.device_id,
             "oai-language": self.language,
-            "oai-session-id": self.oai_session_id,
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
+            # 2026-11-26 真机实测：chatgpt.com 不返回 Accept-CH，默认只发低熵三件套；
+            # 仅当响应通过 Accept-CH 显式请求时才按 RFC 8942 附加高熵 Client Hints。
             "sec-ch-ua": self.sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
-            # 高熵 Client Hints：真实 Chrome 在 chatgpt.com 的 API 请求上全部发送。
-            "sec-ch-ua-full-version": f'"{build}"',
-            # 与低熵 sec-ch-ua 共用同一个 GREASE 品牌（见 _grease_brand）
-            "sec-ch-ua-full-version-list": self.sec_ch_ua_full_list,
-            "sec-ch-ua-model": '""',
-            **self._effective_hints(),
+            "sec-ch-ua-platform": eff_hints.get("sec-ch-ua-platform", '""'),
             "Cookie": self._cookie_header(),
         }
-        # 只在 warmup 真从页面解析到构建号时才发，避免把过期版本写死在指纹里。
-        if self.client_version:
-            headers["oai-client-version"] = self.client_version
-        if self.client_build_number:
-            headers["oai-client-build-number"] = self.client_build_number
+        accepted = getattr(self, "_accepted_ch", set()) or set()
+        if accepted:
+            high_entropy = {
+                "sec-ch-ua-full-version": f'"{build}"',
+                "sec-ch-ua-full-version-list": self.sec_ch_ua_full_list,
+                "sec-ch-ua-model": '""',
+                "sec-ch-ua-arch": eff_hints.get("sec-ch-ua-arch", ""),
+                "sec-ch-ua-bitness": eff_hints.get("sec-ch-ua-bitness", ""),
+                "sec-ch-ua-platform-version": eff_hints.get("sec-ch-ua-platform-version", ""),
+            }
+            for ch_name, ch_val in high_entropy.items():
+                if ch_name in accepted and ch_val:
+                    headers[ch_name] = ch_val
         if not self.access_token:
             # 仅凭 session cookie 换 token 时不发空的 Bearer。
             headers.pop("Authorization")
@@ -1117,8 +1260,9 @@ class ChatGPTClient:
         return headers
 
     def _route_headers(self, route: str, *, page_url: str = "") -> Dict[str, str]:
-        headers: Dict[str, str] = {"Referer": page_url or f"{APP_BASE}/"}
-        # 真实 HAR 的 payments/* 请求不带 `x-openai-target-*`；
+        referer = f"{APP_BASE}/" if route.startswith("/backend-api/payments/") else (page_url or f"{APP_BASE}/")
+        headers: Dict[str, str] = {"Referer": referer}
+        # 真实抓包的 payments/* 请求不带 `x-openai-target-*`；
         # 其余非支付路由沿用旧契约（旧版本 SPA 确实发送）。
         if not route.startswith("/backend-api/payments/"):
             headers["x-openai-target-path"] = route
@@ -1130,10 +1274,10 @@ class ChatGPTClient:
         if route.startswith("/backend-api/payments/") and self.attestation:
             headers["oai-web-deployment-attestation"] = self.attestation
         if route.startswith("/backend-api/payments/"):
+            # 2026-11-26 真机样本 2/3/4 实测：POST /payments/checkout 只带 openai-sentinel-token，
+            # 不附带 openai-sentinel-so-token。
             if self.sentinel_token:
                 headers["openai-sentinel-token"] = self.sentinel_token
-            if self.sentinel_so:
-                headers["openai-sentinel-so-token"] = self.sentinel_so
         return headers
 
     def _app_cookie_names(self) -> set[str]:
@@ -1190,9 +1334,15 @@ class ChatGPTClient:
                 gathered.update({str(k): str(v) for k, v in jar.items()})
         except Exception:
             gathered = {}
+        if any(is_session_cookie_name(str(name)) and name not in removed and value is not None for name, value in gathered.items()):
+            for existing_key in [k for k in self.extra_cookies if is_session_cookie_name(k)]:
+                self.extra_cookies.pop(existing_key, None)
         for name, value in gathered.items():
             if name and name not in removed and value is not None:
                 self.extra_cookies[str(name)] = str(value)
+        reassembled = reassemble_session_token(self.extra_cookies)
+        if reassembled:
+            self.session_token = reassembled
         self._clear_http_cookie_jar()
         self.http.headers.update(self._identity_headers())
 
@@ -1204,30 +1354,44 @@ class ChatGPTClient:
         if not rotated or rotated == self.session_token:
             return False
         self.session_token = rotated
-        self.extra_cookies["__Secure-next-auth.session-token"] = rotated
+        for existing_key in [k for k in self.extra_cookies if is_session_cookie_name(k)]:
+            self.extra_cookies.pop(existing_key, None)
+        chunks = chunk_session_cookie(rotated)
+        for ck_name, ck_val in chunks.items():
+            self.extra_cookies[ck_name] = ck_val
         jar = getattr(self.http, "cookies", None)
         setter = getattr(jar, "set", None) if jar is not None else None
         if callable(setter):
-            try:
-                setter("__Secure-next-auth.session-token", rotated, domain="chatgpt.com")
-            except TypeError:
+            for ck_name, ck_val in chunks.items():
                 try:
-                    setter("__Secure-next-auth.session-token", rotated)
+                    setter(ck_name, ck_val, domain="chatgpt.com")
+                except TypeError:
+                    try:
+                        setter(ck_name, ck_val)
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception:  # noqa: BLE001
                     pass
-            except Exception:  # noqa: BLE001
-                pass
         if self._http is not None:
             self._http.headers.update(self._identity_headers())
         logger.info("session_token_rotated")
         return True
 
-    def refresh_session(self, *, trust_statsig: bool = True, reject_unauthorized: bool = False) -> bool:
+    def refresh_session(
+        self,
+        *,
+        trust_statsig: bool = True,
+        reject_unauthorized: bool = False,
+        force_refresh: bool = False,
+    ) -> bool:
         """用当前出口 IP 请求 /api/auth/session，换取与本批次出口一致的 accessToken 与 cookie。
 
         结账地区由出口代理决定（align_proxy_region），session 本身不绑定国家；
         刷新的目的是让本次请求携带的 accessToken / oai-sc 等 cookie 与出口 IP
         同批次，降低 Cloudflare 403 与 unusual activity 概率。
+        ``force_refresh=True`` 对应真实浏览器结账完成后的
+        ``?refresh=true&reason=checkout_success&workspace_update=true&refresh_account=true``，
+        用于套餐升级后强制换发包含新权益的 accessToken。
 
         软失败：session-token 缺失/失效、上游报错都返回 False，调用方沿用原
         session 继续。建单方显式要求在 HTTP 401 时以脱敏诊断立即终止。刷新结果只在内存，不落库。
@@ -1261,11 +1425,28 @@ class ChatGPTClient:
                     except Exception:  # noqa: BLE001
                         pass
 
+        previous_token = self.access_token
+        failed_iat = jwt_claims(previous_token).get("iat") if previous_token else None
         try:
             previous_names = self._app_cookie_names()
+            session_url = (
+                f"{APP_BASE}/api/auth/session?refresh=true&reason=checkout_success"
+                "&workspace_update=true&refresh_account=true"
+                if force_refresh
+                else f"{APP_BASE}/api/auth/session"
+            )
+            req_headers: Dict[str, str] = {"Referer": f"{APP_BASE}/"}
+            if force_refresh:
+                req_headers["X-OpenAI-Target-Path"] = "/api/auth/session"
+                req_headers["X-OpenAI-Target-Route"] = "/api/auth/session"
+                if isinstance(failed_iat, (int, float)) and not isinstance(failed_iat, bool):
+                    req_headers["X-OpenAI-Failed-Access-Token-Iat"] = str(int(failed_iat))
+            cookie_hdr = self._cookie_header()
+            if cookie_hdr:
+                req_headers["Cookie"] = cookie_hdr
             response = self.http.get(
-                f"{APP_BASE}/api/auth/session",
-                headers={"Referer": f"{APP_BASE}/"},
+                session_url,
+                headers=req_headers,
                 timeout=self.timeout,
             )
         except Exception as exc:
@@ -1303,6 +1484,8 @@ class ChatGPTClient:
             # session-token 已失效时上游返回 200 + 空 accessToken。
             logger.warning("session 刷新未返回 accessToken（session-token 可能已失效），继续用原 session")
             return False
+        if previous_token and token == previous_token:
+            logger.warning("session_refresh_unchanged force_refresh=%s", force_refresh)
         self.access_token = token
         account = jwt_account_id(token)
         if account:
@@ -1319,6 +1502,8 @@ class ChatGPTClient:
             if identity["country"]:
                 self.session_country = identity["country"]
         self._merge_cookies(previous_names)
+        if self._http is not None and hasattr(self._http, "headers"):
+            self._http.headers.update(self._identity_headers())
         logger.info("session 刷新成功，已与本批次出口对齐")
         return True
 
@@ -1448,6 +1633,7 @@ class ChatGPTClient:
                         pass
         if reject_unauthorized and getattr(home, "status_code", None) == 401:
             self._reject_unauthorized(home)
+        self._capture_accept_ch(home)
         html = str(getattr(home, "text", "") or "")
         version, build, session_id = extract_build(html)
         if version:
@@ -1463,6 +1649,14 @@ class ChatGPTClient:
         if sentinel_version:
             self.sentinel_version = sentinel_version
         self._merge_cookies()
+        logger.info(
+            "warmup_done status=%s anon=%s has_build=%s has_sentinel=%s cookies=%d",
+            getattr(home, "status_code", None),
+            anonymous,
+            bool(self.client_version),
+            bool(self.sentinel_version),
+            len(self.extra_cookies),
+        )
 
     def warm_account(self, *, full: bool = False) -> None:
         """Fetch the normal account bootstrap endpoint before checkout.
@@ -1583,6 +1777,7 @@ class ChatGPTClient:
             sec_ch_ua=self.sec_ch_ua,
             sec_ch_ua_platform=self._effective_hints().get("sec-ch-ua-platform", ""),
             version=self.sentinel_version,
+            data_build=self.client_version,
             **self.sentinel_profile,
         )
         value = header_value(token)
@@ -1661,14 +1856,64 @@ class ChatGPTClient:
                     except Exception:  # noqa: BLE001
                         pass
 
+    def _soft_checkout_prelude(self, *, country: str = "") -> None:
+        """Align pre-checkout browser sequence on the same persistent HTTP/2 session.
+
+        Live 2026-11-26 captures showed Chrome always calls `/backend-api/me`,
+        `/backend-api/accounts/check/v4-2023-04-27`, and
+        `/backend-api/checkout_pricing_config/configs/{cc}` before `/sentinel/req`
+        and `POST /payments/checkout`. Only runs on real curl_cffi transports so
+        isolated mock unit tests remain unaffected.
+        """
+        if self._checkout_prelude_done or not self.access_token or self._http is None:
+            return
+        if not type(self._http).__module__.startswith("curl_cffi"):
+            return
+        self._checkout_prelude_done = True
+        cc = (country or self.session_country or "US").strip().upper()
+        endpoints: list[tuple[str, Optional[Dict[str, str]]]] = [
+            ("/backend-api/me", None),
+            (ACCOUNTS_CHECK_PATH, {"timezone_offset_min": "0"}),
+        ]
+        if cc and len(cc) == 2 and cc.isalpha():
+            endpoints.append((f"/backend-api/checkout_pricing_config/configs/{cc}", None))
+        results: list[str] = []
+        transport_errors = 0
+        for path, params in endpoints:
+            tag = path.rsplit("/", 1)[-1]
+            try:
+                resp = self._http_get(path, params=params, timeout=min(float(self.timeout or 15.0), 15.0))
+            except Exception as exc:  # noqa: BLE001
+                transport_errors += 1
+                results.append(f"{tag}={type(exc).__name__}")
+                if transport_errors >= 2 and self.proxy:
+                    logger.warning("checkout_prelude_dead_proxy country=%s results=%s", cc or "-", ",".join(results))
+                    raise DomainError(
+                        ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                        "建单前出口代理隧道中断（未提交结账），正在切换出口节点。",
+                        detail={"code": "proxy_tunnel_failed", "stage": "checkout_prelude"},
+                    ) from None
+                continue
+            status = int(getattr(resp, "status_code", 0) or 0)
+            results.append(f"{tag}={status}")
+            if status == 401:
+                self._reject_unauthorized(resp, method="GET", url=f"{APP_BASE}{path}", stage="checkout_prelude")
+            if status < 400:
+                self._capture_accept_ch(resp)
+                self._merge_cookies()
+        logger.info("checkout_prelude country=%s results=%s", cc or "-", ",".join(results))
+
     def prepare_risk(self, *, flow: str, page_url: str = "", country: str = "") -> None:
         # 语言/时区跟随 Session 签发地（与出口 IP 同区）；没有 statsig 国家才用账单国。
         effective_country = self.session_country or country
         if effective_country:
             self.language = locale_for(effective_country)
             self.timezone = timezone_for(effective_country)
-        url = page_url or f"{APP_BASE}/"
-        self.warmup(page_url=url, reject_unauthorized=flow == "chatgpt_checkout")
+        is_checkout = flow == "chatgpt_checkout"
+        url = f"{APP_BASE}/" if is_checkout else (page_url or f"{APP_BASE}/")
+        self.warmup(page_url=url, reject_unauthorized=is_checkout)
+        if is_checkout:
+            self._soft_checkout_prelude(country=country or effective_country)
         self.mint_sentinel(flow=flow, page_url=url)
 
     def _check_credentials(self) -> None:
@@ -2026,12 +2271,16 @@ class ChatGPTClient:
             plan, country, tax_country, currency, sorted(body),
         )
         checkout_url = f"{APP_BASE}/backend-api/payments/checkout"
-        response = self.http.post(
-            checkout_url,
-            json=body,
-            headers=self._route_headers("/backend-api/payments/checkout", page_url=page_url),
-            timeout=self.timeout,
-        )
+        with _without_session_headers(
+            self.http,
+            {"oai-session-id", "oai-client-version", "oai-client-build-number", "openai-sentinel-so-token"},
+        ):
+            response = self.http.post(
+                checkout_url,
+                json=body,
+                headers=self._route_headers("/backend-api/payments/checkout", page_url=f"{APP_BASE}/"),
+                timeout=self.timeout,
+            )
         # 单次风控令牌只服务这一次建单：后续 GET /checkout/... 与 /checkout/taxes
         # 必须换成各自的令牌（HAR 里 taxes 完全不带 sentinel 头），
         # 复用同一份 so/t 会被判成重放。
@@ -3040,6 +3289,102 @@ class ChatGPTClient:
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "上游未确认自动续费已关闭")
         logger.info("cancel_auto_renew_ok path=%s will_renew=%s", path, will_renew)
         return {"canceled": True, "will_renew": will_renew, "subscription_id": subscription_id}
+
+    def cancel_subscription_direct(
+        self,
+        *,
+        account_id: str = "",
+        cancellation_outcome: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Call ChatGPT's first-party ``POST /backend-api/subscriptions/cancel`` endpoint.
+
+        Matches the live web client (2026-11-26 ``ConsumerBillingSettings`` /
+        ``CancellationDialog``): sends ``{"account_id": account_id}`` with
+        ``chatgpt-account-id`` header so paid subscriptions cancel at period end
+        while retaining current-cycle access. Returns a structured outcome dict
+        indicating whether cancellation succeeded or should fall back to Stripe
+        Customer Portal.
+        """
+        self._check_credentials()
+        resolved_aid = str(account_id or self.account_id or "").strip()
+        if not resolved_aid:
+            self.hydrate()
+            resolved_aid = str(self.account_id or "").strip()
+        if not resolved_aid:
+            raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "无法提取 account_id，无法关闭自动续费")
+        self.account_id = resolved_aid
+
+        path = "/backend-api/subscriptions/cancel"
+        url = f"{APP_BASE}{path}"
+        body: Dict[str, Any] = {"account_id": resolved_aid}
+        if cancellation_outcome:
+            body["cancellation_outcome"] = str(cancellation_outcome)
+
+        def _post_once():
+            headers = self._identity_headers()
+            headers.update(self._route_headers(path))
+            headers["chatgpt-account-id"] = resolved_aid
+            headers["Content-Type"] = "application/json"
+            return self.http.post(
+                url,
+                json=body,
+                headers=headers,
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+
+        logger.info("cancel_subscription_direct_start path=%s", path)
+        response = _post_once()
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status == 401 and getattr(self, "session_token", ""):
+            if self.refresh_session(
+                trust_statsig=False,
+                reject_unauthorized=False,
+                force_refresh=True,
+            ):
+                response = _post_once()
+                status = int(getattr(response, "status_code", 0) or 0)
+
+        if status == 401:
+            _log_upstream_failure(path, response)
+            raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期，无法关闭自动续费")
+
+        if 300 <= status < 400:
+            headers = getattr(response, "headers", {}) or {}
+            location = str(headers.get("location") or headers.get("Location") or "")
+            logger.info("cancel_subscription_direct_redirect status=%s stripe=%s", status, "stripe" in location.lower())
+            return {"canceled": False, "fallback_portal": True, "http_status": status}
+
+        if status in {404, 405, 501}:
+            logger.info("cancel_subscription_direct_unsupported status=%s", status)
+            return {"canceled": False, "fallback_portal": True, "http_status": status}
+
+        if status >= 400:
+            _log_upstream_failure(path, response)
+            payload = _json(response)
+            err_detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
+            err_obj = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            err_code = str(
+                err_detail.get("code")
+                or err_detail.get("error_type")
+                or err_obj.get("code")
+                or payload.get("code")
+                or ""
+            ).strip()
+            logger.warning(
+                "cancel_subscription_direct_failed status=%s code=%s",
+                status,
+                err_code or "-",
+            )
+            return {
+                "canceled": False,
+                "fallback_portal": status in {400, 403, 422},
+                "http_status": status,
+                "error_code": err_code or f"http_{status}",
+            }
+
+        logger.info("cancel_subscription_direct_ok status=%s", status)
+        return {"canceled": True, "http_status": status}
 
     def subscription_payload(self) -> Dict[str, Any]:
         self._check_credentials()

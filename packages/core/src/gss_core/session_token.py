@@ -10,6 +10,47 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 _COUNTRY = re.compile(r"^[A-Z]{2}$")
+SESSION_COOKIE_NAME = "__Secure-next-auth.session-token"
+# Real Chrome enforces RFC 6265's 4096-byte cookie limit; NextAuth splits
+# oversized JWE session tokens at 3933 bytes into `.0`, `.1`, ... chunks.
+SESSION_COOKIE_CHUNK_SIZE = 3933
+_SESSION_CHUNK_RE = re.compile(r"^__Secure-next-auth\.session-token\.(\d+)$")
+
+
+def is_session_cookie_name(name: str) -> bool:
+    clean = str(name or "").strip()
+    return clean == SESSION_COOKIE_NAME or bool(_SESSION_CHUNK_RE.match(clean))
+
+
+def reassemble_session_token(cookies: Dict[str, str]) -> str:
+    """Extract sessionToken from single or chunked (.0/.1/...) NextAuth cookies."""
+    if not isinstance(cookies, dict):
+        return ""
+    direct = str(cookies.get(SESSION_COOKIE_NAME) or "").strip()
+    if direct:
+        return direct
+    chunks: list[tuple[int, str]] = []
+    for key, val in cookies.items():
+        m = _SESSION_CHUNK_RE.match(str(key or "").strip())
+        if m and val is not None:
+            chunks.append((int(m.group(1)), str(val).strip()))
+    if not chunks:
+        return ""
+    chunks.sort(key=lambda pair: pair[0])
+    return "".join(part for _, part in chunks).strip()
+
+
+def chunk_session_cookie(token: str, *, chunk_size: int = SESSION_COOKIE_CHUNK_SIZE) -> Dict[str, str]:
+    """Format a NextAuth session token into browser-faithful cookie entry/entries."""
+    clean = str(token or "").replace("\r", "").replace("\n", "").strip()
+    if not clean:
+        return {}
+    if len(clean) <= chunk_size:
+        return {SESSION_COOKIE_NAME: clean}
+    return {
+        f"{SESSION_COOKIE_NAME}.{idx // chunk_size}": clean[idx : idx + chunk_size]
+        for idx in range(0, len(clean), chunk_size)
+    }
 
 
 @dataclass
@@ -22,6 +63,8 @@ class SessionBundle:
     # statsigContext 是 Session 签发时浏览器上报的真实身份，优先级高于任何伪造档案。
     user_agent: str = ""
     country: str = ""
+    # 从 UA 或导出 JSON 平台字段识别出的客户端系统（macos / windows / linux / ""）。
+    os_hint: str = ""
     # OAuth refresh token (Codex/CLI exports). It is a credential, so it
     # survives strip_ambient even though every ambient field is dropped.
     refresh_token: str = ""
@@ -89,8 +132,8 @@ def _from_mapping(data: Any, *, strip_ambient: bool = False) -> SessionBundle:
     cookies = dict(inner.cookies)
     cookies.update(_cookies_of(data))
     session_token = (
-        _first_string(data, ("sessionToken", "session_token", "__Secure-next-auth.session-token"))
-        or cookies.get("__Secure-next-auth.session-token")
+        _first_string(data, ("sessionToken", "session_token", SESSION_COOKIE_NAME))
+        or reassemble_session_token(cookies)
         or inner.session_token
     )
     refresh_token = (
@@ -106,6 +149,7 @@ def _from_mapping(data: Any, *, strip_ambient: bool = False) -> SessionBundle:
         device_id = ""
         user_agent = ""
         country = ""
+        os_hint = ""
         session_id = ""
         cookies = {}
     else:
@@ -115,8 +159,13 @@ def _from_mapping(data: Any, *, strip_ambient: bool = False) -> SessionBundle:
             or cookies.get("oai-did")
             or inner.device_id
         )
-        user_agent = statsig["user_agent"] or inner.user_agent
+        user_agent = (
+            statsig["user_agent"]
+            or _clean_user_agent(_first_string(data, ("userAgent", "user_agent", "ua")))
+            or inner.user_agent
+        )
         country = statsig["country"] or inner.country
+        os_hint = _detect_os_hint(data, user_agent) or inner.os_hint
         session_id = (
             _first_string(data, ("sessionId", "session_id", "oai-session-id", "oai_session_id"))
             or inner.oai_session_id
@@ -129,7 +178,8 @@ def _from_mapping(data: Any, *, strip_ambient: bool = False) -> SessionBundle:
     if not token and not session_token and not refresh_token:
         raise ValueError("JSON 中没有 accessToken")
     if session_token:
-        cookies.setdefault("__Secure-next-auth.session-token", session_token)
+        for ck_name, ck_val in chunk_session_cookie(session_token).items():
+            cookies.setdefault(ck_name, ck_val)
     if device_id:
         # 强制覆盖：请求头 oai-device-id 与 Cookie oai-did 必须同为 statsig 的 deviceId。
         cookies["oai-did"] = device_id
@@ -141,6 +191,7 @@ def _from_mapping(data: Any, *, strip_ambient: bool = False) -> SessionBundle:
         cookies=cookies,
         user_agent=user_agent,
         country=country,
+        os_hint=os_hint,
         refresh_token=refresh_token,
     )
 
@@ -194,6 +245,33 @@ def _first_country(data: Dict[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
+def _detect_os_hint(data: Dict[str, Any], user_agent: str = "") -> str:
+    """从 UA 或导出 JSON 里的 platform/os 字段识别导出端操作系统。"""
+    ua_low = str(user_agent or "").lower()
+    if "macintosh" in ua_low or "mac os x" in ua_low:
+        return "macos"
+    if "windows" in ua_low:
+        return "windows"
+    if "linux" in ua_low or "x11" in ua_low:
+        return "linux"
+    statsig = _statsig_mapping(data)
+    candidates = (
+        _first_string(data, ("sec_ch_ua_platform", "sec-ch-ua-platform", "platform", "os", "osName", "os_name")),
+        _first_string(statsig, ("sec_ch_ua_platform", "sec-ch-ua-platform", "platform", "os", "osName", "os_name")),
+    )
+    for raw in candidates:
+        low = raw.strip().strip('"').lower()
+        if not low:
+            continue
+        if any(tok in low for tok in ("mac", "darwin", "osx")):
+            return "macos"
+        if any(tok in low for tok in ("win",)):
+            return "windows"
+        if "linux" in low:
+            return "linux"
+    return ""
+
+
 def parse_statsig_context(data: Any) -> Dict[str, str]:
     """提取 Session 签发时的设备身份：deviceId、User-Agent、国家码。
 
@@ -242,6 +320,11 @@ def _parse_cookie_header(text: str) -> Dict[str, str]:
 
 __all__ = [
     "SessionBundle",
+    "SESSION_COOKIE_NAME",
+    "SESSION_COOKIE_CHUNK_SIZE",
+    "is_session_cookie_name",
+    "reassemble_session_token",
+    "chunk_session_cookie",
     "parse_session",
     "parse_session_bundle",
     "parse_statsig_context",
@@ -349,6 +432,6 @@ def identity_cookies_for_reissue(cookies: Dict[str, str]) -> Dict[str, str]:
     return {
         str(name): str(value)
         for name, value in (cookies or {}).items()
-        if name in REISSUE_COOKIE_ALLOWLIST and value is not None
+        if is_session_cookie_name(name) and value is not None
     }
 

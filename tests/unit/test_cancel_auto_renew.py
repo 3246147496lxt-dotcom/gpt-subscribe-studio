@@ -271,3 +271,204 @@ def test_cancel_account_auto_renew_is_idempotent_when_already_off(monkeypatch):
     res = auto_renew.cancel_account_auto_renew(sess)
     assert res["canceled"] is True
     assert res["stage"] == "already_canceled"
+
+
+def test_cancel_account_auto_renew_rotates_proxy_on_ssl_error(monkeypatch):
+    import base64
+    from datetime import datetime, timezone
+    from gss_api import auto_renew
+
+    class SSLError(Exception):
+        pass
+
+    monkeypatch.delenv("GSS_CANCEL_AUTORENEW_PATH", raising=False)
+    monkeypatch.setattr(auto_renew, "use_fake_adapters", lambda: False)
+    monkeypatch.setattr(
+        auto_renew,
+        "configured_proxy",
+        lambda role: "http://user-region-US-sid-init001:pw@proxy.test:1111",
+    )
+    monkeypatch.setattr(auto_renew, "cooling_sids", lambda: set())
+
+    payload = {
+        "exp": int(datetime.now(timezone.utc).timestamp()) + 3600,
+        "https://api.openai.com/profile": {"email": "u@example.test"},
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acc-ssl"},
+    }
+    tok = "h." + base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode() + ".s"
+    sess = json.dumps({"accessToken": tok})
+    seen_proxies = []
+
+    class FakeClient:
+        def __init__(self, proxy):
+            self.proxy = proxy
+            self.access_token = tok
+            self.account_id = "acc-ssl"
+            self.session_token = ""
+            self.timeout = 10.0
+
+        def subscription_payload(self):
+            if len(seen_proxies) == 1:
+                raise SSLError("curl: (35) BoringSSL SSL_connect: Connection closed abruptly (SSL_ERROR_SYSCALL)")
+            return {
+                "is_active": True,
+                "plan_type": "prolite",
+                "active_until": "2099-11-26T07:35:00Z",
+                "last_active_subscription": {"will_renew": False},
+            }
+
+        def close(self):
+            pass
+
+    def make_client(cls, raw, proxy=None, **kw):
+        seen_proxies.append(proxy)
+        return FakeClient(proxy)
+
+    monkeypatch.setattr(auto_renew.ChatGPTClient, "from_raw_session", classmethod(make_client))
+    res = auto_renew.cancel_account_auto_renew(sess, plan="pro_lite")
+    assert res["canceled"] is True
+    assert res["stage"] == "already_canceled"
+    assert len(seen_proxies) == 2
+    assert seen_proxies[0] != seen_proxies[1]
+
+
+def test_cancel_account_auto_renew_exhausted_proxy_raises_domain_error(monkeypatch):
+    import base64
+    from datetime import datetime, timezone
+    from gss_api import auto_renew
+
+    class SSLError(Exception):
+        pass
+
+    monkeypatch.delenv("GSS_CANCEL_AUTORENEW_PATH", raising=False)
+    monkeypatch.setattr(auto_renew, "use_fake_adapters", lambda: False)
+    monkeypatch.setattr(
+        auto_renew,
+        "configured_proxy",
+        lambda role: "http://user-region-US-sid-init001:pw@proxy.test:1111",
+    )
+    monkeypatch.setattr(auto_renew, "cooling_sids", lambda: set())
+
+    payload = {
+        "exp": int(datetime.now(timezone.utc).timestamp()) + 3600,
+        "https://api.openai.com/profile": {"email": "u@example.test"},
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acc-ssl-fail"},
+    }
+    tok = "h." + base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode() + ".s"
+    sess = json.dumps({"accessToken": tok})
+    attempts = []
+
+    class AlwaysFailClient:
+        access_token = tok
+        account_id = "acc-ssl-fail"
+        session_token = ""
+        timeout = 10.0
+
+        def subscription_payload(self):
+            raise SSLError("curl: (35) SSL_ERROR_SYSCALL")
+
+        def close(self):
+            pass
+
+    def make_client(cls, raw, proxy=None, **kw):
+        attempts.append(proxy)
+        return AlwaysFailClient()
+
+    monkeypatch.setattr(auto_renew.ChatGPTClient, "from_raw_session", classmethod(make_client))
+    with pytest.raises(DomainError) as exc:
+        auto_renew.cancel_account_auto_renew(sess)
+    assert exc.value.code is ErrorCode.CHECKOUT_UPSTREAM_ERROR
+    assert (exc.value.detail or {}).get("code") == "proxy_tunnel_failed"
+    assert len(attempts) == 3
+
+
+def test_cancel_subscription_direct_posts_account_id_and_refreshes_on_401(monkeypatch):
+    calls = []
+    refresh_calls = []
+
+    class _SeqHttp:
+        def __init__(self):
+            self.headers = {}
+
+        def post(self, url, json=None, headers=None, timeout=None, allow_redirects=False):
+            calls.append((url, json, dict(headers or {})))
+            status = 401 if len(calls) == 1 else 200
+            return type(
+                "Resp",
+                (),
+                {"status_code": status, "headers": {}, "text": "{}", "json": lambda self: {}},
+            )()
+
+    client = ChatGPTClient(access_token="old-at", session_token="st-live", account_id="acc-live-1")
+    client._http = _SeqHttp()
+    monkeypatch.setattr(
+        client,
+        "refresh_session",
+        lambda **kw: (refresh_calls.append(kw), setattr(client, "access_token", "new-at"), True)[2],
+    )
+    res = client.cancel_subscription_direct()
+    assert res["canceled"] is True
+    assert res["http_status"] == 200
+    assert len(calls) == 2
+    assert calls[0][0] == "https://chatgpt.com/backend-api/subscriptions/cancel"
+    assert calls[0][1] == {"account_id": "acc-live-1"}
+    assert calls[0][2]["chatgpt-account-id"] == "acc-live-1"
+    assert refresh_calls == [{"trust_statsig": False, "reject_unauthorized": False, "force_refresh": True}]
+
+
+def test_cancel_account_auto_renew_uses_first_party_chatgpt_api(monkeypatch):
+    import base64
+    from datetime import datetime, timezone
+    from gss_api import auto_renew
+
+    monkeypatch.delenv("GSS_CANCEL_AUTORENEW_PATH", raising=False)
+    monkeypatch.setattr(auto_renew, "use_fake_adapters", lambda: False)
+    monkeypatch.setattr(auto_renew, "configured_proxy", lambda role: None)
+
+    payload = {
+        "exp": int(datetime.now(timezone.utc).timestamp()) + 3600,
+        "https://api.openai.com/profile": {"email": "u@example.test"},
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acc-direct"},
+    }
+    tok = "h." + base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode() + ".s"
+    sess = json.dumps({"accessToken": tok, "sessionToken": "st"})
+
+    sub_calls = {"n": 0}
+    direct_calls = []
+
+    class DirectClient:
+        access_token = tok
+        account_id = "acc-direct"
+        session_token = "st"
+        timeout = 10.0
+
+        def subscription_payload(self):
+            sub_calls["n"] += 1
+            return {
+                "is_active": True,
+                "plan_type": "plus",
+                "active_until": "2026-12-27T03:01:00Z",
+                "is_processor_stripe": True,
+                "last_active_subscription": {"will_renew": sub_calls["n"] == 1},
+            }
+
+        def cancel_subscription_direct(self, *, account_id=""):
+            direct_calls.append(account_id)
+            return {"canceled": True, "http_status": 200}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(auto_renew.ChatGPTClient, "from_raw_session", classmethod(lambda cls, *a, **k: DirectClient()))
+    monkeypatch.setattr(
+        auto_renew,
+        "_request_portal_url",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fall back to portal when direct API succeeds")),
+    )
+
+    res = auto_renew.cancel_account_auto_renew(sess, plan="plus")
+    assert res["canceled"] is True
+    assert res["will_renew"] is False
+    assert res["stage"] == "chatgpt_api_canceled"
+    assert direct_calls == ["acc-direct"]
+    assert sub_calls["n"] == 2

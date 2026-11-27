@@ -19,12 +19,12 @@ from gss_core.proxies import GatewayStore, configured_proxy
 from .persistence import init_db
 from .store import store
 from .routers import (
-    account, events, locks, orders, promo, proxies, public_portal, quick_pay, saved_cards,
+    account, events, fixed_billing as fixed_billing_router, locks, orders, promo, proxies, public_portal, quick_pay, saved_cards,
     protocol_cards, runtime_flags as runtime_flags_router,
     system as system_router, webhooks as webhooks_router,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def _ensure_info_logging() -> None:
@@ -132,6 +132,7 @@ def create_app() -> FastAPI:
     app.state.gateway_store = GatewayStore()
     app.include_router(account.router)
     app.include_router(proxies.router)
+    app.include_router(fixed_billing_router.router)
     app.include_router(runtime_flags_router.router)
     app.include_router(webhooks_router.router)
     app.include_router(system_router.router)

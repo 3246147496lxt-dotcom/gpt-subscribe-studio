@@ -32,6 +32,11 @@ export function SessionPreviewBar({
       <Group gap={6} wrap="wrap">
         <Badge size="xs" color={badge.color} variant="light">{badge.label}</Badge>
         {info.maskedEmail && <Badge size="xs" color="gray" variant="outline">{info.maskedEmail}</Badge>}
+        {info.detectedOs && (
+          <Badge size="xs" color={info.detectedOs === "macOS" ? "indigo" : "blue"} variant="light">
+            导出端：{info.detectedOs}
+          </Badge>
+        )}
         {info.hasRefreshCredential && <Badge size="xs" color="teal" variant="light">含刷新凭证</Badge>}
         {info.hasCookies && <Badge size="xs" color="cyan" variant="light">含 Cookies</Badge>}
         <Text size="xs" c={info.state === "invalid" || (info.state === "expired" && !info.hasRefreshCredential) ? "red" : "dimmed"}>

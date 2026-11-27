@@ -40,6 +40,9 @@ def _retryable_sentinel_transport(exc: DomainError) -> bool:
     """A dead proxy SID returns CONNECT 404/407 before any checkout is created."""
     if exc.code is not ErrorCode.CHECKOUT_UPSTREAM_ERROR:
         return False
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    if detail.get("code") == "proxy_tunnel_failed" and detail.get("stage") == "checkout_prelude":
+        return True
     text = str(exc.message or "").lower()
     if "sentinel" not in text and "风控令牌" not in text:
         return False
@@ -136,13 +139,13 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         effective_session: Optional[str] = None
         effective_ua: Optional[str] = None
         effective_device_id: Optional[str] = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 created = await asyncio.to_thread(self._create, req, proxy)
                 break
             except DomainError as exc:
-                if attempt == 0 and proxy and _retryable_sentinel_transport(exc):
-                    logger.warning("checkout_sentinel_proxy_rotated code=%s", exc.code.value)
+                if attempt < 2 and proxy and _retryable_sentinel_transport(exc):
+                    logger.warning("checkout_sentinel_proxy_rotated attempt=%d code=%s", attempt + 1, exc.code.value)
                     proxy = rotate_proxy_sid(proxy, force=True)
                     rotated = await asyncio.to_thread(
                         self._reissue_for_rotated_exit, req.session, proxy, exit_country,
@@ -183,11 +186,21 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         raw_session: str, proxy: str, exit_country: str
     ) -> Optional[tuple[str, str, str]]:
         """Re-issue AT on the newly rotated exit IP when ST/refresh_token is present."""
+        from gss_core.session_token import is_access_token_expired
+
         if use_fake_adapters() or not runtime_flags.get_bool("reissue_session_on_exit"):
             return None
         try:
             bundle = parse_session_bundle(raw_session)
         except ValueError:
+            return None
+        if (
+            runtime_flags.get_bool("direct_session_checkout")
+            and bundle.access_token
+            and not is_access_token_expired(bundle.access_token, leeway_seconds=60)
+        ):
+            # Direct-session mode keeps the exported accessToken/oai-did intact
+            # across dead-SID proxy rotations instead of triggering /api/auth/session.
             return None
         if not bundle.session_token and not bundle.refresh_token:
             return None

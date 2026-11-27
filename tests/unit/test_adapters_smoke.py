@@ -197,3 +197,117 @@ def test_conflicting_subscription_plan_never_counts_as_active(monkeypatch):
     monkeypatch.setattr(adapter, "configured_proxy", lambda *a: None)
     monkeypatch.setattr(adapter.ChatGPTClient, "from_raw_session", lambda *a, **kw: client)
     assert not asyncio.run(UpstreamAccountAdapter().subscription_status("fixture")).active
+
+
+def test_live_subscriptions_schema_and_401_force_refresh(monkeypatch):
+    from types import SimpleNamespace
+    from gss_account import adapter
+    from gss_contracts.errors import DomainError, ErrorCode
+
+    refresh_calls = []
+    sub_calls = {"n": 0}
+
+    def sub_payload():
+        sub_calls["n"] += 1
+        if sub_calls["n"] == 1:
+            raise DomainError(ErrorCode.INVALID_SESSION, "401")
+        return {
+            "plan_type": "plus",
+            "is_active": True,
+            "is_delinquent": False,
+            "active_until": "2099-01-01T00:00:00Z",
+            "entitlement": {
+                "has_active_subscription": True,
+                "subscription_plan": "chatgptplusplan",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "is_delinquent": False,
+            },
+        }
+
+    def refresh_session(**kwargs):
+        refresh_calls.append(kwargs)
+        return True
+
+    client = SimpleNamespace(
+        session_token="st-live",
+        subscription_payload=sub_payload,
+        refresh_session=refresh_session,
+        close=lambda: None,
+    )
+    monkeypatch.setattr(adapter, "configured_proxy", lambda *a: None)
+    monkeypatch.setattr(adapter.ChatGPTClient, "from_raw_session", lambda *a, **kw: client)
+    info = asyncio.run(UpstreamAccountAdapter().subscription_status("fixture"))
+    assert info.active is True
+    assert info.raw_kind == "plus"
+    assert refresh_calls == [{"trust_statsig": False, "reject_unauthorized": False, "force_refresh": True}]
+
+
+@pytest.mark.parametrize(("plan_enum", "plan_type", "sub_plan"), [
+    (Plan.PRO_LITE, "prolite", "chatgptprolite"),
+    (Plan.PRO_LITE, "pro_lite", "chatgptproliteplan"),
+    (Plan.PRO_MAX, "promax", "chatgptpromax"),
+])
+def test_live_pro_lite_and_pro_max_plan_type_aliases(monkeypatch, plan_enum, plan_type, sub_plan):
+    from types import SimpleNamespace
+    from gss_account import adapter
+    from gss_api.routers.orders import _plan_matches
+    from gss_contracts import Order
+
+    payload = {
+        "plan_type": plan_type,
+        "is_active": True,
+        "is_delinquent": False,
+        "active_until": "2099-01-01T00:00:00Z",
+        "entitlement": {
+            "has_active_subscription": True,
+            "subscription_plan": sub_plan,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "is_delinquent": False,
+        },
+    }
+    client = SimpleNamespace(subscription_payload=lambda: payload, close=lambda: None)
+    monkeypatch.setattr(adapter, "configured_proxy", lambda *a: None)
+    monkeypatch.setattr(adapter.ChatGPTClient, "from_raw_session", lambda *a, **kw: client)
+    info = asyncio.run(UpstreamAccountAdapter().subscription_status("fixture"))
+    assert info.active is True
+    assert info.raw_kind == plan_type
+    order = Order(id="o-alias", plan=plan_enum, billing_country="US")
+    assert _plan_matches(order, info, SimpleNamespace(receipt_evidence=None, workspace_name=None, seat_quantity=None)) is True
+
+
+def test_subscription_status_rotates_proxy_sid_on_ssl_error(monkeypatch):
+    from types import SimpleNamespace
+    from gss_account import adapter
+
+    class SSLError(Exception):
+        pass
+
+    seen_proxies = []
+
+    def from_raw_session(session, proxy=None, **kw):
+        seen_proxies.append(proxy)
+        if len(seen_proxies) == 1:
+            def fail():
+                raise SSLError("curl: (35) SSL_ERROR_SYSCALL")
+            return SimpleNamespace(subscription_payload=fail, close=lambda: None)
+        return SimpleNamespace(
+            subscription_payload=lambda: {
+                "plan_type": "prolite",
+                "is_active": True,
+                "active_until": "2099-01-01T00:00:00Z",
+                "entitlement": {
+                    "has_active_subscription": True,
+                    "subscription_plan": "chatgptprolite",
+                    "expires_at": "2099-01-01T00:00:00Z",
+                },
+            },
+            close=lambda: None,
+        )
+
+    monkeypatch.setattr(adapter, "configured_proxy", lambda *a: "http://user-region-US-sid-old111:pw@proxy.test:1111")
+    monkeypatch.setattr(adapter, "cooling_sids", lambda: set())
+    monkeypatch.setattr(adapter.ChatGPTClient, "from_raw_session", from_raw_session)
+    info = asyncio.run(UpstreamAccountAdapter().subscription_status("fixture"))
+    assert info.active is True
+    assert len(seen_proxies) == 2
+    assert seen_proxies[0] != seen_proxies[1]

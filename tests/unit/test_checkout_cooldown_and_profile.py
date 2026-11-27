@@ -34,13 +34,26 @@ SESSION_UA = (
 # ── 1. 默认档案 ──────────────────────────────────────────────
 
 
-def test_default_profile_order_is_windows_only() -> None:
+def test_default_profile_order_and_os_profile_override(monkeypatch) -> None:
+    from gss_core import runtime_flags
+
     assert _PROFILE_ORDER == ["windows"]
-    for index in range(200):
-        profile = _pick_profile(f"device-{index}")
-        assert profile["key"] == "windows"
-        assert profile["platform"] == "Win32"
-        assert profile["label"] == "Windows"
+    runtime_flags.update_flags({"client_os_profile": "windows"})
+    try:
+        for index in range(50):
+            profile = _pick_profile(f"device-{index}")
+            assert profile["key"] == "windows"
+            assert profile["platform"] == "Win32"
+            assert profile["label"] == "Windows"
+
+        runtime_flags.update_flags({"client_os_profile": "macos"})
+        for index in range(50):
+            profile = _pick_profile(f"device-{index}")
+            assert profile["key"] == "macos"
+            assert profile["platform"] == "MacIntel"
+            assert profile["label"] == "macOS"
+    finally:
+        runtime_flags.reset_flags(["client_os_profile"])
 
 
 # ── 2. SID 冷却黑名单 ────────────────────────────────────────
@@ -187,17 +200,27 @@ def test_account_detail_reuses_session_device_identity() -> None:
         client.close()
 
 
-def test_account_detail_falls_back_to_windows_profile() -> None:
+def test_account_detail_falls_back_to_windows_profile(monkeypatch) -> None:
     from gss_api import account_detail
+    from gss_core.chatgpt import default_os_key
 
     client = account_detail._detail_read_client(
         json.dumps({"accessToken": "tok", "sessionToken": "st"}), None
     )
     try:
         assert client.device_id  # 缺省时才由出口重新生成
-        assert client.profile["key"] == "windows"
+        assert client.profile["key"] == default_os_key()
     finally:
         client.close()
+
+    monkeypatch.setenv("GSS_CLIENT_OS_PROFILE", "windows")
+    win_client = account_detail._detail_read_client(
+        json.dumps({"accessToken": "tok", "sessionToken": "st"}), None
+    )
+    try:
+        assert win_client.profile["key"] == "windows"
+    finally:
+        win_client.close()
 
 
 # ── 5. 重颁 → 建单的快照延续（同出口 Cookie / 设备） ─────────

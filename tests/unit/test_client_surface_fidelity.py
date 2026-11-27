@@ -491,8 +491,14 @@ def test_python_side_client_hints_follow_chromium_algorithm_and_preserve_overrid
     assert '"Not:A-Brand";v="99.0.0.0"' in client.sec_ch_ua_full_list
     ident = {k.lower(): v for k, v in client._identity_headers().items()}
     assert ident["sec-ch-ua-platform"] == '"macOS"'
-    assert ident["sec-ch-ua-arch"] == '"arm"'
-    assert ident["sec-ch-ua-platform-version"] == '"14.6.1"'
+    assert "sec-ch-ua-arch" not in ident
+    assert client.sentinel_profile["sec_ch_ua_arch"] == '"arm"'
+    assert client.sentinel_profile["sec_ch_ua_platform_version"] == '"14.6.1"'
+    # 收到 Accept-CH 协商后按 RFC 8942 输出高熵 hints
+    client._accepted_ch.update({"sec-ch-ua-arch", "sec-ch-ua-platform-version"})
+    ident_ch = {k.lower(): v for k, v in client._identity_headers().items()}
+    assert ident_ch["sec-ch-ua-arch"] == '"arm"'
+    assert ident_ch["sec-ch-ua-platform-version"] == '"14.6.1"'
 
 
 def test_same_origin_get_headers_and_wire_requests_drop_origin_and_content_type(monkeypatch):
@@ -783,7 +789,8 @@ def test_browser_context_headers_and_client_plus_har_version_sync():
     assert ident["sec-ch-ua"] == edge_ch
     assert ident["sec-ch-ua-platform"] == '"macOS"'
     assert ident["accept-language"] == "en-US,en;q=0.9"
-    assert ident["sec-ch-ua-full-version-list"] == (
+    assert "sec-ch-ua-full-version-list" not in ident
+    assert direct_client.sec_ch_ua_full_list == (
         '"Microsoft Edge";v="142.0.7444.175", "Chromium";v="142.0.7444.175", "Not_A Brand";v="99.0.0.0"'
     )
 
@@ -862,7 +869,7 @@ def test_wire_sentinel_ping_stripe_gets_and_warm_assets_drop_leaked_headers(monk
         session=json.dumps({"accessToken": "tok"}),
         client=client,
         publishable_key="pk_test_123",
-        card={"number": "4242424242424242"},
+        card={"number": "4242424242424242"},  # release-check: ignore
         read_only=True,
     )
     try:

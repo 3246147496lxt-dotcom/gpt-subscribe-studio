@@ -117,7 +117,7 @@ def test_chatgpt_client_wire_headers_and_single_cookie_after_warmup():
                  "sec-ch-ua-model"):
         assert hint not in warmup_map, f"冷导航不应携带高熵 hint {hint}"
     assert warmup_map["sec-ch-ua"] == client.sec_ch_ua
-    assert warmup_map["sec-ch-ua-platform"] == '"Windows"'
+    assert warmup_map["sec-ch-ua-platform"] == client._effective_hints()["sec-ch-ua-platform"]
     assert "text/html" in warmup_map["accept"]
     # HTTP/1.1 回环上 libcurl 不写 priority（RFC 9218 里它是 H2/H3 语义）；
     # 这里显式断言「没发出」，H2 线上的表现属于未验证边界，不做假绿断言。
@@ -141,25 +141,36 @@ def test_chatgpt_client_wire_headers_and_single_cookie_after_warmup():
     assert post_map["sec-fetch-dest"] == "empty"
 
     # No duplicate mixed-case sentinel/attestation headers and no X-GSS-* leak.
+    # 2026-11-26 真机实测：POST /payments/checkout 只发 openai-sentinel-token，不发 so-token / oai-session-id。
     assert lower_names.count("openai-sentinel-token") == 1
-    assert lower_names.count("openai-sentinel-so-token") == 1
+    assert "openai-sentinel-so-token" not in post_map
+    assert "oai-session-id" not in post_map
     assert lower_names.count("oai-web-deployment-attestation") == 1
     assert "x-gss-purchase-attempt" not in post_map
 
-    # Telemetry and Accept-Language match real Chrome HAR.
+    # Telemetry and Accept-Language match real Chrome capture.
     assert post_map["oai-telemetry"] == "[1,null]"
     assert post_map["accept-language"] == "en-PH,en;q=0.9"
+    assert post_map["referer"] == "https://chatgpt.com/"
 
-    # 高熵 Client Hints：真实 Chrome 在 chatgpt.com 的 API 请求上全部发送。
-    assert post_map["sec-ch-ua-full-version"] == f'"{build}"'
-    # 低熵与高熵必须共用同一个 GREASE 品牌（单一来源 gss_core.ua_ch）。
-    assert post_map["sec-ch-ua-full-version-list"] == client.sec_ch_ua_full_list
+    # 2026-11-26 真机实测：chatgpt.com 未下发 Accept-CH，默认只发低熵三件套，不发高熵 hints。
     grease_brand = client._grease_brand()[0]
     assert f'"{grease_brand}"' in post_map["sec-ch-ua"]
-    assert f'"{grease_brand}"' in post_map["sec-ch-ua-full-version-list"]
     assert f';v="{build.split(".")[0]}"' in post_map["sec-ch-ua"]
-    assert post_map["sec-ch-ua-model"] == '""'
+    assert post_map["sec-ch-ua-mobile"] == "?0"
+    assert post_map["sec-ch-ua-platform"] == client._effective_hints()["sec-ch-ua-platform"]
+    for he_hint in (
+        "sec-ch-ua-full-version",
+        "sec-ch-ua-full-version-list",
+        "sec-ch-ua-arch",
+        "sec-ch-ua-bitness",
+        "sec-ch-ua-platform-version",
+        "sec-ch-ua-model",
+    ):
+        assert he_hint not in post_map, f"未收到 Accept-CH 时不应发送高熵头 {he_hint}"
+    assert f'"{grease_brand}"' in client.sec_ch_ua_full_list
     assert post_map["x-openai-rate-limit-join-workspace"] == "1"
+    assert post_map["x-openai-rejoin-pro-cta"] == "1"
 
     # HAR 的 payments/* 上没有这些头：多发即指纹偏差。
     assert "x-oai-mcp-form-version" not in post_map
@@ -480,7 +491,14 @@ console.log(JSON.stringify({
 def test_stripe_http_carries_storage_access_and_tracks_browser_context():
     from types import SimpleNamespace
 
-    client = ChatGPTClient(access_token="tok", device_id="did-stripe-ctx")
+    client = ChatGPTClient(
+        access_token="tok",
+        device_id="did-stripe-ctx",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/146.0.7680.180 Safari/537.36"
+        ),
+    )
     try:
         hdrs0 = {k.lower(): v for k, v in client.stripe_http.headers.items()}
         assert hdrs0["sec-fetch-storage-access"] == "active"

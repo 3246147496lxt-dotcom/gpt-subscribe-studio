@@ -1,8 +1,11 @@
 # 项目状态总结
 
-**更新时间**: 2026-11-25  
+**更新时间**: 2026-11-27  
 **项目名称**: gpt-subscribe-studio  
-**当前阶段**: 四阶段自动化运维与工程稳定性优化完成
+**当前版本**: `v0.2.0`  
+**当前阶段**: 真实卡端到端闭环（建单 → 支付 → 核验 → 自动关续费）验证通过
+
+> 最新全链路实测复盘与运维速查手册见：[docs/LIVE_PAYMENT_RETROSPECTIVE_20261127.md](docs/LIVE_PAYMENT_RETROSPECTIVE_20261127.md)
 
 ## 架构与已上线能力总览
 
@@ -46,7 +49,13 @@
 
 ### 5. Web 前端工作台 (`apps/web`)
 - **按需懒加载与代码拆包**：非首屏面板与弹窗采用 `React.lazy` + 首次访问挂载，Vite `manualChunks` 将 React、Mantine 与图标拆分为独立分包，零大包警告。
-- **功能标签页**：一键充值（含前置体检、SSE 实时进度与队列监控）、批量体检与安全入队、分步调试、服务端开通记录（含套餐/日期筛选与 CSV 导出）、资金锁与对账台、代理设置、Webhook 通知设置，以及顶栏账号详情与系统自检维护弹窗。
+- **功能标签页**：一键充值（含前置体检、SSE 实时进度与队列监控）、批量体检与安全入队、分步调试、服务端开通记录（含套餐/日期筛选与 CSV 导出）、资金锁与对账台、代理设置、固定免税账单设置、运行开关面板、Webhook 通知设置，以及顶栏账号详情与系统自检维护弹窗。
+
+### 6. v0.2.0 真卡端到端闭环能力（2026-11-27 实测验证）
+- **直通建单与完整支付协议对齐**：支持 `direct_session_checkout` 直通模式与 `_soft_checkout_prelude` 预热、OS 画像统一（`client_os_profile`）、客户端 Stripe confirm 响应兼容（`_intent_settled_amount`）以及双 Sentinel + `m.stripe.com/6` 指纹采纳门禁。
+- **升级后核验与令牌轮转**：补齐 `prolite` / `promax` 无下划线套餐别名与短重试；刷新 `/api/auth/session` 附带 `X-OpenAI-Failed-Access-Token-Iat` 并清除旧 `.0/.1` 分片 Cookie，解决升级后 `401 token_expired` 卡核验问题。
+- **一等接口自动关闭续费**：实测确认 Stripe Customer Portal 已停用取消入口，切换至 `POST /backend-api/subscriptions/cancel` 为主路径（含 401 刷新重试与 3 出口 SID 代理轮换，保留 Stripe Portal + Playwright 兜底），已在真实订单 `4f927f13` 跑通 `delivered + auto_renew=canceled`。
+- **实时查号与精准风控诊断**：手动账号查询全面去缓存并内置 3-SID 代理断连自愈；修正 `subscription_limit` 语义与阶段映射（明确为卡指纹或设备 `oai-did` 订阅数上限，发生在 `confirming_payment`）。
 
 ## 验证与运行命令
 

@@ -56,9 +56,31 @@ def _run(secrets, context, spec, *, card=None, billing=None, read_only=False):
             return {"stage": "payment", "state": "unknown", "message": PAYMENT_UNCONFIRMED}
         client = ChatGPTClient.from_raw_session(secrets.session, proxy=secrets.proxy or None)
         client.timeout = 45.0
+        initial_at = client.access_token
+        initial_st = client.session_token
         try:
             return run_checkout_protocol(client, context, spec, card=card, billing=billing, read_only=read_only)
         finally:
+            if client.access_token and (client.access_token != initial_at or client.session_token != initial_st):
+                # Sync post-checkout upgraded AT + rotated ST back to in-memory vault
+                # so follow-up auto-renew cancellation and reconciliation use live credentials.
+                resolved_ua = getattr(client, "user_agent", "") or getattr(client, "ua", "")
+                updated_session = {
+                    "accessToken": client.access_token,
+                    "sessionToken": client.session_token,
+                    "deviceId": client.device_id,
+                    "sessionId": client.oai_session_id,
+                    "userAgent": resolved_ua,
+                    "cookies": dict(client.extra_cookies or {}),
+                    "statsigContext": {
+                        "deviceId": client.device_id,
+                        "userAgent": resolved_ua,
+                        "country": client.session_country or "",
+                    },
+                }
+                if getattr(client, "refresh_token", ""):
+                    updated_session["refresh_token"] = client.refresh_token
+                secrets.session = json.dumps(updated_session)
             client.close()
     finally:
         guard.release()
@@ -101,6 +123,7 @@ def _spec(order, view, secrets, payload=None):
             (current := vault.get(oid)) is not None and current is original()
         ),
         "account_id": secrets.account_id, "country": order.billing_country,
+        "plan": str(order.plan),
         "exit_country": getattr(secrets, "exit_country", "") or "",
         "promo": order.mode.billing_mode is BillingMode.PROMO,
         "promo_code": view.promo_code or "", "promo_campaign_id": view.promo_campaign_id or "",
@@ -338,8 +361,21 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
             # The worker can still complete after the HTTP request is cancelled.
             await _apply(order, secrets, view, context, {"stage": "payment", "state": "unknown"})
             raise
-        except Exception:  # A missing response is not evidence that the worker did not charge.
-            result = {"stage": "payment", "state": "unknown"}
+        except Exception as exc:  # A missing response is not evidence that the worker did not charge.
+            confirm_started = bool(context.get("app_confirmation_started") or context.get("intent_id"))
+            logger.warning(
+                "bind_and_pay_error id=%s type=%s confirm_started=%s",
+                order.id, type(exc).__name__, confirm_started,
+            )
+            if confirm_started:
+                result = {"stage": "payment", "state": "unknown"}
+            else:
+                result = {
+                    "stage": "checkout",
+                    "state": "failed",
+                    "code": "pre_confirm_transport_error",
+                    "message": f"支付前阶段异常（{type(exc).__name__}），未提交扣款，可安全重试",
+                }
         return await _apply(order, secrets, view, context, result)
 
 

@@ -486,7 +486,7 @@ export function SubscriptionStatusModal({
     if (open && session.trim()) {
       setExpandedRow(null);
       setShowAllInvoices(false);
-      void run(false);
+      void run(true);
     }
   }, [open, session, run]);
 

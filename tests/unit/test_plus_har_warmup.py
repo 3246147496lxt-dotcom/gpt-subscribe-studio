@@ -316,3 +316,69 @@ def test_free_account_still_reaches_the_checkout_path(monkeypatch):
 
     engine._prepare()  # must not raise
     assert engine.client is stub
+
+
+def test_direct_session_checkout_preserves_credentials_and_skips_reissue(monkeypatch):
+    class DirectStub(StubClient):
+        def warmup(self, **kwargs):
+            self.calls.append(("warmup", kwargs))
+
+    stub = DirectStub()
+    seen: list = []
+    _install(monkeypatch, "reauthorize_for_country", stub, seen)
+    _install(monkeypatch, "from_raw_session", stub, seen)
+    monkeypatch.setenv("GSS_DIRECT_SESSION_CHECKOUT", "1")
+    engine = build(exit_country="CL", plan="pro_lite")
+
+    engine._prepare()
+
+    assert [name for name, _ in seen] == ["from_raw_session"]
+    assert seen[0][1]["strip_ambient"] is False
+    assert stub.timeout == engine.timeout
+    assert engine.session_reissued is False
+    assert engine.checkout_id == "oaics_fixture"
+    assert stub.calls == [("warmup", {"reject_unauthorized": True})]
+
+
+def test_web_session_respects_chunked_session_cookie_without_duplication():
+    long_st = "a" * 4500
+    chunked = {
+        "__Secure-next-auth.session-token.0": long_st[:3933],
+        "__Secure-next-auth.session-token.1": long_st[3933:],
+    }
+    client = ChatGPTClient(
+        access_token="access-fixture",
+        session_token=long_st,
+        device_id="did-fixture",
+        extra_cookies=dict(chunked),
+    )
+    engine = build(client=client)
+    try:
+        web = engine._web_session()
+        jar = web.cookies.get_dict()
+        assert "__Secure-next-auth.session-token" not in jar
+        assert jar["__Secure-next-auth.session-token.0"] == chunked["__Secure-next-auth.session-token.0"]
+        assert jar["__Secure-next-auth.session-token.1"] == chunked["__Secure-next-auth.session-token.1"]
+    finally:
+        engine.close()
+        client.close()
+
+
+def test_active_plus_entitlement_matches_plan_aliases():
+    pro_lite_payload = {
+        "plan_type": "chatgptprolite",
+        "is_active": True,
+        "account_id": "acc-1",
+    }
+    assert har.active_plus_entitlement(pro_lite_payload, "acc-1", plan="pro_lite") is True
+    assert har.active_plus_entitlement(pro_lite_payload, "acc-1", plan="plus") is False
+    assert har.active_plus_entitlement(
+        {"plan_type": "pro", "is_active": True, "account_id": "acc-1"},
+        "acc-1",
+        plan="pro",
+    ) is True
+    assert har.active_plus_entitlement(
+        {"plan_type": "go", "is_active": True, "account_id": "acc-1"},
+        "acc-1",
+        plan="go",
+    ) is True

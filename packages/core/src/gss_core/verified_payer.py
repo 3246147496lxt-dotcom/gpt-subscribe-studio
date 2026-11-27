@@ -83,7 +83,9 @@ def _fixed_profile() -> VerifiedBilling:
 
 
 def load_profile() -> VerifiedBilling:
-    if os.environ.get("GSS_FIXED_BILLING_FILE", "").strip():
+    from .fixed_billing import has_fixed_billing_source
+
+    if has_fixed_billing_source():
         return _fixed_profile()
     configured = os.environ.get("GSS_VERIFIED_BILLING_FILE", "").strip()
     if not configured:

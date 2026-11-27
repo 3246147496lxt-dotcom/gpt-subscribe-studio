@@ -56,11 +56,16 @@ _PLAN_LABELS = {
     "go": "ChatGPT Go",
     "chatgptgoplan": "ChatGPT Go",
     "pro_lite": "ChatGPT Pro Lite",
+    "prolite": "ChatGPT Pro Lite",
     "chatgptprolite": "ChatGPT Pro Lite",
+    "chatgptproliteplan": "ChatGPT Pro Lite",
     "pro": "ChatGPT Pro",
     "chatgptpro": "ChatGPT Pro",
+    "chatgptproplan": "ChatGPT Pro",
     "pro_max": "ChatGPT Pro Max",
+    "promax": "ChatGPT Pro Max",
     "chatgptpromax": "ChatGPT Pro Max",
+    "chatgptpromaxplan": "ChatGPT Pro Max",
     "team": "ChatGPT Team",
     "chatgptteamplan": "ChatGPT Team",
     "free": "ChatGPT 免费版",
@@ -352,11 +357,51 @@ def _fetch_serial(session: str, access_token: str, calls, *,
 
     A 401 on the first request is retried once after exchanging the session
     cookie for a fresh access token; only a second failure is reported.
-    When ChatGPT's direct billing endpoints return no invoices for a Stripe
-    account, falls back to reading invoice history from the account's Stripe
-    Customer Portal session (strictly read-only, no ChatGPT credentials sent
-    to Stripe).
+    When the residential proxy drops TLS before any endpoint answers, rotates
+    to up to 2 fresh SIDs automatically so live queries stay reliable.
     """
+    candidate_proxies: List[Optional[str]] = [proxy]
+    if proxy:
+        for _ in range(2):
+            try:
+                rotated = rewrite_proxy_exit(proxy, sid=fresh_proxy_sid(exclude=cooling_sids()))
+            except Exception:  # noqa: BLE001
+                break
+            if rotated and rotated not in candidate_proxies:
+                candidate_proxies.append(rotated)
+
+    last_transport_error: Optional[DomainError] = None
+    for attempt_idx, active_proxy in enumerate(candidate_proxies):
+        try:
+            return _fetch_serial_once(
+                session,
+                access_token,
+                calls,
+                account_id=account_id,
+                proxy=active_proxy,
+                timeout=timeout,
+                include_invoices=include_invoices,
+                country=country,
+            )
+        except DomainError as exc:
+            if (exc.detail or {}).get("code") == "upstream_unavailable" and attempt_idx + 1 < len(candidate_proxies):
+                last_transport_error = exc
+                logger.warning(
+                    "account_detail_proxy_retry attempt=%s/%s reason=%s",
+                    attempt_idx + 1,
+                    len(candidate_proxies),
+                    (exc.detail or {}).get("reason") or "-",
+                )
+                continue
+            raise
+    if last_transport_error is not None:
+        raise last_transport_error
+    raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "订阅接口暂时不可达，请稍后重试。")
+
+
+def _fetch_serial_once(session: str, access_token: str, calls, *,
+                       account_id: str = "", proxy: Optional[str], timeout: float,
+                       include_invoices: bool = True, country: str = "") -> Dict[str, Any]:
     client = _detail_read_client(session, proxy, timeout=timeout, country=country)
     client.access_token = access_token
     merged: Dict[str, Any] = {}
@@ -388,8 +433,17 @@ def _fetch_serial(session: str, access_token: str, calls, *,
             if status == 401 and not refreshed:
                 refreshed = True
                 session_token_present = bool(getattr(client, "session_token", ""))
-                if session_token_present and client.refresh_session(
-                        trust_statsig=False, reject_unauthorized=False):
+                did_refresh = False
+                if session_token_present:
+                    try:
+                        did_refresh = bool(client.refresh_session(
+                            trust_statsig=False, reject_unauthorized=False, force_refresh=True,
+                        ))
+                    except TypeError:
+                        did_refresh = bool(client.refresh_session(
+                            trust_statsig=False, reject_unauthorized=False,
+                        ))
+                if did_refresh:
                     logger.info("account_detail_token_refreshed path=%s", path)
                     try:
                         payload, status, response = _request(client, path, call_params)
@@ -504,10 +558,17 @@ def _fetch_billing_history_sync(
         tx_params = {"limit": "20", **({"account_id": account_id} if account_id else {})}
         try:
             payload, status, _resp = _request(client, TRANSACTION_HISTORY_PATH, tx_params)
-            if status == 401 and getattr(client, "session_token", "") and client.refresh_session(
-                trust_statsig=False, reject_unauthorized=False,
-            ):
-                payload, status, _resp = _request(client, TRANSACTION_HISTORY_PATH, tx_params)
+            if status == 401 and getattr(client, "session_token", ""):
+                try:
+                    did_refresh = bool(client.refresh_session(
+                        trust_statsig=False, reject_unauthorized=False, force_refresh=True,
+                    ))
+                except TypeError:
+                    did_refresh = bool(client.refresh_session(
+                        trust_statsig=False, reject_unauthorized=False,
+                    ))
+                if did_refresh:
+                    payload, status, _resp = _request(client, TRANSACTION_HISTORY_PATH, tx_params)
             if status == 200 and isinstance(payload, dict) and isinstance(payload.get("transactions"), list):
                 tx_payload = payload
         except Exception:  # noqa: BLE001
@@ -1273,8 +1334,17 @@ def _request_portal_url(
             if status == 401 and not refreshed:
                 refreshed = True
                 session_token_present = bool(getattr(client, "session_token", ""))
-                if session_token_present and client.refresh_session(
-                        trust_statsig=False, reject_unauthorized=False):
+                did_refresh = False
+                if session_token_present:
+                    try:
+                        did_refresh = bool(client.refresh_session(
+                            trust_statsig=False, reject_unauthorized=False, force_refresh=True,
+                        ))
+                    except TypeError:
+                        did_refresh = bool(client.refresh_session(
+                            trust_statsig=False, reject_unauthorized=False,
+                        ))
+                if did_refresh:
                     logger.info("account_detail_portal_token_refreshed path=%s", path)
                     continue
             if status == 401:

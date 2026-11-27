@@ -66,14 +66,15 @@ def test_headers_match_capture_surface():
     d = DeviceProfile.random(country="JP")
     web = d.web_headers(referer="https://chatgpt.com/")
     for name in ("x-openai-checkout-source", "x-openai-rate-limit-join-workspace",
-                 "sec-ch-ua-full-version-list", "sec-ch-ua-model",
-                 "user-agent", "priority"):
+                 "x-openai-rejoin-pro-cta", "sec-ch-ua", "sec-ch-ua-mobile",
+                 "sec-ch-ua-platform", "user-agent", "priority"):
         assert name in web
-    # 与 ChatGPTClient 保持同一套 Web 客户端身份，不混发 macOS Codex WebView 专有头。
-    for forbidden in ("originator", "x-openai-codex-window-type", "x-openai-web-frontend"):
+    # 2026-11-26 真机实测：chatgpt.com 不发未协商的高熵 Client Hints，也不混发 Codex WebView 头。
+    for forbidden in ("originator", "x-openai-codex-window-type", "x-openai-web-frontend",
+                      "sec-ch-ua-full-version-list", "sec-ch-ua-model", "sec-ch-ua-arch"):
         assert forbidden not in web
     assert web["x-openai-checkout-source"] == "chatgpt_web_merged"
-    assert web["sec-ch-ua-model"] == '""'
+    assert d.client_hint_headers(include_high_entropy=True)["sec-ch-ua-model"] == '""'
 
     stripe = d.stripe_headers()
     assert stripe["origin"] == "https://js.stripe.com"
@@ -91,6 +92,7 @@ def test_plus_har_inherits_client_ua_when_raw_user_agent_is_blank(tmp_path, monk
     monkeypatch.setenv("GSS_DEVICE_STORE", str(tmp_path / "devices.json"))
     # 即使宿主机是 macOS 或环境变量偏置为 macOS，PlusHarProtocol 也必须对齐
     # 同一笔订单 ChatGPTClient.ua（Windows Chrome），避免建单与支付两阶段 OS/TLS 分裂。
+    monkeypatch.setenv("GSS_CLIENT_OS_PROFILE", "windows")
     monkeypatch.setenv("GSS_DEVICE_OS", "macos")
     client = ChatGPTClient(access_token="tok", device_id="did-win-align")
     assert client.user_agent == ""

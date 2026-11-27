@@ -695,3 +695,297 @@ def test_telemetry_gate_is_skipped_only_when_the_mode_is_off():
     engine.telemetry = _telemetry(engine, _OfflineBeacon())
 
     assert engine._confirmation_token() == "ctoken_fixture"
+
+
+def test_checkout_confirm_sends_dual_sentinel_and_server_confirm_headers():
+    """2026-11-26 Sample 5 [1151]: checkout/confirm carries approval token + checkout SO token."""
+    engine = PlusHarProtocol(
+        session="",
+        checkout_id=CHECKOUT_ID,
+        publishable_key="pk_live_fixture",
+        currency="PHP",
+        country="US",
+        device=DeviceProfile.random(country="PH", seed="confirm-hdrs"),
+        client=StubClient(),
+    )
+    engine.client.sentinel_token = '{"flow":"checkout_session_approval","p":"p1","c":"c1"}'
+    engine.client.sentinel_so = '{"flow":"chatgpt_checkout","so":"so1","c":"c2"}'
+
+    captured = {}
+
+    class CaptureWeb:
+        def request(self, method, url, **kwargs):
+            captured["headers"] = dict(kwargs.get("headers") or {})
+            return FakeResponse({
+                "status": "success",
+                "type": "payment_intent",
+                "client_secret": "pi_live_fixture_secret_abc",
+                "confirm_return_url": f"https://chatgpt.com/checkout/verify?stripe_session_id={CHECKOUT_ID}",
+            })
+
+        def close(self):
+            pass
+
+    engine._web_session = lambda: CaptureWeb()  # type: ignore[assignment]
+    engine._reset_web_session = lambda: None  # type: ignore[assignment]
+    engine._hydrate_confirmed_intent = lambda: None  # type: ignore[assignment]
+    engine.ctoken = "ctoken_fixture"
+    engine._app_confirm()
+
+    hdrs = {k.lower(): v for k, v in captured["headers"].items()}
+    assert hdrs["openai-sentinel-token"] == '{"flow":"checkout_session_approval","p":"p1","c":"c1"}'
+    assert hdrs["openai-sentinel-so-token"] == '{"flow":"chatgpt_checkout","so":"so1","c":"c2"}'
+    assert hdrs["x-oaics-server-confirm-card"] == "true"
+    assert hdrs["x-openai-checkout-method-retry"] == "1"
+    # Cleared immediately after confirm so stale tokens cannot leak.
+    assert engine.client.sentinel_token == ""
+    assert engine.client.sentinel_so == ""
+
+
+def test_publishable_key_payment_intent_amount_settles_receipt_without_amount_received():
+    """2026-11-26 Sample 5 [1155]: publishable-key PI confirm returns `amount`, not `amount_received`."""
+    from decimal import Decimal
+
+    engine = build_harness(currency="PHP")
+    engine.client = StubClient()
+    engine.intent_id = "pi_3UgEw6Fixture"
+    engine.receipt_expected_minor = 98214
+    engine.raw["intent"] = {
+        "id": "pi_3UgEw6Fixture",
+        "object": "payment_intent",
+        "amount": 98214,
+        "currency": "php",
+        "status": "succeeded",
+    }
+    engine._read_checkout = lambda: {  # type: ignore[assignment]
+        "checkout_session_id": CHECKOUT_ID,
+        "status": "complete",
+        "payment_status": "paid",
+        "client_secret": "pi_3UgEw6Fixture_secret_xyz",
+    }
+    engine._ack_checkout = lambda: True  # type: ignore[assignment]
+
+    out = engine._settle()
+    assert out.state == "paid"
+    assert engine.receipt_evidence is not None
+    assert engine.receipt_evidence.payment_id == "pi_3UgEw6Fixture"
+    assert engine.receipt_evidence.amount == Decimal("982.14")
+    assert engine.receipt_evidence.currency == "PHP"
+
+    # Explicit zero amount_received must still be rejected.
+    assert engine._bound_intent({
+        "id": "pi_3UgEw6Fixture",
+        "object": "payment_intent",
+        "amount": 98214,
+        "amount_received": 0,
+        "currency": "php",
+        "status": "succeeded",
+    }) is False
+
+
+def test_run_har_context_pre_confirm_transport_error_fails_without_unknown(monkeypatch):
+    def fail_before_confirm(self):
+        self.stage = "setup"
+        self.confirmation_started = False
+        raise TimeoutError("stripe confirmation_tokens timed out")
+
+    monkeypatch.setattr(PlusHarProtocol, "pay", fail_before_confirm)
+    context = {}
+    spec = {
+        "checkout_url": f"https://chatgpt.com/checkout/{PROCESSOR}/{CHECKOUT_ID}",
+        "checkout_id": CHECKOUT_ID,
+        "publishable_key": "pk_live_fixture",
+        "currency": "PHP",
+        "country": "US",
+        "processor": PROCESSOR,
+    }
+    payload = run_har_context(StubClient(), context, spec, card={"number": "4242"},
+                              billing={"email": "fixture@example.test", "country": "US"})
+    assert payload["state"] == "failed"
+    assert payload["code"] == "pre_confirm_transport_error"
+    assert not context.get("app_confirmation_started")
+
+
+def test_restore_account_skips_refresh_in_direct_session_mode(monkeypatch):
+    from gss_core.saved_cards import restore_account
+
+    class TrackingClient(StubClient):
+        def __init__(self):
+            self.refreshed = 0
+
+        def refresh_session(self, **kwargs):
+            self.refreshed += 1
+            return True
+
+    monkeypatch.setenv("GSS_DIRECT_SESSION_CHECKOUT", "1")
+    client = TrackingClient()
+    account_id = restore_account(client, expected="account_fixture")
+    assert account_id == "account_fixture"
+    assert client.refreshed == 0
+
+
+@pytest.mark.parametrize(
+    ("session_meta", "expected_field"),
+    [
+        (
+            {
+                "disable_saved_payment_methods": False,
+                "experiments": {
+                    "saved_payment_link_arm": "save_default_link",
+                    "saved_payment_link_initial_save_for_reuse": "true",
+                },
+            },
+            True,
+        ),
+        (
+            {
+                "disable_saved_payment_methods": False,
+                "experiments": {
+                    "saved_payment_link_arm": "save_default_link",
+                    "saved_payment_link_initial_save_for_reuse": "false",
+                },
+            },
+            False,
+        ),
+        (
+            {"disable_saved_payment_methods": False, "experiments": {"saved_payment_link_arm": "control"}},
+            None,
+        ),
+        (
+            {"disable_saved_payment_methods": False, "experiments": {}},
+            None,
+        ),
+        (
+            {
+                "disable_saved_payment_methods": True,
+                "experiments": {"saved_payment_link_arm": "save_default_link"},
+            },
+            None,
+        ),
+    ],
+)
+def test_checkout_confirm_save_choice_matches_session_experiments(session_meta, expected_field):
+    engine = build_harness()
+    engine.client = StubClient()
+    engine._sync_save_choice(session_meta)
+    engine.ctoken = "ctoken_fixture"
+    engine._reset_web_session = lambda: None  # type: ignore[assignment]
+    engine._hydrate_confirmed_intent = lambda: None  # type: ignore[assignment]
+    engine._app_confirm()
+
+    confirm = next(body for method, route, body in engine.app.calls
+                   if route == "/backend-api/payments/checkout/confirm")
+    if expected_field is None:
+        assert "save_payment_method_for_reuse" not in confirm
+    else:
+        assert confirm["save_payment_method_for_reuse"] is expected_field
+
+
+def test_subscription_active_force_refreshes_session_after_upgrade_401():
+    """2026-11-26 Sample 5 [1175]->[1179]: upgrading free->paid invalidates old AT (401)."""
+    from gss_contracts.errors import DomainError, ErrorCode
+
+    class Upgrade401Client(StubClient):
+        def __init__(self):
+            self.session_token = "st-live"
+            self.calls = []
+            self._sub_calls = 0
+
+        def subscription_payload(self):
+            self._sub_calls += 1
+            if self._sub_calls == 1:
+                raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
+            return {
+                "plan_type": "plus",
+                "is_active": True,
+                "entitlement": {"has_active_subscription": True, "subscription_plan": "chatgptplusplan"},
+            }
+
+        def refresh_session(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    engine = build_harness()
+    client = Upgrade401Client()
+    engine.client = client
+    assert engine._subscription_active() is True
+    assert client.calls == [{"trust_statsig": False, "reject_unauthorized": False, "force_refresh": True}]
+
+
+def test_active_plus_entitlement_accepts_live_prolite_and_promax():
+    from gss_core.plus_har_protocol import active_plus_entitlement
+
+    assert active_plus_entitlement(
+        {
+            "plan_type": "prolite",
+            "is_active": True,
+            "entitlement": {
+                "has_active_subscription": True,
+                "subscription_plan": "chatgptprolite",
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        },
+        account_id="acct-1",
+        plan="pro_lite",
+    ) is True
+    assert active_plus_entitlement(
+        {
+            "plan_type": "promax",
+            "is_active": True,
+            "entitlement": {
+                "has_active_subscription": True,
+                "subscription_plan": "chatgptpromax",
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        },
+        account_id="acct-1",
+        plan="pro_max",
+    ) is True
+
+
+def test_refresh_session_sends_failed_iat_and_replaces_chunked_session_cookie():
+    import base64
+    import json
+    from gss_core.chatgpt import ChatGPTClient
+    from gss_core.session_token import chunk_session_cookie
+
+    old_st = "A" * 4400
+    new_st = "B" * 4400
+    claims = {"iat": 1795746401, "exp": 1995746401}
+    old_at = "h." + base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode() + ".s"
+    new_at = "h." + base64.urlsafe_b64encode(json.dumps({"iat": 1795746999, "exp": 1995746999}).encode()).rstrip(b"=").decode() + ".s"
+
+    captured = {}
+
+    class FakeResp:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {"accessToken": new_at, "sessionToken": new_st}
+
+    class FakeHttp:
+        def __init__(self):
+            self.headers = {}
+            self.cookies = None
+
+        def get(self, url, headers=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            return FakeResp()
+
+    client = ChatGPTClient(
+        access_token=old_at,
+        session_token=old_st,
+        extra_cookies=chunk_session_cookie(old_st),
+    )
+    client._http = FakeHttp()
+    assert client.refresh_session(trust_statsig=False, reject_unauthorized=False, force_refresh=True) is True
+    assert captured["headers"].get("X-OpenAI-Failed-Access-Token-Iat") == "1795746401"
+    assert captured["headers"].get("X-OpenAI-Target-Path") == "/api/auth/session"
+    assert client.access_token == new_at
+    assert client.session_token == new_st
+    cookie_header = client._cookie_header()
+    assert "A" * 50 not in cookie_header
+    assert "__Secure-next-auth.session-token.0=" + ("B" * 3933) in cookie_header
+    assert "__Secure-next-auth.session-token.1=" + ("B" * (4400 - 3933)) in cookie_header

@@ -675,3 +675,45 @@ class RuntimeFlagsResetIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     keys: Optional[list[str]] = None
+
+
+class FixedBillingAddressIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    email: str
+    line1: str
+    city: str
+    state: str
+    postal_code: str
+    country: str = "US"
+
+
+class FixedBillingAddressOut(BaseModel):
+    name: str
+    email: str
+    line1: str
+    city: str
+    state: str
+    postal_code: str
+    country: str
+
+
+class FixedBillingStateOptionOut(BaseModel):
+    value: str
+    label: str
+
+
+class FixedBillingSettingsOut(BaseModel):
+    configured: bool
+    valid: bool
+    source: str
+    storage_label: str
+    can_delete: bool = False
+    error: Optional[str] = None
+    address: Optional[FixedBillingAddressOut] = None
+    verification_id: Optional[str] = None
+    updated_at: Optional[str] = None
+    strict_exit_match: bool = False
+    tax_free_states: list[FixedBillingStateOptionOut] = Field(default_factory=list)
+    default_sample: FixedBillingAddressOut

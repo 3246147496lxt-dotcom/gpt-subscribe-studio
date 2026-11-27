@@ -283,7 +283,7 @@ def post(client, **body):
     return client.post("/api/account/subscription-detail", json=body)
 
 
-def test_first_query_hits_upstream_and_second_serves_cache(api):
+def test_every_manual_query_hits_upstream_directly_without_cache(api):
     client, calls, db = api
     first = post(client, session=session_json())
     assert first.status_code == 200
@@ -293,8 +293,8 @@ def test_first_query_hits_upstream_and_second_serves_cache(api):
 
     second = post(client, session=session_json())
     assert second.status_code == 200
-    assert second.json()["cached"] is True
-    assert calls["count"] == 1  # cache hit must not touch the upstream
+    assert second.json()["cached"] is False
+    assert calls["count"] == 2  # manual queries always fetch live upstream data
 
 
 def test_force_refresh_bypasses_the_cache(api):
@@ -306,7 +306,7 @@ def test_force_refresh_bypasses_the_cache(api):
     assert calls["count"] == 2
 
 
-def test_upstream_failure_serves_stale_cache_with_warning(api, monkeypatch):
+def test_upstream_failure_returns_error_instead_of_stale_cache(api, monkeypatch):
     client, _calls, _db = api
     post(client, session=session_json())
 
@@ -316,9 +316,8 @@ def test_upstream_failure_serves_stale_cache_with_warning(api, monkeypatch):
 
     monkeypatch.setattr(account, "fetch_snapshot", failing)
     response = post(client, session=session_json(), forceRefresh=True)
-    assert response.status_code == 200
-    assert response.json()["stale"] is True
-    assert response.json()["warning"]
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "upstream_unavailable"
 
 
 def test_revoked_token_is_not_masked_by_a_cached_snapshot(api, monkeypatch):
