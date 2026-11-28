@@ -1763,6 +1763,7 @@ class ChatGPTClient:
         return _json(response)
 
     def mint_sentinel(self, *, flow: str, page_url: str = "", ping: bool = True) -> None:
+        sentinel_budget = float(os.environ.get("GSS_SENTINEL_TIMEOUT", "35") or 35)
         token = mint(
             flow=flow,
             device_id=self.device_id,
@@ -1772,7 +1773,7 @@ class ChatGPTClient:
             language=self.language,
             timezone=self.timezone,
             cookie_header=self._cookie_header(),
-            timeout_s=max(5.0, min(self.timeout, float(os.environ.get("GSS_SENTINEL_TIMEOUT", "15") or 15), 90.0)),
+            timeout_s=max(5.0, min(sentinel_budget, 90.0)),
             impersonate=self.impersonate,
             sec_ch_ua=self.sec_ch_ua,
             sec_ch_ua_platform=self._effective_hints().get("sec-ch-ua-platform", ""),

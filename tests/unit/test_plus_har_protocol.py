@@ -552,13 +552,79 @@ def test_reset_web_session_preserves_checkout_cookies():
 
 def test_sentinel_failure_is_fail_closed():
     from gss_contracts.errors import DomainError, ErrorCode
-    engine = PlusHarProtocol(session="", client=SimpleNamespace(
-        mint_sentinel=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("reqfail")),
-    ))
+    for err in (
+        RuntimeError("reqfail"),
+        DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "无法签发 ChatGPT 风控令牌（Sentinel）：proxy fetch: HTTP 403 forbidden"),
+        DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "无法签发 ChatGPT 风控令牌（Sentinel）：proxy fetch: HTTP 400 bad request"),
+    ):
+        calls = 0
+
+        def _fail(**kwargs):
+            nonlocal calls
+            calls += 1
+            raise err
+
+        engine = PlusHarProtocol(session="", client=SimpleNamespace(mint_sentinel=_fail))
+        engine.credentials_current = lambda: True
+        with pytest.raises(DomainError) as caught:
+            engine._sentinel("checkout_session_approval")
+        assert caught.value.code is ErrorCode.SENTINEL_CHALLENGE_FAILED
+        assert calls == 1  # Non-transient / 4xx failure must not retry.
+
+
+def test_sentinel_retries_once_on_transient_timeout_and_succeeds(monkeypatch):
+    from gss_contracts.errors import DomainError, ErrorCode
+    calls = 0
+
+    def _flaky(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "无法签发 ChatGPT 风控令牌（Sentinel）：sentinel bridge timed out。")
+
+    engine = PlusHarProtocol(session="", client=SimpleNamespace(mint_sentinel=_flaky))
+    engine.credentials_current = lambda: True
+    monkeypatch.setattr("gss_core.plus_har_protocol.sentinel_ping", lambda *a, **k: None)
+    engine._sentinel("chatgpt_checkout")
+    assert calls == 2
+
+
+def test_sentinel_transient_timeout_fails_closed_after_single_retry():
+    from gss_contracts.errors import DomainError, ErrorCode
+    calls = 0
+
+    def _always_timeout(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "sentinel bridge timed out")
+
+    engine = PlusHarProtocol(session="", client=SimpleNamespace(mint_sentinel=_always_timeout))
     engine.credentials_current = lambda: True
     with pytest.raises(DomainError) as caught:
-        engine._sentinel("checkout_session_approval")
+        engine._sentinel("chatgpt_checkout")
     assert caught.value.code is ErrorCode.SENTINEL_CHALLENGE_FAILED
+    assert calls == 2
+
+
+def test_sentinel_default_timeout_is_35s(monkeypatch):
+    from gss_core.chatgpt import ChatGPTClient
+    monkeypatch.delenv("GSS_SENTINEL_TIMEOUT", raising=False)
+    captured = {}
+
+    def _fake_mint(**kwargs):
+        captured.update(kwargs)
+        return {"p": "p-ok", "c": "c-ok"}
+
+    monkeypatch.setattr("gss_core.chatgpt.mint", _fake_mint)
+    client = ChatGPTClient(access_token="at-test")
+    assert client.timeout == 15.0
+    client.mint_sentinel(flow="chatgpt_checkout", ping=False)
+    assert captured["timeout_s"] == 35.0
+
+    monkeypatch.setenv("GSS_SENTINEL_TIMEOUT", "50")
+    captured.clear()
+    client.mint_sentinel(flow="chatgpt_checkout", ping=False)
+    assert captured["timeout_s"] == 50.0
 
 
 def test_subscription_limit_confirm_is_terminal_rejection():

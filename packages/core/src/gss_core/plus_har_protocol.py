@@ -733,22 +733,83 @@ class PlusHarProtocol:
         if budget > 0 and hasattr(self.telemetry, "deadline"):
             self.telemetry.deadline = time.time() + budget
 
+    @staticmethod
+    def _is_retryable_sentinel_error(exc: Exception) -> bool:
+        """Only retry transient timeout/tunnel blips; never retry 4xx/auth rejections."""
+        text = str(exc or "").lower()
+        if any(
+            tok in text
+            for tok in (
+                "400",
+                "401",
+                "403",
+                "429",
+                "token_revoked",
+                "invalid_session",
+                "unauthorized",
+                "forbidden",
+                "rate limit",
+            )
+        ):
+            return False
+        return any(
+            tok in text
+            for tok in (
+                "timed out",
+                "timeout",
+                "etimedout",
+                "proxyerror",
+                "proxy connect",
+                "tunnel connection failed",
+                "connect tunnel failed",
+                "econnreset",
+                "econnrefused",
+                "connection reset",
+                "socket hang up",
+                "ssl_connect",
+                "ssl_error_syscall",
+                "unexpected eof",
+                "broken pipe",
+                "epipe",
+                "curl: (7)",
+                "curl: (28)",
+                "curl: (35)",
+                "curl: (52)",
+                "curl: (56)",
+            )
+        )
+
     def _sentinel(self, flow: str) -> None:
         self._require_credentials()
         started = time.monotonic()
         logger.info("plus_har_sentinel_start flow=%s", flow)
-        try:
-            # 本方法自己按 HAR 设备档案补 ping，避免同一 /sentinel/req 回两次。
-            self.client.mint_sentinel(flow=flow, page_url="https://chatgpt.com/", ping=False)
-        except Exception as exc:  # noqa: BLE001
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            if attempt > 0:
+                self._require_credentials()
+                logger.warning(
+                    "plus_har_sentinel_retry flow=%s attempt=%d elapsed=%.2f type=%s",
+                    flow, attempt, time.monotonic() - started, type(last_exc).__name__,
+                )
+            try:
+                # 本方法自己按 HAR 设备档案补 ping，避免同一 /sentinel/req 回两次。
+                self.client.mint_sentinel(flow=flow, page_url="https://chatgpt.com/", ping=False)
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt == 0 and self._is_retryable_sentinel_error(exc):
+                    continue
+                break
+        if last_exc is not None:
             logger.warning(
                 "plus_har_sentinel_failed flow=%s type=%s elapsed=%.2f",
-                flow, type(exc).__name__, time.monotonic() - started,
+                flow, type(last_exc).__name__, time.monotonic() - started,
             )
             raise DomainError(
                 ErrorCode.SENTINEL_CHALLENGE_FAILED,
                 "Sentinel 风控令牌签发失败，已停止确认，未提交支付。",
-            ) from exc
+            ) from last_exc
         logger.info("plus_har_sentinel_ok flow=%s elapsed=%.2f", flow, time.monotonic() - started)
         ping_started = time.monotonic()
         try:
