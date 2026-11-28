@@ -29,6 +29,11 @@ export type HealthSnapshot = {
   webhooks: {
     enabled: boolean;
     configured: boolean;
+    webhook_enabled?: boolean;
+    webhook_configured?: boolean;
+    telegram_enabled?: boolean;
+    telegram_configured?: boolean;
+    active_channels?: string[];
     subscribed_events: number;
     recent_deliveries: number;
   };

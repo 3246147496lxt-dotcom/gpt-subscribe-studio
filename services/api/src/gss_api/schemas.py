@@ -576,13 +576,19 @@ class ReconcilerStatusOut(BaseModel):
 class WebhookConfigIn(BaseModel):
     model_config = ConfigDict(hide_input_in_errors=True)
 
-    enabled: bool = False
-    url: str = Field(default="", max_length=1000)
+    enabled: Optional[bool] = None
+    url: Optional[str] = Field(default=None, max_length=1000)
     secret: Optional[str] = Field(default=None, max_length=256, repr=False)
     clear_secret: bool = False
-    events: list[str] = Field(default_factory=lambda: [
-        "succeeded", "failed", "unknown", "requires_action", "paid_pending_delivery", "reconcile_resolved",
-    ])
+    events: Optional[list[str]] = None
+    telegram_enabled: Optional[bool] = None
+    telegram_bot_token: Optional[str] = Field(default=None, max_length=256, repr=False)
+    clear_telegram_token: bool = False
+    telegram_chat_id: Optional[str] = Field(default=None, max_length=128)
+    telegram_thread_id: Optional[int | str] = None
+    clear_telegram_thread_id: bool = False
+    telegram_api_base: Optional[str] = Field(default=None, max_length=300)
+    telegram_silent: Optional[bool] = None
 
 
 class WebhookConfigOut(BaseModel):
@@ -592,10 +598,19 @@ class WebhookConfigOut(BaseModel):
     has_secret: bool = False
     events: list[str] = Field(default_factory=list)
     supported_events: list[str] = Field(default_factory=list)
+    telegram_enabled: bool = False
+    telegram_has_token: bool = False
+    telegram_token_masked: str = ""
+    telegram_chat_id: str = ""
+    telegram_thread_id: Optional[int] = None
+    telegram_api_base: str = "https://api.telegram.org"
+    telegram_silent: bool = False
+    telegram_configured: bool = False
 
 
 class WebhookDeliveryOut(BaseModel):
     id: str
+    channel: str = "webhook"
     event: str
     ok: bool
     status_code: Optional[int] = None
@@ -616,6 +631,7 @@ class WebhookTestOut(BaseModel):
     elapsed_ms: int = 0
     error: Optional[str] = None
     delivery: Optional[WebhookDeliveryOut] = None
+    deliveries: list[WebhookDeliveryOut] = Field(default_factory=list)
 
 
 class BatchPreflightItemIn(BaseModel):

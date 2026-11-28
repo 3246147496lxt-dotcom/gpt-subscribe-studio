@@ -31,7 +31,7 @@ from .. import locks, order_vault
 from .events import notify_order_update
 from .orders import (
     PAID_AWAITING_ENTITLEMENT, PAYMENT_UNCONFIRMED,
-    _accept_receipt, _error, _mark_delivered, _receipt_for, _set_delivery_status,
+    _accept_receipt, _error, _mark_delivered, _notify_direct_order, _receipt_for, _set_delivery_status,
     _set_payment_status, _team_locks, _to_out, _verified_order_billing,
 )
 
@@ -247,6 +247,16 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
         if observed_brand:
             view.card_brand = observed_brand
     store.persist(order.id)
+    if payment_succeeded and result["state"] != "paid":
+        _notify_direct_order(order.id, "paid_pending_delivery", source="protocol_step", message=view.status_summary or PAID_AWAITING_ENTITLEMENT)
+    elif not payment_succeeded and result["stage"] in {"payment", "checkout"}:
+        st = result["state"]
+        if st in {"card_declined", "rejected", "failed"}:
+            _notify_direct_order(order.id, "failed", source="protocol_step", message=result.get("message") or view.status_summary or "支付失败")
+        elif st == "challenge_required":
+            _notify_direct_order(order.id, "requires_action", source="protocol_step", message=result.get("message") or "支付需要继续验证")
+        elif st == "unknown":
+            _notify_direct_order(order.id, "unknown", source="protocol_step", message=PAYMENT_UNCONFIRMED)
     result.update({
         "payment_status": view.payment_status,
         "delivery_status": view.delivery_status,

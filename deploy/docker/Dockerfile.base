@@ -1,0 +1,58 @@
+# 基础运行镜像（gss-api-base:py312）：只包含 Node + undici + Python 依赖 + Playwright 兜底层
+#
+# 仅在 deploy/server/requirements.txt 或本文件变更时重新构建：
+#   docker build -f deploy/docker/Dockerfile.base -t gss-api-base:py312 .
+#
+# 日常业务代码/前端发版走 deploy/docker/Dockerfile（基于本镜像仅叠加 ~2MB 代码层，秒级构建）。
+
+# ── 阶段 1：准备 node 与 undici（供 Sentinel Node 桥使用） ──────────
+FROM node:20-bookworm-slim AS nodeenv
+
+RUN mkdir -p /opt/nodedeps \
+ && cd /opt/nodedeps \
+ && npm init -y >/dev/null 2>&1 \
+ && npm install --omit=dev --no-audit --no-fund undici@6 >/dev/null 2>&1 \
+ && node -e "require('/opt/nodedeps/node_modules/undici'); console.log('undici ok')"
+
+# ── 阶段 2：重依赖运行底座 ───────────────────────────────────────
+FROM python:3.12-slim
+
+ARG DEPS_HASH=unknown
+LABEL gss.role="base" \
+      gss.deps_hash="${DEPS_HASH}"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl libatomic1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# node 二进制 + undici 依赖
+COPY --from=nodeenv /usr/local/bin/node /usr/local/bin/node
+COPY --from=nodeenv /opt/nodedeps/node_modules /app/node_modules
+ENV NODE_PATH=/app/node_modules
+
+# Python 依赖 + Playwright 兜底（自动关续费 Stripe Portal fallback）
+COPY deploy/server/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt \
+ && python -m playwright install --with-deps chromium
+
+ENV PYTHONPATH=/app/packages/contracts/src:/app/packages/core/src:/app/services/account/src:/app/services/checkout/src:/app/services/payment/src:/app/services/api/src:/app/services/orchestrator/src \
+    GSS_WEB_DIR=/app/web \
+    GSS_LOGIN_FILE=/app/login.html \
+    GSS_DATA_DIR=/data \
+    GSS_CONFIG_DIR=/config \
+    GSS_AUTH_FILE=/config/container-auth.json \
+    GSS_BIND_HOST=0.0.0.0 \
+    GSS_BIND_PORT=18120
+
+EXPOSE 18120
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS -o /dev/null -L "http://127.0.0.1:${GSS_BIND_PORT}/" || exit 1
+
+CMD ["sh", "-c", "exec python -m uvicorn app:app --host ${GSS_BIND_HOST} --port ${GSS_BIND_PORT}"]

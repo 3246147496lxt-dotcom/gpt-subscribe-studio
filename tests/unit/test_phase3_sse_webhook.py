@@ -259,3 +259,162 @@ def test_webhook_config_ssrf_signing_redaction_and_test_delivery(monkeypatch, _i
         r_health = client.get("/api/health")
         assert r_health.status_code == 200
         assert r_health.json()["webhooks"]["enabled"] is True
+
+
+def test_telegram_channel_config_html_redaction_and_test_delivery(monkeypatch, _isolated_phase3):
+    _db, _store, mgr = _isolated_phase3
+    captured: list[tuple[str, dict, dict]] = []
+
+    class DummyClient:
+        def __init__(self, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, *, content, headers):
+            captured.append((url, json.loads(content.decode("utf-8")), dict(headers)))
+            return SimpleNamespace(status_code=200, json=lambda: {"ok": True, "result": {"message_id": 42}})
+
+    monkeypatch.setattr(httpx, "AsyncClient", DummyClient)
+
+    # Telegram HTML masks email, escapes HTML special chars, maps Pro tier names, and strips secrets.
+    html_msg = mgr.build_telegram_html("succeeded", {
+        "order_id": "ord1234567890",
+        "job_id": "job9876543210",
+        "plan": "pro_max",
+        "exit_country": "ph",
+        "source": "quick_pay",
+        "account_email": "alice.smith@example.com",
+        "amount": "200.00",
+        "currency": "USD",
+        "elapsed_s": "21.4",
+        "auto_renew_status": "canceled",
+        "message": "ok <tag> & authorization: Bearer leakme999999999",
+        "session": "must-not-appear",
+    })
+    assert "Pro500" in html_msg
+    assert "PH" in html_msg
+    assert "一键充值" in html_msg
+    assert "al***@example.com" in html_msg
+    assert "alice.smith@example.com" not in html_msg
+    assert "&lt;tag&gt;" in html_msg
+    assert "leakme999999999" not in html_msg
+    assert "must-not-appear" not in html_msg
+    assert "已自动关闭" in html_msg
+
+    sample_token = "123456789:AAExampleFakeTokenForUnitTest12345"
+    with TestClient(main.create_app()) as client:
+        # Invalid token & chat_id rejected
+        assert client.put("/api/settings/webhooks", json={
+            "telegram_enabled": True,
+            "telegram_bot_token": "not-a-valid-token",
+            "telegram_chat_id": "123456789",
+        }).status_code == 400
+        assert client.put("/api/settings/webhooks", json={
+            "telegram_enabled": True,
+            "telegram_bot_token": sample_token,
+            "telegram_chat_id": "bad chat id!",
+        }).status_code == 400
+        # Enabling Telegram without token/chat_id rejected
+        assert client.put("/api/settings/webhooks", json={
+            "telegram_enabled": True,
+        }).status_code == 400
+
+        # Valid Telegram-only config (no generic webhook URL needed!)
+        r_save = client.put("/api/settings/webhooks", json={
+            "telegram_enabled": True,
+            "telegram_bot_token": sample_token,
+            "telegram_chat_id": "-1001234567890",
+            "telegram_thread_id": 77,
+            "telegram_silent": True,
+            "events": ["succeeded", "failed", "unknown", "manual_verdict"],
+        })
+        assert r_save.status_code == 200
+        cfg = r_save.json()
+        assert cfg["telegram_enabled"] is True
+        assert cfg["telegram_configured"] is True
+        assert cfg["telegram_has_token"] is True
+        assert cfg["telegram_chat_id"] == "-1001234567890"
+        assert cfg["telegram_thread_id"] == 77
+        assert cfg["telegram_silent"] is True
+        assert sample_token not in r_save.text
+        assert cfg["telegram_token_masked"].startswith("123456789:***")
+        assert stat.S_IMODE(os.stat(mgr._path()).st_mode) == 0o600
+
+        # Test Telegram channel delivery
+        r_test = client.post("/api/settings/webhooks/test?channel=telegram")
+        assert r_test.status_code == 200
+        body = r_test.json()
+        assert body["ok"] is True
+        assert body["delivery"]["channel"] == "telegram"
+        assert len(captured) == 1
+        sent_url, sent_json, _headers = captured[0]
+        assert sent_url == f"https://api.telegram.org/bot{sample_token}/sendMessage"
+        assert sent_json["chat_id"] == "-1001234567890"
+        assert sent_json["message_thread_id"] == 77
+        assert sent_json["parse_mode"] == "HTML"
+        assert sent_json["disable_notification"] is True
+
+        # Health summary reflects Telegram active channel
+        r_health = client.get("/api/health")
+        assert r_health.status_code == 200
+        wh = r_health.json()["webhooks"]
+        assert wh["enabled"] is True
+        assert wh["telegram_enabled"] is True
+        assert wh["active_channels"] == ["telegram"]
+
+
+def test_direct_order_and_manual_verdict_alerts_and_suppression(monkeypatch, _isolated_phase3):
+    _db, store, _mgr = _isolated_phase3
+    emitted: list[tuple[str, dict]] = []
+    monkeypatch.setattr(webhooks, "dispatch_event", lambda ev, data: emitted.append((ev, data)) or True)
+
+    order = Order(
+        id="ord-direct-1",
+        idempotency_key="idem-direct-1",
+        purchase_attempt_id="pa-direct-1",
+        plan=Plan.PLUS,
+        billing_country="US",
+        mode=Mode(),
+        status=OrderStatus.ACTIVE,
+        amount=Decimal("20.00"),
+    )
+    view = OrderView(
+        account_email="direct@example.com",
+        exit_country="PH",
+        amount="20.00",
+        currency="USD",
+        payment_status="succeeded",
+        delivery_status="pending",
+    )
+    store.orders[order.id] = order
+    store.views[order.id] = view
+
+    # Direct _mark_delivered notifies succeeded.
+    asyncio.run(orders_router._mark_delivered(order.id))
+    assert len(emitted) == 1
+    assert emitted[0][0] == "succeeded"
+    assert emitted[0][1]["order_id"] == "ord-direct-1"
+    assert emitted[0][1]["exit_country"] == "PH"
+
+    # Inside quick_pay suppression context, direct order alerts stay quiet (no duplicates),
+    # while force=True (manual_verdict / standalone reconciler) still fires.
+    emitted.clear()
+    with webhooks.suppress_direct_order_alerts():
+        orders_router._notify_direct_order(order.id, "failed", message="suppressed")
+        assert emitted == []
+        orders_router._notify_direct_order(
+            order.id,
+            "manual_verdict",
+            source="manual_verdict",
+            message="人工放行",
+            extra={"operator": "admin", "previous_status": "unknown", "verdict": "delivered"},
+            force=True,
+        )
+    assert len(emitted) == 1
+    assert emitted[0][0] == "manual_verdict"
+    assert emitted[0][1]["operator"] == "admin"

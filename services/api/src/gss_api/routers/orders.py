@@ -125,6 +125,7 @@ from ..schemas import (
 from ..persistence import get_db_optional, load_checkout_diagnostics
 from ..store import store
 from .. import locks, order_vault, purchase_claims
+from ..services import webhooks
 from .events import notify_order_update
 
 router = APIRouter(prefix="/api", tags=["orders"])
@@ -328,6 +329,52 @@ def _set_delivery_status(order_id: str, status: str, summary: Optional[str] = No
         view.receipt = _receipt_for(order, view)
 
 
+def _notify_direct_order(
+    order_id: str,
+    event: str,
+    *,
+    source: str = "orders_step",
+    message: str = "",
+    extra: Optional[Dict[str, Any]] = None,
+    force: bool = False,
+) -> None:
+    if not force and webhooks.direct_order_alerts_suppressed():
+        return
+    if event not in webhooks.SUPPORTED_EVENTS:
+        return
+    order = store.get_order(order_id)
+    view = store.view(order_id) if order is not None else None
+    next_url = ""
+    if view is not None and isinstance(view.next_action, dict):
+        next_url = str(view.next_action.get("redirect_url") or "")
+    amount = ""
+    currency = ""
+    if view is not None:
+        amount = view.paid_amount or view.amount or ""
+        currency = view.paid_currency or view.currency or ""
+    if not amount and order is not None and getattr(order, "amount", None) is not None:
+        amount = str(getattr(order, "amount"))
+    raw_plan = getattr(order, "plan", None) if order is not None else None
+    raw_status = getattr(order, "status", None) if order is not None else None
+    payload: Dict[str, Any] = {
+        "order_id": order_id,
+        "status": str(raw_status) if raw_status is not None else event,
+        "plan": (getattr(view, "plan_type", None) if view else None) or (str(raw_plan) if raw_plan else ""),
+        "account_email": (getattr(view, "account_email", None) if view else None) or "",
+        "exit_country": (getattr(view, "exit_country", None) if view else None) or str(getattr(order, "billing_country", "") or ""),
+        "amount": amount,
+        "currency": currency,
+        "failure_code": (getattr(view, "failure_code", None) if view else None) or "",
+        "auto_renew_status": (getattr(view, "auto_renew_status", None) if view else None) or "",
+        "next_action_url": next_url,
+        "source": source,
+        "message": message or ((getattr(view, "last_error", None) or getattr(view, "status_summary", None)) if view is not None else "") or "",
+    }
+    if extra:
+        payload.update(extra)
+    webhooks.dispatch_event(event, payload)
+
+
 async def _mark_payment_unknown(order: Order) -> None:
     """提交后的异常不是拒付凭据；查询和重复提交都不得重新扣款。"""
     store.update_status(order.id, OrderStatus.UNKNOWN)
@@ -336,6 +383,7 @@ async def _mark_payment_unknown(order: Order) -> None:
     view.next_action = None
     _set_payment_status(order.id, "processing", summary=PAYMENT_UNCONFIRMED)
     await notify_order_update(order.id, OrderStatus.UNKNOWN, {"payment_status": "processing"})
+    _notify_direct_order(order.id, "unknown", message=PAYMENT_UNCONFIRMED)
 
 
 def _accept_receipt(order: Order, evidence) -> bool:
@@ -1259,6 +1307,19 @@ async def manual_verdict_order(order_id: str, payload: OrderManualVerdictRequest
             "manual_verdict_applied order=%s prev=%s next=%s operator=%s lock_state=%s",
             order_id, prev_status, str(order.status), operator, lock_state or "-",
         )
+        _notify_direct_order(
+            order_id,
+            "manual_verdict",
+            source="manual_verdict",
+            message=note,
+            extra={
+                "operator": operator,
+                "previous_status": prev_status,
+                "verdict": verdict,
+                "status": str(order.status),
+            },
+            force=True,
+        )
         return OrderManualVerdictOut(
             order_id=order_id,
             previous_status=prev_status,
@@ -1895,8 +1956,14 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                 raise
         if checkout is None:
             raise _error(502, ErrorCode.CHECKOUT_UPSTREAM_ERROR, "建单未返回结果")
-    except HTTPException:
+    except HTTPException as exc:
         store.update_status(order.id, OrderStatus.REJECTED)
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        _notify_direct_order(
+            order.id,
+            "failed",
+            message=str(detail.get("message") or exc.detail or "建单失败"),
+        )
         raise
     except DomainError as exc:
         logger.info("stage_timing stage=create_checkout duration_ms=%.1f", (time.perf_counter() - checkout_started) * 1000)
@@ -1921,6 +1988,7 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
         error._checkout_order_id = order.id  # internal correlation only; not in the HTTP body
         view.last_error = error.detail["message"]
         store.update_status(order.id, OrderStatus.REJECTED)  # persists failure fields together
+        _notify_direct_order(order.id, "failed", message=view.last_error or "建单失败")
         logger.info(
             "checkout_failed id=%s plan=%s country=%s code=%s",
             order.id,
@@ -1940,8 +2008,9 @@ async def _create_order(payload: OrderCreateRequest, idempotency_key: str | None
                 raise HTTPException(409, "未取得结账账单核对结果，已停止付款。")
             require_verified_billing(checkout.billing, order_billing=verified,
                                      verification_id=verified.verification_id, profile=verified)
-        except HTTPException:
+        except HTTPException as exc:
             store.update_status(order.id, OrderStatus.REJECTED)
+            _notify_direct_order(order.id, "failed", message=str(exc.detail or "结账账单核对未通过"))
             raise
     view = store.view(order.id)
     view.billing_verified = verified is not None
@@ -2041,6 +2110,7 @@ async def _mark_delivered(order_id: str) -> None:
     view.receipt = _receipt_for(current, view)
     vault.drop(order_id)
     await notify_order_update(order_id, OrderStatus.DELIVERED, {"payment_confirmed": True})
+    _notify_direct_order(order_id, "succeeded", message=view.status_summary or "扣款成功，订阅已生效")
 
 
 def _team_client(secrets: OrderSecrets, country: str = "") -> ChatGPTClient:
@@ -2399,6 +2469,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         _set_payment_status(order_id, "failed", summary=f"支付失败：{message[:120]}")
         view.last_error = message
         await notify_order_update(order_id, OrderStatus.FAILED, {"error": message})
+        _notify_direct_order(order_id, "failed", message=message)
         raise error
     except Exception as exc:
         logger.warning("payment_unconfirmed id=%s type=%s", order_id, type(exc).__name__)
@@ -2419,12 +2490,16 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         if not _accept_receipt(order, payment.receipt_evidence):
             await _mark_payment_unknown(order)
             return _to_out(order)
+        _notify_direct_order(order_id, "paid_pending_delivery", message=PAID_AWAITING_ENTITLEMENT)
     elif payment.status in {PaymentStatus.PROCESSING, PaymentStatus.REQUIRES_ACTION}:
         if payment.provider_ref and payment.provider_ref.startswith("pi_"):
             view.observed_payment_id = payment.provider_ref
         _set_payment_status(order_id, "processing", summary="支付处理中，请勿重复提交")
+        if payment.status is PaymentStatus.REQUIRES_ACTION:
+            _notify_direct_order(order_id, "requires_action", message=view.last_error or "需要持卡人验证")
     elif payment.status is PaymentStatus.DECLINED:
         _set_payment_status(order_id, "failed", summary=view.last_error or "支付失败")
+        _notify_direct_order(order_id, "failed", message=view.last_error or "支付失败")
     logger.info(
         "pay_finished id=%s country=%s payment=%s order=%s error=%s",
         order_id,
@@ -2938,6 +3013,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
             store.update_status(order_id, OrderStatus.FAILED)
             _set_payment_status(order_id, "failed", summary=msg)
             store.persist(order_id)
+            _notify_direct_order(order_id, "failed", source="protocol_step", message=msg)
             return _protocol_out(order_id, state="failed", code=err_code, message=msg)
         logger.warning(
             "protocol_pay_unknown_domain id=%s code=%s msg=%s",
@@ -2980,18 +3056,23 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         delivered = await _verify_after_payment(order, view)
         response_state = "paid" if delivered else "pending"
         message = view.status_summary
+        if not delivered:
+            _notify_direct_order(order_id, "paid_pending_delivery", source="protocol_step", message=message or PAID_AWAITING_ENTITLEMENT)
     elif outcome.state == "rejected":
         msg = outcome.message or "上游业务拒绝"
         _set_payment_status(order_id, "failed", summary=msg)
         store.update_status(order_id, OrderStatus.REJECTED)
+        _notify_direct_order(order_id, "failed", source="protocol_step", message=msg)
         response_state, message = "rejected", msg
     elif outcome.state == "card_declined":
         _set_payment_status(order_id, "failed", summary=outcome.message or "支付失败")
         store.update_status(order_id, OrderStatus.FAILED)
+        _notify_direct_order(order_id, "failed", source="protocol_step", message=outcome.message or "支付失败")
         response_state, message = "card_declined", outcome.message
     elif outcome.state == "challenge_required":
         _set_payment_status(order_id, "processing", summary="支付需要继续验证")
         store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
+        _notify_direct_order(order_id, "requires_action", source="protocol_step", message=outcome.message or "支付需要继续验证")
         response_state, message = "challenge_required", outcome.message
     elif outcome.state == "pending":
         _set_payment_status(order_id, "processing", summary=outcome.message or "支付处理中")

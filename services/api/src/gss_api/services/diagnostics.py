@@ -160,6 +160,12 @@ def collect_diagnostics(*, gateway_store: Optional[GatewayStore] = None) -> Syst
     q_stats = order_flow.queue_stats()
     rec_stats = reconciler.status()
     wh_stats = webhooks.manager.health_summary()
+    active_ch = wh_stats.get("active_channels") or []
+    if active_ch:
+        ch_label = " + ".join("Telegram" if c == "telegram" else "Webhook" for c in active_ch)
+        alert_desc = f"告警通知已启用（{ch_label}）"
+    else:
+        alert_desc = "告警通知未启用"
     checks.append(SystemCheckOut(
         key="background_services",
         label="后台调度 / 对账 / 告警",
@@ -168,7 +174,7 @@ def collect_diagnostics(*, gateway_store: Optional[GatewayStore] = None) -> Syst
         message=(
             f"并发 {q_stats['running']}/{q_stats['max_concurrency']}（排队 {q_stats['queued']}）· "
             f"对账器{'运行中' if rec_stats['running'] else '未运行'} · "
-            f"Webhook{'已启用' if wh_stats['enabled'] else '未启用'}。"
+            f"{alert_desc}。"
         ),
     ))
 

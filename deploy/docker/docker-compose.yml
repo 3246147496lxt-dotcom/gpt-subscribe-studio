@@ -1,7 +1,9 @@
-# 纯协议版部署：只有 API 一个容器，无浏览器、无求解器
+# 纯协议版部署：只有 API 一个容器（依赖层已拆至 Dockerfile.base -> gss-api-base:py312）
 #
-# 用法：
+# 推荐直接使用仓库根目录的 ./scripts/deploy.sh 一键发版与回滚；
+# 手动用法：
 #   cd /opt/gss/src
+#   docker build -f deploy/docker/Dockerfile.base -t gss-api-base:py312 .   # 仅首次或依赖变更时
 #   docker compose -f deploy/docker/docker-compose.yml up -d --build
 #
 # 端口只发布到 127.0.0.1，对外仍由 caddy 反代，和裸机时的暴露面一致。

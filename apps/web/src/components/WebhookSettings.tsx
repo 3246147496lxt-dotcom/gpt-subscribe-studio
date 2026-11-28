@@ -14,7 +14,16 @@ import {
   TextInput,
   Tooltip,
 } from "@mantine/core";
-import { IconBell, IconBellRinging, IconCheck, IconHistory, IconRefresh, IconSend } from "@tabler/icons-react";
+import {
+  IconBell,
+  IconBellRinging,
+  IconBrandTelegram,
+  IconCheck,
+  IconHistory,
+  IconRefresh,
+  IconSend,
+  IconWebhook,
+} from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
@@ -29,23 +38,40 @@ import { AdminPageHeader } from "./AdminPageHeader";
 
 const EVENT_LABELS: Record<string, string> = {
   succeeded: "充值成功（succeeded）",
-  failed: "任务失败（failed）",
+  failed: "任务 / 建单失败（failed）",
   unknown: "扣款未知并加锁（unknown）",
-  requires_action: "需持卡人/本人验证（requires_action）",
+  requires_action: "需持卡人 / 3DS 验证（requires_action）",
   paid_pending_delivery: "已扣款待交付（paid_pending_delivery）",
   reconcile_resolved: "自动对账核销成功（reconcile_resolved）",
+  manual_verdict: "人工判定已执行（manual_verdict）",
 };
+
+const CRITICAL_EVENTS = ["failed", "unknown", "requires_action", "paid_pending_delivery", "manual_verdict"];
 
 export function WebhookSettings() {
   const [settings, setSettings] = useState<WebhookSettingsData | null>(null);
+
+  // Telegram Bot channel state
+  const [tgEnabled, setTgEnabled] = useState(false);
+  const [tgTokenInput, setTgTokenInput] = useState("");
+  const [tgClearToken, setTgClearToken] = useState(false);
+  const [tgChatId, setTgChatId] = useState("");
+  const [tgThreadId, setTgThreadId] = useState("");
+  const [tgApiBase, setTgApiBase] = useState("https://api.telegram.org");
+  const [tgSilent, setTgSilent] = useState(false);
+
+  // Generic Webhook channel state
   const [enabled, setEnabled] = useState(false);
   const [urlInput, setUrlInput] = useState("");
   const [secretInput, setSecretInput] = useState("");
   const [clearSecret, setClearSecret] = useState(false);
+
+  // Shared subscribed events
   const [events, setEvents] = useState<string[]>(Object.keys(EVENT_LABELS));
+
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
+  const [testingChannel, setTestingChannel] = useState<null | "telegram" | "webhook">(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -55,11 +81,21 @@ export function WebhookSettings() {
     try {
       const data = await getWebhookSettings();
       setSettings(data);
-      setEnabled(data.config.enabled);
-      setEvents(data.config.events);
+      const cfg = data.config;
+      setTgEnabled(Boolean(cfg.telegram_enabled));
+      setTgTokenInput("");
+      setTgClearToken(false);
+      setTgChatId(cfg.telegram_chat_id || "");
+      setTgThreadId(cfg.telegram_thread_id != null ? String(cfg.telegram_thread_id) : "");
+      setTgApiBase(cfg.telegram_api_base || "https://api.telegram.org");
+      setTgSilent(Boolean(cfg.telegram_silent));
+
+      setEnabled(Boolean(cfg.enabled));
       setUrlInput("");
       setSecretInput("");
       setClearSecret(false);
+
+      setEvents(cfg.events);
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "加载通知配置失败");
     } finally {
@@ -73,22 +109,59 @@ export function WebhookSettings() {
 
   const isDirty = useMemo(() => {
     if (!settings) return false;
-    if (enabled !== settings.config.enabled) return true;
+    const cfg = settings.config;
+    if (tgEnabled !== Boolean(cfg.telegram_enabled)) return true;
+    if (tgTokenInput.trim() !== "") return true;
+    if (tgClearToken) return true;
+    if (tgChatId.trim() !== (cfg.telegram_chat_id || "")) return true;
+    const prevThread = cfg.telegram_thread_id != null ? String(cfg.telegram_thread_id) : "";
+    if (tgThreadId.trim() !== prevThread) return true;
+    const prevBase = (cfg.telegram_api_base || "https://api.telegram.org").replace(/\/+$/, "");
+    const currBase = (tgApiBase.trim() || "https://api.telegram.org").replace(/\/+$/, "");
+    if (currBase !== prevBase) return true;
+    if (tgSilent !== Boolean(cfg.telegram_silent)) return true;
+
+    if (enabled !== Boolean(cfg.enabled)) return true;
     if (urlInput.trim() !== "") return true;
     if (secretInput.trim() !== "") return true;
     if (clearSecret) return true;
-    const prevSorted = [...settings.config.events].sort().join(",");
+
+    const prevSorted = [...cfg.events].sort().join(",");
     const currSorted = [...events].sort().join(",");
     return prevSorted !== currSorted;
-  }, [settings, enabled, urlInput, secretInput, clearSecret, events]);
+  }, [
+    settings,
+    tgEnabled,
+    tgTokenInput,
+    tgClearToken,
+    tgChatId,
+    tgThreadId,
+    tgApiBase,
+    tgSilent,
+    enabled,
+    urlInput,
+    secretInput,
+    clearSecret,
+    events,
+  ]);
 
   function handleDiscard() {
     if (!settings) return;
-    setEnabled(settings.config.enabled);
-    setEvents(settings.config.events);
+    const cfg = settings.config;
+    setTgEnabled(Boolean(cfg.telegram_enabled));
+    setTgTokenInput("");
+    setTgClearToken(false);
+    setTgChatId(cfg.telegram_chat_id || "");
+    setTgThreadId(cfg.telegram_thread_id != null ? String(cfg.telegram_thread_id) : "");
+    setTgApiBase(cfg.telegram_api_base || "https://api.telegram.org");
+    setTgSilent(Boolean(cfg.telegram_silent));
+
+    setEnabled(Boolean(cfg.enabled));
     setUrlInput("");
     setSecretInput("");
     setClearSecret(false);
+
+    setEvents(cfg.events);
     setError(null);
   }
 
@@ -97,21 +170,26 @@ export function WebhookSettings() {
     setError(null);
     setNotice(null);
     try {
-      const payload: {
-        enabled: boolean;
-        url?: string;
-        secret?: string;
-        clear_secret?: boolean;
-        events: string[];
-      } = {
+      const payload: Parameters<typeof saveWebhookSettings>[0] = {
         enabled,
         events,
         clear_secret: clearSecret,
+        telegram_enabled: tgEnabled,
+        clear_telegram_token: tgClearToken,
+        telegram_chat_id: tgChatId.trim(),
+        telegram_api_base: tgApiBase.trim() || "https://api.telegram.org",
+        telegram_silent: tgSilent,
       };
       if (urlInput.trim()) payload.url = urlInput.trim();
       if (secretInput.trim()) payload.secret = secretInput.trim();
+      if (tgTokenInput.trim()) payload.telegram_bot_token = tgTokenInput.trim();
+      if (tgThreadId.trim() === "") {
+        payload.clear_telegram_thread_id = true;
+      } else {
+        payload.telegram_thread_id = tgThreadId.trim();
+      }
       await saveWebhookSettings(payload);
-      setNotice("Webhook 通知配置已保存（权限 0600，绝不回显密钥）。");
+      setNotice("告警通知配置已保存（权限 0600，绝不回显 Bot Token 与签名密钥）。");
       await load();
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "保存失败");
@@ -120,27 +198,31 @@ export function WebhookSettings() {
     }
   }
 
-  async function handleTest() {
-    setTesting(true);
+  async function handleTest(channel: "telegram" | "webhook") {
+    setTestingChannel(channel);
     setError(null);
     setNotice(null);
     try {
-      const res = await testWebhook();
+      const res = await testWebhook(channel);
+      const label = channel === "telegram" ? "Telegram" : "Webhook";
       if (res.ok) {
-        setNotice(`测试告警发送成功（HTTP ${res.status_code} · ${res.elapsed_ms} ms）。`);
+        setNotice(`${label} 测试消息发送成功（HTTP ${res.status_code} · ${res.elapsed_ms} ms）。`);
       } else {
-        setError(`测试告警发送失败：${res.error || "未知错误"}`);
+        setError(`${label} 测试消息发送失败：${res.error || "未知错误"}`);
       }
       await load();
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "发送测试失败");
     } finally {
-      setTesting(false);
+      setTestingChannel(null);
     }
   }
 
   const deliveries: WebhookDelivery[] = settings?.deliveries ?? [];
-  const activeReady = Boolean(settings?.config.enabled && settings?.config.has_url);
+  const tgActive = Boolean(settings?.config.telegram_enabled && settings?.config.telegram_configured);
+  const whActive = Boolean(settings?.config.enabled && settings?.config.has_url);
+  const activeLabels = [tgActive ? "Telegram" : null, whActive ? "Webhook" : null].filter(Boolean);
+  const activeReady = activeLabels.length > 0;
 
   return (
     <Stack gap="md">
@@ -149,21 +231,31 @@ export function WebhookSettings() {
         badge={
           <span className={`ops-live-pill ${activeReady ? "ops-live-pill--ok" : "ops-live-pill--warn"}`}>
             <span className="ops-pulse-dot" aria-hidden="true" />
-            {activeReady ? "已启用推送" : "未启用"}
+            {activeReady ? `${activeLabels.join(" + ")} 已启用` : "未启用"}
           </span>
         }
-        subtitle="任务终态、需要 3DS 验证（requires_action）、账号加锁（unknown）与对账核销时异步推送脱敏通知，兼容飞书、钉钉、Slack 与通用 JSON。"
+        subtitle="覆盖一键充值、自助门户、分步协议、自动对账与人工判定全入口，实时推送脱敏状态摘要（绝不含卡号、Session 或账单原文）。"
         actions={
           <>
             <Button
               size="xs"
               variant="default"
-              leftSection={<IconSend size={14} />}
-              loading={testing}
-              disabled={!settings?.config.has_url || testing || saving}
-              onClick={() => void handleTest()}
+              leftSection={<IconBrandTelegram size={14} />}
+              loading={testingChannel === "telegram"}
+              disabled={!settings?.config.telegram_configured || testingChannel !== null || saving || isDirty}
+              onClick={() => void handleTest("telegram")}
             >
-              发送测试告警
+              测试 Telegram
+            </Button>
+            <Button
+              size="xs"
+              variant="default"
+              leftSection={<IconSend size={14} />}
+              loading={testingChannel === "webhook"}
+              disabled={!settings?.config.has_url || testingChannel !== null || saving || isDirty}
+              onClick={() => void handleTest("webhook")}
+            >
+              测试 Webhook
             </Button>
             <Button
               size="xs"
@@ -189,13 +281,138 @@ export function WebhookSettings() {
         </Alert>
       )}
 
-      {/* 配置卡片 */}
+      {/* Telegram Bot 推送卡片 */}
+      <section className="ops-panel">
+        <div className="ops-panel-head">
+          <div className="ops-panel-title-wrap">
+            <IconBrandTelegram size={16} stroke={1.9} />
+            <h3 className="ops-panel-title">Telegram Bot 实时推送</h3>
+            <Badge size="xs" color={tgActive ? "teal" : "gray"} variant="light">
+              {tgActive ? "运行中" : settings?.config.telegram_configured ? "已配置未启用" : "未配置"}
+            </Badge>
+            {isDirty && <Badge size="xs" color="orange" variant="light">有未保存更改</Badge>}
+          </div>
+          <Button
+            size="xs"
+            variant="light"
+            leftSection={<IconSend size={13} />}
+            loading={testingChannel === "telegram"}
+            disabled={!settings?.config.telegram_configured || testingChannel !== null || saving || isDirty}
+            onClick={() => void handleTest("telegram")}
+          >
+            发送测试消息
+          </Button>
+        </div>
+
+        <Stack gap="md">
+          <Switch
+            checked={tgEnabled}
+            onChange={(e) => setTgEnabled(e.currentTarget.checked)}
+            label="启用 Telegram Bot 异步告警"
+            description="在 Telegram 中找 @BotFather 创建 Bot 获取 Token，私聊给 Bot 发一条消息后通过 @userinfobot 获取你的数字 Chat ID（群组填 -100 开头的 ID）。"
+          />
+
+          <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="md">
+            <PasswordInput
+              label="Bot Token"
+              placeholder={
+                settings?.config.telegram_has_token
+                  ? `已配置：${settings.config.telegram_token_masked}（留空保持不变）`
+                  : "123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+              value={tgTokenInput}
+              onChange={(e) => {
+                setTgTokenInput(e.currentTarget.value);
+                setTgClearToken(false);
+              }}
+            />
+            <TextInput
+              label="Chat ID（个人数字 ID / 群组 -100... / @频道）"
+              placeholder="例如 123456789 或 -1001234567890"
+              value={tgChatId}
+              onChange={(e) => setTgChatId(e.currentTarget.value)}
+            />
+          </SimpleGrid>
+
+          {settings?.config.telegram_has_token && (
+            <Checkbox
+              checked={tgClearToken}
+              onChange={(e) => setTgClearToken(e.currentTarget.checked)}
+              label="清除已保存的 Bot Token"
+              size="xs"
+            />
+          )}
+
+          <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="md">
+            <TextInput
+              label="群组话题 ID（可选，message_thread_id）"
+              placeholder="普通私聊/群组留空；开启 Topics 的超级群填正整数"
+              value={tgThreadId}
+              onChange={(e) => setTgThreadId(e.currentTarget.value)}
+            />
+            <TextInput
+              label="Bot API 地址（默认官方直连）"
+              placeholder="https://api.telegram.org"
+              value={tgApiBase}
+              onChange={(e) => setTgApiBase(e.currentTarget.value)}
+            />
+          </SimpleGrid>
+
+          <Checkbox
+            checked={tgSilent}
+            onChange={(e) => setTgSilent(e.currentTarget.checked)}
+            label="静默推送（disable_notification，手机不响铃震动）"
+            size="sm"
+          />
+        </Stack>
+      </section>
+
+      {/* 共用订阅事件卡片 */}
       <section className="ops-panel">
         <div className="ops-panel-head">
           <div className="ops-panel-title-wrap">
             <IconBell size={16} stroke={1.9} />
-            <h3 className="ops-panel-title">Webhook 通道与订阅事件</h3>
-            {isDirty && <Badge size="xs" color="orange" variant="light">有未保存更改</Badge>}
+            <h3 className="ops-panel-title">订阅告警事件（Telegram 与 Webhook 共用）</h3>
+            <Badge size="xs" color="gray" variant="light">
+              已选 {events.length}/{Object.keys(EVENT_LABELS).length}
+            </Badge>
+          </div>
+          <Group gap="xs">
+            <Button
+              size="xs"
+              variant="subtle"
+              onClick={() => setEvents(Object.keys(EVENT_LABELS))}
+            >
+              全选
+            </Button>
+            <Button
+              size="xs"
+              variant="subtle"
+              onClick={() => setEvents(CRITICAL_EVENTS)}
+            >
+              仅异常与人工
+            </Button>
+          </Group>
+        </div>
+
+        <Checkbox.Group value={events} onChange={setEvents}>
+          <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="xs">
+            {Object.entries(EVENT_LABELS).map(([key, label]) => (
+              <Checkbox key={key} value={key} label={label} size="sm" />
+            ))}
+          </SimpleGrid>
+        </Checkbox.Group>
+      </section>
+
+      {/* 通用 Webhook 通道卡片 */}
+      <section className="ops-panel">
+        <div className="ops-panel-head">
+          <div className="ops-panel-title-wrap">
+            <IconWebhook size={16} stroke={1.9} />
+            <h3 className="ops-panel-title">通用 Webhook 通道（可选，兼容飞书 / 钉钉 / Slack）</h3>
+            <Badge size="xs" color={whActive ? "teal" : "gray"} variant="light">
+              {whActive ? "运行中" : settings?.config.has_url ? "已配置未启用" : "未配置"}
+            </Badge>
           </div>
         </div>
 
@@ -203,8 +420,8 @@ export function WebhookSettings() {
           <Switch
             checked={enabled}
             onChange={(e) => setEnabled(e.currentTarget.checked)}
-            label="启用 Webhook 异步告警"
-            description="发送负载仅包含脱敏后的订单号、作业号、金额与状态摘要，绝不包含卡号、Session 或账单地址。"
+            label="启用通用 HTTPS Webhook 推送"
+            description="可与 Telegram 同时启用；支持可选 HMAC-SHA256 签名头（X-GSS-Signature-256）。"
           />
 
           <TextInput
@@ -242,14 +459,6 @@ export function WebhookSettings() {
             )}
           </Group>
 
-          <Checkbox.Group label="订阅告警事件" value={events} onChange={setEvents}>
-            <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="xs" mt="xs">
-              {Object.entries(EVENT_LABELS).map(([key, label]) => (
-                <Checkbox key={key} value={key} label={label} size="sm" />
-              ))}
-            </SimpleGrid>
-          </Checkbox.Group>
-
           {!isDirty && (
             <Group justify="flex-end">
               <Button
@@ -273,18 +482,19 @@ export function WebhookSettings() {
           <div className="ops-panel-title-wrap">
             <IconHistory size={16} stroke={1.9} />
             <h3 className="ops-panel-title">近期投递审计记录</h3>
-            <Badge size="xs" color="gray" variant="light">{deliveries.length} / 30 条</Badge>
+            <Badge size="xs" color="gray" variant="light">{deliveries.length} / 50 条</Badge>
           </div>
         </div>
 
         {deliveries.length === 0 ? (
-          <Text size="sm" c="dimmed" py="md" ta="center">暂无 Webhook 投递记录。</Text>
+          <Text size="sm" c="dimmed" py="md" ta="center">暂无告警投递记录。</Text>
         ) : (
-          <Table.ScrollContainer minWidth={560}>
+          <Table.ScrollContainer minWidth={620}>
             <Table className="ledger-clean-table" highlightOnHover={false}>
               <Table.Thead>
                 <Table.Tr>
                   <Table.Th>结果</Table.Th>
+                  <Table.Th>通道</Table.Th>
                   <Table.Th>事件</Table.Th>
                   <Table.Th>HTTP / 错误</Table.Th>
                   <Table.Th>耗时 / 尝试</Table.Th>
@@ -294,6 +504,7 @@ export function WebhookSettings() {
               <Table.Tbody>
                 {deliveries.map((d) => {
                   const tone = d.ok ? "success" : "failed";
+                  const isTg = d.channel === "telegram";
                   return (
                     <Table.Tr key={d.id}>
                       <Table.Td>
@@ -302,8 +513,13 @@ export function WebhookSettings() {
                           {d.ok ? "成功" : "失败"}
                         </span>
                       </Table.Td>
+                      <Table.Td>
+                        <Badge size="xs" color={isTg ? "cyan" : "indigo"} variant="light">
+                          {isTg ? "Telegram" : "Webhook"}
+                        </Badge>
+                      </Table.Td>
                       <Table.Td><Code>{d.event}</Code></Table.Td>
-                      <Table.Td>{d.status_code ?? d.error ?? "-"}</Table.Td>
+                      <Table.Td>{d.error ? `${d.error}` : (d.status_code ?? "-")}</Table.Td>
                       <Table.Td><span className="ledger-time">{d.elapsed_ms} ms · {d.attempts} 次</span></Table.Td>
                       <Table.Td>
                         <Tooltip label={new Date(d.created_at).toLocaleString()} openDelay={250} withArrow>

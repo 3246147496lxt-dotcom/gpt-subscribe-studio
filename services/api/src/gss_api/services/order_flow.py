@@ -299,6 +299,27 @@ def _publish_sse(job: QuickPayJob) -> None:
         pass
 
 
+def _infer_job_source(job: QuickPayJob, event_name: Optional[str]) -> str:
+    if event_name == "reconcile_resolved":
+        return "reconciler"
+    key = str(job.idempotency_key or "")
+    if key.startswith("apikey:") or key.startswith("open_api:"):
+        return "open_api"
+    db = get_db_optional()
+    if db is not None:
+        try:
+            if db.get_api_task_by_job(job.id) is not None:
+                return "open_api"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if db.get_portal_task_by_job(job.id) is not None:
+                return "public_portal"
+        except Exception:  # noqa: BLE001
+            pass
+    return "quick_pay"
+
+
 def _notify_webhook(job: QuickPayJob, event_name: Optional[str] = None) -> None:
     event = event_name or job.status
     if event not in webhooks.SUPPORTED_EVENTS:
@@ -306,6 +327,23 @@ def _notify_webhook(job: QuickPayJob, event_name: Optional[str] = None) -> None:
     next_url = ""
     if isinstance(job.next_action, dict):
         next_url = str(job.next_action.get("redirect_url") or "")
+    plan = ""
+    account_email = ""
+    exit_country = ""
+    auto_renew_status = job.auto_renew_status or ""
+    if job.order_id:
+        order = orders.store.get_order(job.order_id)
+        view = orders.store.view(job.order_id) if order is not None else None
+        if order is not None:
+            raw_plan = getattr(order, "plan", None)
+            plan = (getattr(view, "plan_type", None) if view else None) or (str(raw_plan) if raw_plan else "")
+            exit_country = (getattr(view, "exit_country", None) if view else None) or str(getattr(order, "billing_country", "") or "")
+        if view is not None:
+            account_email = getattr(view, "account_email", None) or ""
+            if not auto_renew_status:
+                auto_renew_status = getattr(view, "auto_renew_status", None) or ""
+    total_ms = job.timings.get("total_ms") if isinstance(job.timings, dict) else None
+    elapsed_s = f"{float(total_ms) / 1000.0:.1f}" if isinstance(total_ms, (int, float)) and total_ms >= 0 else ""
     webhooks.dispatch_event(event, {
         "job_id": job.id,
         "order_id": job.order_id,
@@ -317,6 +355,12 @@ def _notify_webhook(job: QuickPayJob, event_name: Optional[str] = None) -> None:
         "lock_id": job.lock_id,
         "message": job.message,
         "next_action_url": next_url,
+        "plan": plan,
+        "account_email": account_email,
+        "exit_country": exit_country,
+        "auto_renew_status": auto_renew_status,
+        "elapsed_s": elapsed_s,
+        "source": _infer_job_source(job, event_name),
     })
 
 
@@ -595,12 +639,23 @@ async def run_quick_pay(job_id: str, payload: QuickPayRequest, idempotency_key: 
             job.timings["total_ms"] = int((time.monotonic() - run_started) * 1000)
             _event(job, "failed", job.message)
             _persist_job(job)
+            _notify_webhook(job)
             return job
         _set_stage(job, "preflight_passed", "前置体检通过")
 
         _set_stage(job, "creating_order", "已接受任务，开始建单")
         _event(job, "running", job.stage)
         stage_started: Dict[str, float] = {"creating_order": time.monotonic()}
+        with webhooks.suppress_direct_order_alerts():
+            return await _execute_quick_pay_body(job, payload, idempotency_key, run_started, stage_started)
+
+    async def _execute_quick_pay_body(
+        job: QuickPayJob,
+        payload: QuickPayRequest,
+        idempotency_key: str,
+        run_started: float,
+        stage_started: Dict[str, float],
+    ) -> QuickPayJob:
         try:
             create_kwargs: Dict[str, Any] = {
                 "plan": payload.plan,

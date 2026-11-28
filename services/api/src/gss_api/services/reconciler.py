@@ -290,6 +290,14 @@ async def reconcile_order(
                 )
                 if job is not None:
                     order_flow._notify_webhook(job, "reconcile_resolved")
+                else:
+                    orders._notify_direct_order(
+                        order_id,
+                        "reconcile_resolved",
+                        source="reconciler",
+                        message="只读对账核验通过，订阅已确认交付。",
+                        force=True,
+                    )
                 return {
                     "order_id": order_id,
                     "job_id": job.id if job else None,
@@ -388,6 +396,14 @@ async def reconcile_order(
                     _resolved_count += 1
                     if job is not None:
                         order_flow._notify_webhook(job, "reconcile_resolved")
+                    else:
+                        orders._notify_direct_order(
+                            order_id,
+                            "reconcile_resolved",
+                            source="reconciler",
+                            message="只读对账确认原单已付款并交付。",
+                            force=True,
+                        )
                 _record_event(
                     order_id, job.id if job else "",
                     event="succeeded" if delivered else "paid_pending_delivery",

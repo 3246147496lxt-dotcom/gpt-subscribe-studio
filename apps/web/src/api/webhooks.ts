@@ -7,10 +7,19 @@ export type WebhookConfig = {
   has_secret: boolean;
   events: string[];
   supported_events: string[];
+  telegram_enabled: boolean;
+  telegram_has_token: boolean;
+  telegram_token_masked: string;
+  telegram_chat_id: string;
+  telegram_thread_id?: number | null;
+  telegram_api_base: string;
+  telegram_silent: boolean;
+  telegram_configured: boolean;
 };
 
 export type WebhookDelivery = {
   id: string;
+  channel?: "webhook" | "telegram" | string;
   event: string;
   ok: boolean;
   status_code?: number | null;
@@ -31,6 +40,7 @@ export type WebhookTestResult = {
   elapsed_ms: number;
   error?: string | null;
   delivery?: WebhookDelivery | null;
+  deliveries?: WebhookDelivery[];
 };
 
 export async function getWebhookSettings(signal?: AbortSignal): Promise<WebhookSettings> {
@@ -38,11 +48,19 @@ export async function getWebhookSettings(signal?: AbortSignal): Promise<WebhookS
 }
 
 export async function saveWebhookSettings(input: {
-  enabled: boolean;
+  enabled?: boolean;
   url?: string;
   secret?: string;
   clear_secret?: boolean;
-  events: string[];
+  events?: string[];
+  telegram_enabled?: boolean;
+  telegram_bot_token?: string;
+  clear_telegram_token?: boolean;
+  telegram_chat_id?: string;
+  telegram_thread_id?: number | string | null;
+  clear_telegram_thread_id?: boolean;
+  telegram_api_base?: string;
+  telegram_silent?: boolean;
 }): Promise<WebhookConfig> {
   return requestJson<WebhookConfig>("/api/settings/webhooks", {
     method: "PUT",
@@ -50,8 +68,9 @@ export async function saveWebhookSettings(input: {
   });
 }
 
-export async function testWebhook(): Promise<WebhookTestResult> {
-  return requestJson<WebhookTestResult>("/api/settings/webhooks/test", {
+export async function testWebhook(channel: "all" | "webhook" | "telegram" = "all"): Promise<WebhookTestResult> {
+  const query = channel && channel !== "all" ? `?channel=${encodeURIComponent(channel)}` : "";
+  return requestJson<WebhookTestResult>(`/api/settings/webhooks/test${query}`, {
     method: "POST",
     timeoutMs: 20_000,
   });

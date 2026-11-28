@@ -826,13 +826,19 @@ export function OpsOverviewPanel({
 
             <button type="button" className="ops-config-tile" onClick={() => onNavigate("webhooks")}>
               <div className="ops-config-head">
-                <span className="ops-config-label">Webhook 告警通知</span>
+                <span className="ops-config-label">告警通知（TG / Webhook）</span>
                 <Badge
                   size="xs"
                   color={health?.webhooks.enabled && health?.webhooks.configured ? "green" : "gray"}
                   variant="light"
                 >
-                  {health?.webhooks.enabled && health?.webhooks.configured ? "已启用" : "未启用"}
+                  {health?.webhooks.enabled && health?.webhooks.configured
+                    ? (health.webhooks.active_channels?.length
+                      ? health.webhooks.active_channels
+                          .map((c) => (c === "telegram" ? "Telegram" : "Webhook"))
+                          .join(" + ")
+                      : "已启用")
+                    : "未启用"}
                 </Badge>
               </div>
               <div className="ops-config-val">
