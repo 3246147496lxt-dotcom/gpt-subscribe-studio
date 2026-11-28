@@ -16,6 +16,7 @@ def _ensure_isolated_dirs() -> Path:
         _TEST_RUNTIME_ROOT = Path(tempfile.mkdtemp(prefix="gss-pytest-"))
     os.environ.setdefault("GSS_DATA_DIR", str(_TEST_RUNTIME_ROOT / "data"))
     os.environ.setdefault("GSS_CONFIG_DIR", str(_TEST_RUNTIME_ROOT / "config"))
+    os.environ.setdefault("GSS_TELEGRAM_BOT_POLLING", "0")
     return _TEST_RUNTIME_ROOT
 
 

@@ -4,7 +4,9 @@ import {
   Button,
   Checkbox,
   Code,
+  Divider,
   Group,
+  NumberInput,
   PasswordInput,
   SimpleGrid,
   Stack,
@@ -59,6 +61,11 @@ export function WebhookSettings() {
   const [tgThreadId, setTgThreadId] = useState("");
   const [tgApiBase, setTgApiBase] = useState("https://api.telegram.org");
   const [tgSilent, setTgSilent] = useState(false);
+  const [tgBotCommands, setTgBotCommands] = useState(true);
+  const [tgDigestEnabled, setTgDigestEnabled] = useState(true);
+  const [tgDigestHour, setTgDigestHour] = useState<number>(22);
+  const [tgStreakThreshold, setTgStreakThreshold] = useState<number>(3);
+  const [tgDiskWarnMb, setTgDiskWarnMb] = useState<number>(1024);
 
   // Generic Webhook channel state
   const [enabled, setEnabled] = useState(false);
@@ -89,6 +96,11 @@ export function WebhookSettings() {
       setTgThreadId(cfg.telegram_thread_id != null ? String(cfg.telegram_thread_id) : "");
       setTgApiBase(cfg.telegram_api_base || "https://api.telegram.org");
       setTgSilent(Boolean(cfg.telegram_silent));
+      setTgBotCommands(cfg.telegram_bot_commands_enabled ?? true);
+      setTgDigestEnabled(cfg.telegram_digest_enabled ?? true);
+      setTgDigestHour(cfg.telegram_digest_hour ?? 22);
+      setTgStreakThreshold(cfg.telegram_streak_threshold ?? 3);
+      setTgDiskWarnMb(cfg.telegram_disk_warn_mb ?? 1024);
 
       setEnabled(Boolean(cfg.enabled));
       setUrlInput("");
@@ -120,6 +132,11 @@ export function WebhookSettings() {
     const currBase = (tgApiBase.trim() || "https://api.telegram.org").replace(/\/+$/, "");
     if (currBase !== prevBase) return true;
     if (tgSilent !== Boolean(cfg.telegram_silent)) return true;
+    if (tgBotCommands !== (cfg.telegram_bot_commands_enabled ?? true)) return true;
+    if (tgDigestEnabled !== (cfg.telegram_digest_enabled ?? true)) return true;
+    if (tgDigestHour !== (cfg.telegram_digest_hour ?? 22)) return true;
+    if (tgStreakThreshold !== (cfg.telegram_streak_threshold ?? 3)) return true;
+    if (tgDiskWarnMb !== (cfg.telegram_disk_warn_mb ?? 1024)) return true;
 
     if (enabled !== Boolean(cfg.enabled)) return true;
     if (urlInput.trim() !== "") return true;
@@ -138,6 +155,11 @@ export function WebhookSettings() {
     tgThreadId,
     tgApiBase,
     tgSilent,
+    tgBotCommands,
+    tgDigestEnabled,
+    tgDigestHour,
+    tgStreakThreshold,
+    tgDiskWarnMb,
     enabled,
     urlInput,
     secretInput,
@@ -155,6 +177,11 @@ export function WebhookSettings() {
     setTgThreadId(cfg.telegram_thread_id != null ? String(cfg.telegram_thread_id) : "");
     setTgApiBase(cfg.telegram_api_base || "https://api.telegram.org");
     setTgSilent(Boolean(cfg.telegram_silent));
+    setTgBotCommands(cfg.telegram_bot_commands_enabled ?? true);
+    setTgDigestEnabled(cfg.telegram_digest_enabled ?? true);
+    setTgDigestHour(cfg.telegram_digest_hour ?? 22);
+    setTgStreakThreshold(cfg.telegram_streak_threshold ?? 3);
+    setTgDiskWarnMb(cfg.telegram_disk_warn_mb ?? 1024);
 
     setEnabled(Boolean(cfg.enabled));
     setUrlInput("");
@@ -179,6 +206,11 @@ export function WebhookSettings() {
         telegram_chat_id: tgChatId.trim(),
         telegram_api_base: tgApiBase.trim() || "https://api.telegram.org",
         telegram_silent: tgSilent,
+        telegram_bot_commands_enabled: tgBotCommands,
+        telegram_digest_enabled: tgDigestEnabled,
+        telegram_digest_hour: tgDigestHour,
+        telegram_streak_threshold: tgStreakThreshold,
+        telegram_disk_warn_mb: tgDiskWarnMb,
       };
       if (urlInput.trim()) payload.url = urlInput.trim();
       if (secretInput.trim()) payload.secret = secretInput.trim();
@@ -364,6 +396,48 @@ export function WebhookSettings() {
             label="静默推送（disable_notification，手机不响铃震动）"
             size="sm"
           />
+
+          <Divider label="机器人交互指令、按钮操作与自动巡检预警" labelPosition="left" />
+
+          <Stack gap="xs">
+            <Switch
+              checked={tgBotCommands}
+              onChange={(e) => setTgBotCommands(e.currentTarget.checked)}
+              label="启用斜杠指令与卡片操作按钮（/status /orders /order /locks /disk /digest）"
+              description="严格仅响应上方 Chat ID 本人消息，支持一键「只读对账」与「重试关闭续费」，绝不触发扣款。"
+            />
+            <Switch
+              checked={tgDigestEnabled}
+              onChange={(e) => setTgDigestEnabled(e.currentTarget.checked)}
+              label="启用每日运行简报（按北京时间定时汇总当日成单、成功率、失败原因与磁盘余量）"
+            />
+          </Stack>
+
+          <SimpleGrid cols={{ base: 1, sm: 3 }} spacing="md">
+            <NumberInput
+              label="每日简报时间（北京时间 0–23 点）"
+              min={0}
+              max={23}
+              disabled={!tgDigestEnabled}
+              value={tgDigestHour}
+              onChange={(val) => setTgDigestHour(typeof val === "number" ? val : 22)}
+            />
+            <NumberInput
+              label="连续失败预警阈值（单，0=关闭）"
+              min={0}
+              max={20}
+              value={tgStreakThreshold}
+              onChange={(val) => setTgStreakThreshold(typeof val === "number" ? val : 3)}
+            />
+            <NumberInput
+              label="磁盘余量预警阈值（MB，0=关闭）"
+              min={0}
+              max={51200}
+              step={256}
+              value={tgDiskWarnMb}
+              onChange={(val) => setTgDiskWarnMb(typeof val === "number" ? val : 1024)}
+            />
+          </SimpleGrid>
         </Stack>
       </section>
 

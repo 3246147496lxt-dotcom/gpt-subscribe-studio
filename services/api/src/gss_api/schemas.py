@@ -589,6 +589,11 @@ class WebhookConfigIn(BaseModel):
     clear_telegram_thread_id: bool = False
     telegram_api_base: Optional[str] = Field(default=None, max_length=300)
     telegram_silent: Optional[bool] = None
+    telegram_bot_commands_enabled: Optional[bool] = None
+    telegram_digest_enabled: Optional[bool] = None
+    telegram_digest_hour: Optional[int] = Field(default=None, ge=0, le=23)
+    telegram_streak_threshold: Optional[int] = Field(default=None, ge=0, le=20)
+    telegram_disk_warn_mb: Optional[int] = Field(default=None, ge=0, le=51200)
 
 
 class WebhookConfigOut(BaseModel):
@@ -606,6 +611,11 @@ class WebhookConfigOut(BaseModel):
     telegram_api_base: str = "https://api.telegram.org"
     telegram_silent: bool = False
     telegram_configured: bool = False
+    telegram_bot_commands_enabled: bool = True
+    telegram_digest_enabled: bool = True
+    telegram_digest_hour: int = 22
+    telegram_streak_threshold: int = 3
+    telegram_disk_warn_mb: int = 1024
 
 
 class WebhookDeliveryOut(BaseModel):

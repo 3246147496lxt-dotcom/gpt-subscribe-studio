@@ -262,6 +262,11 @@ class WebhookConfig:
     telegram_thread_id: Optional[int] = None
     telegram_api_base: str = _DEFAULT_TELEGRAM_API_BASE
     telegram_silent: bool = False
+    telegram_bot_commands_enabled: bool = True
+    telegram_digest_enabled: bool = True
+    telegram_digest_hour: int = 22
+    telegram_streak_threshold: int = 3
+    telegram_disk_warn_mb: int = 1024
 
     @property
     def telegram_configured(self) -> bool:
@@ -283,6 +288,11 @@ class WebhookConfig:
             "telegram_api_base": self.telegram_api_base or _DEFAULT_TELEGRAM_API_BASE,
             "telegram_silent": self.telegram_silent,
             "telegram_configured": self.telegram_configured,
+            "telegram_bot_commands_enabled": self.telegram_bot_commands_enabled,
+            "telegram_digest_enabled": self.telegram_digest_enabled,
+            "telegram_digest_hour": self.telegram_digest_hour,
+            "telegram_streak_threshold": self.telegram_streak_threshold,
+            "telegram_disk_warn_mb": self.telegram_disk_warn_mb,
         }
 
 
@@ -321,6 +331,15 @@ class WebhookManager:
                 thread_id = validate_telegram_thread_id(thread_raw)
             except ValueError:
                 thread_id = None
+            def _int_opt(key: str, default: int, lo: int, hi: int) -> int:
+                raw = data.get(key)
+                if raw is None or raw == "":
+                    return default
+                try:
+                    return max(lo, min(hi, int(raw)))
+                except (TypeError, ValueError):
+                    return default
+
             return WebhookConfig(
                 enabled=bool(data.get("enabled")),
                 url=str(data.get("url") or "").strip(),
@@ -332,6 +351,11 @@ class WebhookManager:
                 telegram_thread_id=thread_id,
                 telegram_api_base=str(data.get("telegram_api_base") or "").strip().rstrip("/") or _DEFAULT_TELEGRAM_API_BASE,
                 telegram_silent=bool(data.get("telegram_silent")),
+                telegram_bot_commands_enabled=bool(data.get("telegram_bot_commands_enabled", True)),
+                telegram_digest_enabled=bool(data.get("telegram_digest_enabled", True)),
+                telegram_digest_hour=_int_opt("telegram_digest_hour", 22, 0, 23),
+                telegram_streak_threshold=_int_opt("telegram_streak_threshold", 3, 0, 20),
+                telegram_disk_warn_mb=_int_opt("telegram_disk_warn_mb", 1024, 0, 51200),
             )
 
     def save(
@@ -350,6 +374,11 @@ class WebhookManager:
         clear_telegram_thread_id: bool = False,
         telegram_api_base: Optional[str] = None,
         telegram_silent: Optional[bool] = None,
+        telegram_bot_commands_enabled: Optional[bool] = None,
+        telegram_digest_enabled: Optional[bool] = None,
+        telegram_digest_hour: Optional[int] = None,
+        telegram_streak_threshold: Optional[int] = None,
+        telegram_disk_warn_mb: Optional[int] = None,
     ) -> WebhookConfig:
         with self._lock:
             current = self.load()
@@ -392,6 +421,34 @@ class WebhookManager:
                 next_tg_api_base = validate_telegram_api_base(telegram_api_base)
 
             next_tg_silent = current.telegram_silent if telegram_silent is None else bool(telegram_silent)
+            next_tg_cmds = (
+                current.telegram_bot_commands_enabled
+                if telegram_bot_commands_enabled is None
+                else bool(telegram_bot_commands_enabled)
+            )
+            next_tg_digest = (
+                current.telegram_digest_enabled
+                if telegram_digest_enabled is None
+                else bool(telegram_digest_enabled)
+            )
+            if telegram_digest_hour is None:
+                next_tg_hour = current.telegram_digest_hour
+            else:
+                if not (0 <= int(telegram_digest_hour) <= 23):
+                    raise ValueError("每日简报推送小时须在 0 到 23 之间（北京时间）")
+                next_tg_hour = int(telegram_digest_hour)
+            if telegram_streak_threshold is None:
+                next_tg_streak = current.telegram_streak_threshold
+            else:
+                if not (0 <= int(telegram_streak_threshold) <= 20):
+                    raise ValueError("连续失败预警阈值须在 0 到 20 之间（0 表示关闭）")
+                next_tg_streak = int(telegram_streak_threshold)
+            if telegram_disk_warn_mb is None:
+                next_tg_disk = current.telegram_disk_warn_mb
+            else:
+                if not (0 <= int(telegram_disk_warn_mb) <= 51200):
+                    raise ValueError("磁盘余量预警阈值须在 0 到 51200 MB 之间（0 表示关闭）")
+                next_tg_disk = int(telegram_disk_warn_mb)
 
             if next_tg_enabled and (not next_tg_token or not next_tg_chat_id):
                 raise ValueError("启用 Telegram 通知前请先填写 Bot Token 与 Chat ID")
@@ -412,6 +469,11 @@ class WebhookManager:
                 telegram_thread_id=next_tg_thread_id,
                 telegram_api_base=next_tg_api_base,
                 telegram_silent=next_tg_silent,
+                telegram_bot_commands_enabled=next_tg_cmds,
+                telegram_digest_enabled=next_tg_digest,
+                telegram_digest_hour=next_tg_hour,
+                telegram_streak_threshold=next_tg_streak,
+                telegram_disk_warn_mb=next_tg_disk,
             )
             path = self._path()
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -428,6 +490,11 @@ class WebhookManager:
                     "telegram_thread_id": cfg.telegram_thread_id,
                     "telegram_api_base": cfg.telegram_api_base,
                     "telegram_silent": cfg.telegram_silent,
+                    "telegram_bot_commands_enabled": cfg.telegram_bot_commands_enabled,
+                    "telegram_digest_enabled": cfg.telegram_digest_enabled,
+                    "telegram_digest_hour": cfg.telegram_digest_hour,
+                    "telegram_streak_threshold": cfg.telegram_streak_threshold,
+                    "telegram_disk_warn_mb": cfg.telegram_disk_warn_mb,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -621,6 +688,46 @@ class WebhookManager:
             logger.warning("webhook_delivery_failed event=%s status=%s err=%s", event, status_code, last_error)
         return record
 
+    @staticmethod
+    def build_telegram_reply_markup(
+        cfg: WebhookConfig,
+        event: str,
+        data: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        if not cfg.telegram_bot_commands_enabled:
+            return None
+        order_id = str(data.get("order_id") or "").strip()
+        if event == "webhook_test":
+            return {
+                "inline_keyboard": [[
+                    {"text": "📊 今日状态", "callback_data": "st:"},
+                    {"text": "📋 最近订单", "callback_data": "ol:"},
+                ]]
+            }
+        if not order_id or len(order_id) > 56:
+            return None
+        ar_status = str(data.get("auto_renew_status") or "").strip().lower()
+        if event in {"unknown", "requires_action", "paid_pending_delivery"}:
+            return {
+                "inline_keyboard": [[
+                    {"text": "🔍 订单详情", "callback_data": f"od:{order_id}"},
+                    {"text": "🔄 只读对账", "callback_data": f"rc:{order_id}"},
+                ]]
+            }
+        if event in {"succeeded", "reconcile_resolved"} and ar_status in {"failed", "manual_required", "pending"}:
+            return {
+                "inline_keyboard": [[
+                    {"text": "🔍 订单详情", "callback_data": f"od:{order_id}"},
+                    {"text": "🛑 重试关闭续费", "callback_data": f"ar:{order_id}"},
+                ]]
+            }
+        return {
+            "inline_keyboard": [[
+                {"text": "🔍 订单详情", "callback_data": f"od:{order_id}"},
+                {"text": "📊 今日状态", "callback_data": "st:"},
+            ]]
+        }
+
     async def deliver_telegram(
         self,
         cfg: WebhookConfig,
@@ -640,6 +747,9 @@ class WebhookManager:
         }
         if cfg.telegram_thread_id is not None:
             body_obj["message_thread_id"] = int(cfg.telegram_thread_id)
+        reply_markup = self.build_telegram_reply_markup(cfg, event, data)
+        if reply_markup is not None:
+            body_obj["reply_markup"] = reply_markup
         body_bytes = json.dumps(body_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -740,6 +850,11 @@ class WebhookManager:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             scheduled = True
+            try:
+                from . import telegram_bot
+                telegram_bot.on_order_event(cfg, event, data)
+            except Exception:  # noqa: BLE001
+                pass
         return scheduled
 
     async def send_test(self, channel: str = "all") -> dict[str, Any]:

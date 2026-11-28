@@ -74,7 +74,7 @@ def create_app() -> FastAPI:
     except Exception:  # noqa: BLE001
         pass
     from .locks import recover_incomplete_jobs
-    from .services import order_flow, reconciler, reference_pricing, webhooks as webhook_svc
+    from .services import order_flow, reconciler, reference_pricing, telegram_bot, webhooks as webhook_svc
     recover_incomplete_jobs()
 
     @asynccontextmanager
@@ -82,9 +82,11 @@ def create_app() -> FastAPI:
         order_flow.reset_shutdown()
         reconciler.start()
         reference_pricing.start()
+        telegram_bot.start()
         try:
             yield
         finally:
+            await telegram_bot.stop()
             await reference_pricing.stop()
             await reconciler.stop()
             await order_flow.drain_quick_pay(keep_draining=False)
@@ -161,6 +163,7 @@ def create_app() -> FastAPI:
             "reconciler": reconciler.status(),
             "reference_pricing": reference_pricing.status(),
             "webhooks": webhook_svc.manager.health_summary(),
+            "telegram_bot": telegram_bot.status(),
         }
 
     # ── 出口代理连接失败 → 503（而不是裸 500）────────────────────

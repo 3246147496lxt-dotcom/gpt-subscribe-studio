@@ -40,6 +40,21 @@ async def save_webhooks(payload: WebhookConfigIn) -> WebhookConfigOut:
             clear_telegram_thread_id=payload.clear_telegram_thread_id,
             telegram_api_base=payload.telegram_api_base if "telegram_api_base" in fields else None,
             telegram_silent=payload.telegram_silent if "telegram_silent" in fields else None,
+            telegram_bot_commands_enabled=(
+                payload.telegram_bot_commands_enabled if "telegram_bot_commands_enabled" in fields else None
+            ),
+            telegram_digest_enabled=(
+                payload.telegram_digest_enabled if "telegram_digest_enabled" in fields else None
+            ),
+            telegram_digest_hour=(
+                payload.telegram_digest_hour if "telegram_digest_hour" in fields else None
+            ),
+            telegram_streak_threshold=(
+                payload.telegram_streak_threshold if "telegram_streak_threshold" in fields else None
+            ),
+            telegram_disk_warn_mb=(
+                payload.telegram_disk_warn_mb if "telegram_disk_warn_mb" in fields else None
+            ),
         )
     except ValueError as exc:
         raise HTTPException(400, detail={"code": "invalid_webhook_config", "message": str(exc)}) from None

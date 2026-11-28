@@ -15,6 +15,11 @@ export type WebhookConfig = {
   telegram_api_base: string;
   telegram_silent: boolean;
   telegram_configured: boolean;
+  telegram_bot_commands_enabled?: boolean;
+  telegram_digest_enabled?: boolean;
+  telegram_digest_hour?: number;
+  telegram_streak_threshold?: number;
+  telegram_disk_warn_mb?: number;
 };
 
 export type WebhookDelivery = {
@@ -61,6 +66,11 @@ export async function saveWebhookSettings(input: {
   clear_telegram_thread_id?: boolean;
   telegram_api_base?: string;
   telegram_silent?: boolean;
+  telegram_bot_commands_enabled?: boolean;
+  telegram_digest_enabled?: boolean;
+  telegram_digest_hour?: number;
+  telegram_streak_threshold?: number;
+  telegram_disk_warn_mb?: number;
 }): Promise<WebhookConfig> {
   return requestJson<WebhookConfig>("/api/settings/webhooks", {
     method: "PUT",
